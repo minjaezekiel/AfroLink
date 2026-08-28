@@ -36,8 +36,9 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Seven crates, **184 tests passing**. Deterministic
-execution and the full BFT consensus state machine — no networking yet.
+**Phase 1 in progress.** Eight crates, **193 tests passing**. A working chain:
+four validators propose, vote and commit blocks, agreeing on both the block and
+the resulting state. Still in-process — no sockets or disk yet.
 
 ```
 crates/
@@ -48,10 +49,11 @@ crates/
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
   executor/     block execution, blocks, genesis                         22 tests ✅
   consensus/    validator sets, vote accounting, round state machine     40 tests ✅
+  node/         consensus driver, proposals, deterministic simulator      9 tests ✅
 ```
 
-Next: storage backend, RPC with proof-carrying queries, then libp2p networking
-and a live multi-node testnet.
+Next: a persistent storage backend and RPC with proof-carrying queries, then
+libp2p to replace the in-process simulator with a real network.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
 ```bash

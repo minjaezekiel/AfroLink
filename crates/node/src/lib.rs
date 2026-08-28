@@ -1,0 +1,404 @@
+//! The consensus driver.
+//!
+//! Ties [`afrolink_consensus`] to [`afrolink_executor`]: consumes proposals and
+//! votes, produces the messages a node should broadcast, and commits blocks.
+//!
+//! # No networking, no clock
+//!
+//! The driver is a pure function of `(state, event) → actions`. Timeouts arrive
+//! as [`Event::Timeout`] rather than being read from a clock, and outbound
+//! messages are returned as [`Action`]s rather than sent. That is what lets the
+//! test harness in [`sim`] run a whole validator set in one process,
+//! deterministically, and reproduce Byzantine scenarios exactly.
+//!
+//! # Validators re-execute every proposal
+//!
+//! A proposal carries a block whose header claims an `app_hash`. A validator
+//! never takes that claim on trust: it re-executes the transactions against a
+//! copy of its own state and compares. A proposer that lies about the resulting
+//! state gets nil prevotes and its block dies. This is the step that makes the
+//! chain a *verification* system rather than a *replication* one.
+
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "tests assert on known-good fixtures; a panic there is a failed test, not a halted node"
+    )
+)]
+
+pub mod proposal;
+pub mod sim;
+
+pub use proposal::{Proposal, SignedProposal};
+
+use afrolink_consensus::{
+    Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet, VoteType,
+};
+use afrolink_crypto::hash::Hash32;
+use afrolink_crypto::{Address, SecretKey};
+use afrolink_executor::{Block, Executor};
+use afrolink_primitives::{ChainId, Height, Round, Timestamp};
+use afrolink_state::{KeyValueStore, MemoryStore};
+use afrolink_types::Transaction;
+use std::collections::BTreeMap;
+
+/// Something that happened to the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A proposal arrived.
+    Proposal(Box<SignedProposal>),
+    /// A vote arrived.
+    Vote(Box<SignedVote>),
+    /// A step's timer expired.
+    Timeout(Step),
+}
+
+/// Something the node wants done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Broadcast this proposal to peers.
+    BroadcastProposal(Box<SignedProposal>),
+    /// Broadcast this vote to peers.
+    BroadcastVote(Box<SignedVote>),
+    /// A block was committed. The height is final.
+    Committed(Box<Block>),
+    /// Start a timer for this step.
+    ScheduleTimeout(Step, Round),
+}
+
+/// A validator node.
+pub struct Node {
+    chain_id: ChainId,
+    key: SecretKey,
+    address: Address,
+    validators: ValidatorSet,
+    executor: Executor,
+
+    store: MemoryStore,
+    height: Height,
+    last_block_id: Hash32,
+    round_state: RoundState,
+
+    proposals: BTreeMap<Round, SignedProposal>,
+    prevotes: BTreeMap<Round, VoteSet>,
+    precommits: BTreeMap<Round, VoteSet>,
+
+    /// Transactions waiting to be proposed.
+    pub mempool: Vec<Transaction>,
+    /// Blocks committed by this node, in order.
+    pub committed: Vec<Block>,
+    /// Whether the current height has already been decided.
+    decided: bool,
+}
+
+impl Node {
+    /// Build a node starting just after `genesis_block` at the given state.
+    #[must_use]
+    pub fn new(
+        chain_id: ChainId,
+        key: SecretKey,
+        validators: ValidatorSet,
+        store: MemoryStore,
+        genesis_block: &Block,
+    ) -> Self {
+        let address = Address::from_public_key(&key.public_key());
+        let height = genesis_block.header.height.next();
+        Self {
+            executor: Executor::new(chain_id.clone()),
+            chain_id,
+            key,
+            address,
+            validators,
+            store,
+            height,
+            last_block_id: genesis_block.header.id(),
+            round_state: RoundState::new(height),
+            proposals: BTreeMap::new(),
+            prevotes: BTreeMap::new(),
+            precommits: BTreeMap::new(),
+            mempool: Vec::new(),
+            committed: Vec::new(),
+            decided: false,
+        }
+    }
+
+    /// This node's address.
+    #[must_use]
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    /// The height currently being decided.
+    #[must_use]
+    pub fn height(&self) -> Height {
+        self.height
+    }
+
+    /// The current state root.
+    #[must_use]
+    pub fn app_hash(&self) -> Hash32 {
+        self.store.root()
+    }
+
+    /// Read-only access to state, for queries and proofs.
+    #[must_use]
+    pub fn store(&self) -> &MemoryStore {
+        &self.store
+    }
+
+    /// Whether this node proposes in the given round.
+    #[must_use]
+    pub fn is_proposer(&self, round: Round) -> bool {
+        self.validators
+            .proposer(self.height, round)
+            .is_some_and(|v| v.address == self.address)
+    }
+
+    /// Begin the current round, proposing if it is our turn.
+    pub fn start_round(&mut self, time: Timestamp) -> Vec<Action> {
+        let round = self.round_state.round;
+        let mut actions = Vec::new();
+
+        if self.is_proposer(round) {
+            let transactions = core::mem::take(&mut self.mempool);
+
+            // Re-propose a value that already has support rather than replacing
+            // it, or the network may never converge.
+            let (block, valid_round) = match self.round_state.valid_value {
+                Some(_) => match self.proposals.values().next_back().cloned() {
+                    Some(prev) => (prev.proposal.block, self.round_state.valid_round),
+                    None => (self.build_block(time, transactions), None),
+                },
+                None => (self.build_block(time, transactions), None),
+            };
+
+            let signed = Proposal {
+                chain_id: self.chain_id.clone(),
+                height: self.height,
+                round,
+                block,
+                valid_round,
+                proposer: self.address,
+            }
+            .sign(&self.key);
+
+            actions.push(Action::BroadcastProposal(Box::new(signed.clone())));
+            // Feed our own proposal back through the normal path, so proposing
+            // and receiving take exactly the same code path.
+            actions.extend(self.on_proposal(signed));
+        } else {
+            actions.push(Action::ScheduleTimeout(Step::Propose, round));
+        }
+
+        actions
+    }
+
+    /// Build a block by executing `transactions` against a copy of state.
+    fn build_block(&self, time: Timestamp, transactions: Vec<Transaction>) -> Block {
+        let mut trial = self.store.clone();
+        let (block, _) = self.executor.build_block(
+            &mut trial,
+            self.height,
+            time,
+            self.last_block_id,
+            transactions,
+        );
+        block
+    }
+
+    /// Handle one event.
+    pub fn handle(&mut self, event: Event) -> Vec<Action> {
+        match event {
+            Event::Proposal(p) => self.on_proposal(*p),
+            Event::Vote(v) => self.on_vote(*v),
+            Event::Timeout(step) => self.on_timeout(step),
+        }
+    }
+
+    fn on_proposal(&mut self, signed: SignedProposal) -> Vec<Action> {
+        let p = &signed.proposal;
+        if self.decided || p.height != self.height || p.round != self.round_state.round {
+            return Vec::new();
+        }
+        // Only the round's designated proposer may propose.
+        if self
+            .validators
+            .proposer(self.height, p.round)
+            .is_none_or(|v| v.address != p.proposer)
+        {
+            return Vec::new();
+        }
+        if p.chain_id != self.chain_id {
+            return Vec::new();
+        }
+
+        let block_id = p.block_id();
+        let valid = self.validate_block(&signed.proposal.block);
+        self.proposals.insert(p.round, signed.clone());
+
+        let decision =
+            self.round_state
+                .decide_prevote(Some(block_id), signed.proposal.valid_round, valid);
+        let Decision::Prevote(value) = decision else {
+            return Vec::new();
+        };
+        self.round_state.step = Step::Prevote;
+        vec![self.emit_vote(VoteType::Prevote, value)]
+    }
+
+    /// Re-execute a proposed block and check it matches its own header.
+    ///
+    /// This is the anti-lying check: a proposer cannot claim a state root it did
+    /// not actually produce, because every validator recomputes it.
+    fn validate_block(&self, block: &Block) -> bool {
+        if block.header.height != self.height
+            || block.header.parent != self.last_block_id
+            || block.header.chain_id != self.chain_id
+            || !block.tx_root_matches()
+        {
+            return false;
+        }
+        let mut trial = self.store.clone();
+        let outcome = self
+            .executor
+            .execute_block(&mut trial, self.height, &block.transactions);
+        outcome.app_hash == block.header.app_hash
+    }
+
+    fn on_vote(&mut self, signed: SignedVote) -> Vec<Action> {
+        if self.decided || signed.vote.height != self.height {
+            return Vec::new();
+        }
+        let (round, vote_type) = (signed.vote.round, signed.vote.vote_type);
+
+        let set = match vote_type {
+            VoteType::Prevote => &mut self.prevotes,
+            VoteType::Precommit => &mut self.precommits,
+        }
+        .entry(round)
+        .or_insert_with(|| VoteSet::new(self.chain_id.clone(), self.height, round, vote_type));
+
+        if set.add(&self.validators, signed).is_err() {
+            return Vec::new();
+        }
+
+        // Only the current round can drive this node's own progress.
+        if round != self.round_state.round {
+            return Vec::new();
+        }
+
+        match vote_type {
+            VoteType::Prevote => self.check_prevote_quorum(),
+            VoteType::Precommit => self.check_precommit_quorum(),
+        }
+    }
+
+    fn check_prevote_quorum(&mut self) -> Vec<Action> {
+        if self.round_state.step == Step::Precommit {
+            return Vec::new();
+        }
+        let round = self.round_state.round;
+        let Some(quorum) = self
+            .prevotes
+            .get(&round)
+            .and_then(|s| s.quorum_value(&self.validators))
+        else {
+            return Vec::new();
+        };
+
+        let Decision::Precommit(value) = self.round_state.decide_precommit(Some(quorum)) else {
+            return Vec::new();
+        };
+        vec![self.emit_vote(VoteType::Precommit, value)]
+    }
+
+    fn check_precommit_quorum(&mut self) -> Vec<Action> {
+        let round = self.round_state.round;
+        let Some(quorum) = self
+            .precommits
+            .get(&round)
+            .and_then(|s| s.quorum_value(&self.validators))
+        else {
+            return Vec::new();
+        };
+
+        match self.round_state.decide_commit(Some(quorum)) {
+            Decision::Commit(block_id) => self.commit(block_id),
+            Decision::NextRound(next) => {
+                vec![Action::ScheduleTimeout(Step::Propose, next)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Apply the committed block to real state and advance the height.
+    fn commit(&mut self, block_id: Hash32) -> Vec<Action> {
+        let Some(signed) = self
+            .proposals
+            .values()
+            .find(|p| p.proposal.block_id() == block_id)
+            .cloned()
+        else {
+            // Decided on a block we have not seen. A real node would fetch it;
+            // here we simply cannot proceed, and must not fabricate state.
+            return Vec::new();
+        };
+
+        let block = signed.proposal.block;
+        self.executor
+            .execute_block(&mut self.store, self.height, &block.transactions);
+
+        self.decided = true;
+        self.committed.push(block.clone());
+        self.last_block_id = block.header.id();
+        self.height = self.height.next();
+        self.round_state = RoundState::new(self.height);
+        self.proposals.clear();
+        self.prevotes.clear();
+        self.precommits.clear();
+        self.decided = false;
+
+        vec![Action::Committed(Box::new(block))]
+    }
+
+    fn on_timeout(&mut self, step: Step) -> Vec<Action> {
+        let round = self.round_state.round;
+        match step {
+            // No proposal arrived in time: prevote nil so the round can conclude.
+            Step::Propose if self.round_state.step == Step::Propose => {
+                self.round_state.step = Step::Prevote;
+                vec![self.emit_vote(VoteType::Prevote, None)]
+            }
+            // Prevotes were inconclusive: precommit nil.
+            Step::Prevote if self.round_state.step == Step::Prevote => {
+                self.round_state.step = Step::Precommit;
+                vec![self.emit_vote(VoteType::Precommit, None)]
+            }
+            // Precommits were inconclusive: move on to the next round.
+            Step::Precommit if self.round_state.step == Step::Precommit => {
+                let next = round.next();
+                self.round_state.advance_to(next);
+                vec![Action::ScheduleTimeout(Step::Propose, next)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn emit_vote(&mut self, vote_type: VoteType, block_id: Option<Hash32>) -> Action {
+        let signed = Vote {
+            chain_id: self.chain_id.clone(),
+            height: self.height,
+            round: self.round_state.round,
+            vote_type,
+            block_id,
+            validator: self.address,
+        }
+        .sign(&self.key);
+        Action::BroadcastVote(Box::new(signed))
+    }
+}

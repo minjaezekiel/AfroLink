@@ -32,13 +32,15 @@ the transaction path is not.)*
 - [ ] Storage backend (RocksDB), pruning
 - [ ] JSON-RPC + gRPC, with proof-carrying queries
 
-**Exit criterion:** one node produces and applies blocks; state root is
-reproducible from genesis on any machine.
+**Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and
+commit, agreeing on both the block and the resulting state root, verified by the
+deterministic simulator in `crates/node/src/sim.rs`.
 
 ## Phase 2 — Multi-node testnet
 
 - [ ] libp2p networking, gossip, peer scoring
-- [ ] Byzantine testing: equivocation, censorship, network partition, clock skew
+- [~] Byzantine testing — equivocation and crash-fault cases covered by the
+      in-process simulator; partition and clock skew still to do
 - [ ] Slashing for double-sign and downtime
 - [ ] Fast sync and state sync
 - [ ] Explorer, faucet, monitoring
