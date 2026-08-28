@@ -46,6 +46,25 @@ impl Address {
         Self(out)
     }
 
+    /// Derive an address deterministically from arbitrary seed bytes.
+    ///
+    /// Used for accounts that have no key: group accounts (derived from creator
+    /// and nonce) and module accounts (derived from the module name). The domain
+    /// keeps these disjoint from key-derived addresses, so a derived address can
+    /// never collide with one somebody holds a key for.
+    #[must_use]
+    pub fn derived(domain: Domain, seed: &[u8]) -> Self {
+        let digest = hash(domain, seed);
+        let mut out = [0u8; ADDRESS_LEN];
+        out.copy_from_slice(
+            digest
+                .as_bytes()
+                .get(..ADDRESS_LEN)
+                .unwrap_or(&[0; ADDRESS_LEN]),
+        );
+        Self(out)
+    }
+
     /// Wrap raw address bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; ADDRESS_LEN]) -> Self {
@@ -95,7 +114,7 @@ impl core::fmt::Display for Address {
         match self.to_bech32() {
             Ok(s) => f.write_str(&s),
             // Unreachable with the compiled-in HRP, but Display must not panic.
-            Err(_) => write!(f, "ash!invalid:{}", hex::encode(self.0)),
+            Err(_) => write!(f, "{HRP}!invalid:{}", hex::encode(self.0)),
         }
     }
 }

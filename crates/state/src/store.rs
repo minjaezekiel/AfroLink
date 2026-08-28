@@ -44,6 +44,12 @@ pub enum Namespace {
     Params = 0x07,
     /// Smart-contract code and instance storage.
     Contract = 0x08,
+    /// Accounts frozen by a sovereign issuer, keyed by (denom, address).
+    ///
+    /// Scoped to a single denom on purpose: an issuer may freeze its own
+    /// stablecoin for an account and can never touch AFRI, another country's
+    /// currency, or anything else that account holds.
+    Frozen = 0x09,
 }
 
 /// A namespaced state key.
@@ -90,6 +96,15 @@ impl StoreKey {
     #[must_use]
     pub fn issuer(denom: &Denom) -> Self {
         Self::new(Namespace::Issuer, &[denom.as_str().as_bytes()])
+    }
+
+    /// The key recording that `address` is frozen for `denom`.
+    #[must_use]
+    pub fn frozen(denom: &Denom, address: &afrolink_crypto::Address) -> Self {
+        Self::new(
+            Namespace::Frozen,
+            &[denom.as_str().as_bytes(), address.as_bytes()],
+        )
     }
 
     /// The raw key bytes.

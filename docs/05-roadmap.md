@@ -17,8 +17,8 @@ Cryptographic and state primitives, with adversarial tests.
 - [x] Transaction types, signing, replay protection *(33 tests)*
 - [x] Group accounts — chama/susu/stokvel as a native type *(ADR-0005)*
 - [x] Fee abstraction types — pay fees in any denom, sponsored fees
-- [ ] Bank module: multi-denom balances, supply tracking
-- [ ] Deterministic block executor
+- [x] Bank module: multi-denom balances, supply tracking, sovereign issuance *(18 tests)*
+- [x] Deterministic block executor, blocks and headers *(11 tests)*
 
 **Exit criterion:** a light client verifies a balance against a state root, and
 provably cannot be lied to. *(The proof machinery for this is done and tested;

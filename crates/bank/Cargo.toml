@@ -1,0 +1,19 @@
+[package]
+name = "afrolink-bank"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Multi-denomination balances, supply accounting and sovereign stablecoin issuance for AfroLink."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+afrolink-state.workspace = true
+afrolink-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "afrolink-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic block execution: applies transactions to state and commits an app hash."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+afrolink-state.workspace = true
+afrolink-types.workspace = true
+afrolink-bank.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

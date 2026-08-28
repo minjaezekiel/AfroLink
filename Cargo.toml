@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/primitives", "crates/crypto", "crates/state", "crates/types"]
+members = ["crates/primitives", "crates/crypto", "crates/state", "crates/types", "crates/bank", "crates/executor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,7 +16,7 @@ afrolink-crypto = { path = "crates/crypto" }
 afrolink-state = { path = "crates/state" }
 afrolink-types = { path = "crates/types" }
 afrolink-bank = { path = "crates/bank" }
-afrolink-consensus = { path = "crates/consensus" }
+afrolink-executor = { path = "crates/executor" }
 
 blake3 = "1.8"
 ed25519-dalek = "3.0"

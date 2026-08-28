@@ -36,7 +36,8 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 0 — foundations.** Four crates, **104 tests passing**.
+**Phase 0 complete.** Six crates, **133 tests passing**. A chain that executes
+blocks deterministically — no networking or consensus yet.
 
 ```
 crates/
@@ -44,9 +45,11 @@ crates/
   crypto/       BLAKE3 + Ed25519, bech32m addresses, RFC 6962 Merkle    32 tests ✅
   state/        sparse Merkle state, membership + absence proofs        18 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
+  bank/         balances, supply invariant, sovereign issuance          18 tests ✅
+  executor/     deterministic block execution, blocks and headers       11 tests ✅
 ```
 
-Next: the bank module and block executor, then the Ubuntu-BFT engine.
+Next: Phase 1 — the Ubuntu-BFT round state machine, validator set and genesis.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
 ```bash

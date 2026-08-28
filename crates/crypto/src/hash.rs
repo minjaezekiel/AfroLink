@@ -106,6 +106,10 @@ pub enum Domain {
     VoteSignDoc,
     /// A validator's identifier within a validator set.
     ValidatorId,
+    /// Derives the address of a group account from its creator and nonce.
+    GroupAddress,
+    /// A module-owned account address, derived from the module's name.
+    ModuleAddress,
 }
 
 impl Domain {
@@ -123,6 +127,8 @@ impl Domain {
             Self::StateNode => "afrolink/v1/state-node",
             Self::VoteSignDoc => "afrolink/v1/vote-sign-doc",
             Self::ValidatorId => "afrolink/v1/validator-id",
+            Self::GroupAddress => "afrolink/v1/group-address",
+            Self::ModuleAddress => "afrolink/v1/module-address",
         }
     }
 }

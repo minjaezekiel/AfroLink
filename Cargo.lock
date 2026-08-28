@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "afrolink-bank"
+version = "0.1.0"
+dependencies = [
+ "afrolink-crypto",
+ "afrolink-primitives",
+ "afrolink-state",
+ "afrolink-types",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-crypto"
 version = "0.1.0"
 dependencies = [
@@ -11,6 +22,18 @@ dependencies = [
  "ed25519-dalek",
  "getrandom",
  "hex",
+ "thiserror",
+]
+
+[[package]]
+name = "afrolink-executor"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-crypto",
+ "afrolink-primitives",
+ "afrolink-state",
+ "afrolink-types",
  "thiserror",
 ]
 

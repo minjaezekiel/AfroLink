@@ -1,0 +1,862 @@
+//! Deterministic block execution.
+//!
+//! Given the same prior state and the same ordered transactions, every node on
+//! earth must reach byte-identical state. That is the whole job of this crate,
+//! and everything below follows from it:
+//!
+//! * Transactions are applied strictly in order.
+//! * A failing transaction is **recorded, not skipped**: its fee is charged and
+//!   its nonce consumed, but its state changes are discarded. Skipping it
+//!   entirely would let a node that saw a different failure reason produce a
+//!   different state.
+//! * No wall-clock reads, no map iteration order, no floating point, no
+//!   randomness.
+//!
+//! # Failure isolation
+//!
+//! Each transaction is applied to a sandbox copy of the store. On success the
+//! sandbox is promoted; on failure it is dropped. Copying the whole store per
+//! transaction is `O(state)` and is fine for the sizes here, but it is the first
+//! thing to replace with a copy-on-write cache layer when real load arrives.
+
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "tests assert on known-good fixtures; a panic there is a failed test, not a halted node"
+    )
+)]
+
+pub mod block;
+
+pub use block::{Block, BlockHeader};
+
+use afrolink_bank::{Bank, BankError};
+use afrolink_crypto::Address;
+use afrolink_crypto::hash::{Domain, Hash32};
+use afrolink_primitives::{Amount, ChainId, Height, Timestamp};
+use afrolink_state::{KeyValueStore, StateError, StoreKey};
+use afrolink_types::group::GroupError;
+use afrolink_types::{Account, GroupAccount, Message, Transaction, TxError};
+use thiserror::Error;
+
+/// Name of the module account that collects fees before distribution.
+pub const FEE_COLLECTOR: &str = "fee_collector";
+
+/// The address of the fee collector module account.
+#[must_use]
+pub fn fee_collector_address() -> Address {
+    Address::derived(Domain::ModuleAddress, FEE_COLLECTOR.as_bytes())
+}
+
+/// Why a transaction failed during execution.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ExecError {
+    /// Stateless verification failed.
+    #[error(transparent)]
+    Tx(#[from] TxError),
+    /// The nonce did not match the account's expected sequence.
+    #[error("wrong nonce: account expects {expected}, transaction carries {got}")]
+    WrongNonce {
+        /// Nonce the account expects next.
+        expected: u64,
+        /// Nonce the transaction carried.
+        got: u64,
+    },
+    /// A bank operation failed.
+    #[error(transparent)]
+    Bank(#[from] BankError),
+    /// A group operation failed.
+    #[error(transparent)]
+    Group(#[from] GroupError),
+    /// The named account does not exist.
+    #[error("account does not exist")]
+    NoSuchAccount,
+    /// The named account is not a group account.
+    #[error("account is not a group")]
+    NotAGroup,
+    /// The signer may not perform this action on this group.
+    #[error("signer is not a member of this group")]
+    NotAGroupMember,
+    /// A group payout was requested for an accumulating group.
+    #[error("this group accumulates its pot and has no rotation recipient")]
+    NoRotationRecipient,
+    /// Corrupt state.
+    #[error(transparent)]
+    State(#[from] StateError),
+}
+
+/// The outcome of one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxOutcome {
+    /// The transaction's identifier.
+    pub tx_id: Hash32,
+    /// `Ok(())` if it applied, otherwise why it did not.
+    pub result: Result<(), ExecError>,
+    /// Fee actually charged.
+    pub fee_charged: Amount,
+}
+
+impl TxOutcome {
+    /// Whether the transaction applied successfully.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
+/// The result of executing a block.
+#[derive(Debug, Clone)]
+pub struct BlockOutcome {
+    /// State root after execution.
+    pub app_hash: Hash32,
+    /// Per-transaction outcomes, in execution order.
+    pub outcomes: Vec<TxOutcome>,
+}
+
+impl BlockOutcome {
+    /// Number of transactions that applied.
+    #[must_use]
+    pub fn succeeded(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.succeeded()).count()
+    }
+}
+
+/// Executes blocks against a state store.
+pub struct Executor {
+    chain_id: ChainId,
+}
+
+impl Executor {
+    /// An executor bound to one network.
+    #[must_use]
+    pub fn new(chain_id: ChainId) -> Self {
+        Self { chain_id }
+    }
+
+    /// The network this executor accepts transactions for.
+    #[must_use]
+    pub fn chain_id(&self) -> &ChainId {
+        &self.chain_id
+    }
+
+    /// Apply an ordered list of transactions and return the new app hash.
+    pub fn execute_block<S>(
+        &self,
+        store: &mut S,
+        height: Height,
+        transactions: &[Transaction],
+    ) -> BlockOutcome
+    where
+        S: KeyValueStore + Clone,
+    {
+        let mut outcomes = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            outcomes.push(self.execute_tx(store, height, tx));
+        }
+        BlockOutcome {
+            app_hash: store.root(),
+            outcomes,
+        }
+    }
+
+    /// Build the header for a block, executing it to obtain the app hash.
+    pub fn build_block<S>(
+        &self,
+        store: &mut S,
+        height: Height,
+        time: Timestamp,
+        parent: Hash32,
+        transactions: Vec<Transaction>,
+    ) -> (Block, BlockOutcome)
+    where
+        S: KeyValueStore + Clone,
+    {
+        let tx_root = Block::tx_root(&transactions);
+        let outcome = self.execute_block(store, height, &transactions);
+        let header = BlockHeader {
+            chain_id: self.chain_id.clone(),
+            height,
+            time,
+            parent,
+            tx_root,
+            app_hash: outcome.app_hash,
+        };
+        (
+            Block {
+                header,
+                transactions,
+            },
+            outcome,
+        )
+    }
+
+    /// Apply one transaction, isolating its failure.
+    fn execute_tx<S>(&self, store: &mut S, height: Height, tx: &Transaction) -> TxOutcome
+    where
+        S: KeyValueStore + Clone,
+    {
+        let tx_id = tx.id();
+
+        // Stateless checks first — these cost nothing and reject the cheap attacks.
+        if let Err(e) = tx.verify(&self.chain_id, height) {
+            return TxOutcome {
+                tx_id,
+                result: Err(e.into()),
+                fee_charged: Amount::ZERO,
+            };
+        }
+
+        // Nonce check against committed state.
+        let account = match load_account(store, &tx.body.sender) {
+            Ok(a) => a,
+            Err(e) => {
+                return TxOutcome {
+                    tx_id,
+                    result: Err(e),
+                    fee_charged: Amount::ZERO,
+                };
+            }
+        };
+        if account.nonce != tx.body.nonce {
+            return TxOutcome {
+                tx_id,
+                result: Err(ExecError::WrongNonce {
+                    expected: account.nonce,
+                    got: tx.body.nonce,
+                }),
+                fee_charged: Amount::ZERO,
+            };
+        }
+
+        // Charge the fee against committed state. If the payer cannot cover it
+        // the transaction is not includable at all, so nothing is consumed.
+        let fee_payer = tx.body.fee.payer_or(tx.body.sender);
+        let fee_result = Bank::new(store).transfer(
+            &fee_payer,
+            &fee_collector_address(),
+            &tx.body.fee.denom,
+            tx.body.fee.amount,
+        );
+        if let Err(e) = fee_result
+            && !tx.body.fee.amount.is_zero()
+        {
+            return TxOutcome {
+                tx_id,
+                result: Err(e.into()),
+                fee_charged: Amount::ZERO,
+            };
+        }
+        let fee_charged = tx.body.fee.amount;
+
+        // Messages run in a sandbox so a mid-transaction failure cannot leave
+        // half a transaction applied.
+        let mut sandbox = store.clone();
+        let mut failure = None;
+        for msg in &tx.body.messages {
+            if let Err(e) = self.apply_message(&mut sandbox, tx.body.sender, msg) {
+                failure = Some(e);
+                break;
+            }
+        }
+
+        match failure {
+            None => {
+                *store = sandbox;
+                // The nonce advances on the committed store either way.
+                bump_nonce(store, &tx.body.sender);
+                TxOutcome {
+                    tx_id,
+                    result: Ok(()),
+                    fee_charged,
+                }
+            }
+            Some(e) => {
+                // Sandbox dropped: no state change from the messages. The fee is
+                // still charged and the nonce still consumed, so a failing
+                // transaction cannot be replayed for free.
+                bump_nonce(store, &tx.body.sender);
+                TxOutcome {
+                    tx_id,
+                    result: Err(e),
+                    fee_charged,
+                }
+            }
+        }
+    }
+
+    fn apply_message<S>(
+        &self,
+        store: &mut S,
+        sender: Address,
+        msg: &Message,
+    ) -> Result<(), ExecError>
+    where
+        S: KeyValueStore,
+    {
+        match msg {
+            Message::Transfer { to, denom, amount } => {
+                Bank::new(store).transfer(&sender, to, denom, *amount)?;
+                ensure_account(store, to);
+                Ok(())
+            }
+
+            Message::CreateGroup {
+                name,
+                members,
+                contribution,
+                policy,
+                quorum,
+            } => {
+                let account = load_account(store, &sender)?;
+                let group_address = Address::derived(
+                    Domain::GroupAddress,
+                    &[sender.as_bytes().as_slice(), &account.nonce.to_le_bytes()].concat(),
+                );
+                let member_records = members.iter().map(|m| m.into_member(0)).collect::<Vec<_>>();
+                let group = GroupAccount::new(
+                    name.clone(),
+                    member_records,
+                    contribution.clone(),
+                    policy.clone(),
+                    *quorum,
+                )?;
+                store.set_encoded(
+                    &StoreKey::account(&group_address),
+                    &Account::group(group_address, group),
+                );
+                Ok(())
+            }
+
+            Message::ContributeToGroup { group, amount } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                Bank::new(store).transfer(&sender, group, &denom, *amount)?;
+
+                // Re-borrow mutably now the transfer is done.
+                if let afrolink_types::AccountKind::Group(g) = &mut account.kind {
+                    g.record_contribution(&sender)?;
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::GroupPayout { group } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let recipient = record
+                    .next_recipient()
+                    .ok_or(ExecError::NoRotationRecipient)?;
+                let denom = record.contribution.denom.clone();
+
+                // Pay out whatever the pot actually holds, rather than the
+                // nominal figure: a member may have missed a contribution, and
+                // paying the nominal amount would overdraw the group.
+                let pot = Bank::new(store).view().balance(group, &denom)?;
+                if !pot.is_zero() {
+                    Bank::new(store).transfer(group, &recipient, &denom, pot)?;
+                }
+
+                if let afrolink_types::AccountKind::Group(g) = &mut account.kind {
+                    g.advance_cycle();
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Load an account, returning a fresh one if it has never been seen.
+fn load_account<S: KeyValueStore>(store: &S, address: &Address) -> Result<Account, ExecError> {
+    Ok(store
+        .get_decoded::<Account>(&StoreKey::account(address))?
+        .unwrap_or_else(|| Account::individual(*address)))
+}
+
+/// Load an account that must already exist.
+fn load_existing_account<S: KeyValueStore>(
+    store: &S,
+    address: &Address,
+) -> Result<Account, ExecError> {
+    store
+        .get_decoded::<Account>(&StoreKey::account(address))?
+        .ok_or(ExecError::NoSuchAccount)
+}
+
+/// Create an account record for a recipient that has never been seen.
+fn ensure_account<S: KeyValueStore>(store: &mut S, address: &Address) {
+    let key = StoreKey::account(address);
+    if store.get(&key).is_none() {
+        store.set_encoded(&key, &Account::individual(*address));
+    }
+}
+
+fn bump_nonce<S: KeyValueStore>(store: &mut S, address: &Address) {
+    let key = StoreKey::account(address);
+    let mut account = store
+        .get_decoded::<Account>(&key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Account::individual(*address));
+    account.increment_nonce();
+    store.set_encoded(&key, &account);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use afrolink_bank::Issuer;
+    use afrolink_crypto::SecretKey;
+    use afrolink_primitives::Denom;
+    use afrolink_state::MemoryStore;
+    use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role};
+    use afrolink_types::{Fee, TxBody};
+
+    fn sk(seed: u8) -> SecretKey {
+        SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn addr(seed: u8) -> Address {
+        Address::from_public_key(&sk(seed).public_key())
+    }
+
+    fn chain() -> ChainId {
+        ChainId::new("afrolink-1").expect("valid")
+    }
+
+    fn kes() -> Denom {
+        Denom::sovereign("ke", "kes").expect("valid")
+    }
+
+    fn cbk() -> Address {
+        addr(100)
+    }
+
+    /// A store where accounts 1..=4 each hold 10,000 KES.
+    fn funded_store() -> MemoryStore {
+        let mut store = MemoryStore::new();
+        let mut bank = Bank::new(&mut store);
+        bank.register_issuer(&kes(), &Issuer::new(cbk()))
+            .expect("registers");
+        for i in 1..=4u8 {
+            bank.mint(&cbk(), &addr(i), &kes(), Amount::from_afri(10_000))
+                .expect("mints");
+        }
+        store
+    }
+
+    fn tx(sender: u8, nonce: u64, messages: Vec<Message>) -> Transaction {
+        TxBody {
+            chain_id: chain(),
+            sender: addr(sender),
+            nonce,
+            valid_until: Height(1_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages,
+            memo: String::new(),
+        }
+        .sign(&sk(sender))
+    }
+
+    #[test]
+    fn a_transfer_applies_and_advances_the_nonce() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let transfer = Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+        };
+        let outcome = exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![transfer])]);
+
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+        let bank = Bank::new(&mut store);
+        assert_eq!(
+            bank.balance(&addr(2), &kes()).expect("read"),
+            Amount::from_afri(10_500)
+        );
+    }
+
+    #[test]
+    fn execution_is_deterministic_across_identical_runs() {
+        // The property the whole chain depends on: same input, same state root.
+        let msgs = vec![Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+        }];
+        let txs = vec![tx(1, 0, msgs.clone()), tx(3, 0, msgs)];
+
+        let mut a = funded_store();
+        let mut b = funded_store();
+        let exec = Executor::new(chain());
+        let ra = exec.execute_block(&mut a, Height(1), &txs);
+        let rb = exec.execute_block(&mut b, Height(1), &txs);
+
+        assert_eq!(
+            ra.app_hash, rb.app_hash,
+            "identical input must give identical state"
+        );
+    }
+
+    #[test]
+    fn transaction_order_changes_the_state_root() {
+        // If order did not matter, validators could reorder a block freely and
+        // still agree on state, which would make committing to an ordered tx
+        // list pointless. Account 5 starts empty, so its outgoing transfer only
+        // works if it has already been funded within this same block.
+        let fund = vec![Message::Transfer {
+            to: addr(5),
+            denom: kes(),
+            amount: Amount::from_afri(5_000),
+        }];
+        let spend = vec![Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(4_000),
+        }];
+
+        let exec = Executor::new(chain());
+
+        let mut a = funded_store();
+        let ordered = exec.execute_block(
+            &mut a,
+            Height(1),
+            &[tx(1, 0, fund.clone()), tx(5, 0, spend.clone())],
+        );
+
+        let mut b = funded_store();
+        let reversed = exec.execute_block(&mut b, Height(1), &[tx(5, 0, spend), tx(1, 0, fund)]);
+
+        assert_eq!(
+            ordered.succeeded(),
+            2,
+            "funding first lets the spend go through"
+        );
+        assert_eq!(
+            reversed.succeeded(),
+            1,
+            "spending first must fail: account 5 is empty"
+        );
+        assert_ne!(
+            ordered.app_hash, reversed.app_hash,
+            "reordering a block must change the resulting state"
+        );
+    }
+
+    #[test]
+    fn a_replayed_transaction_is_rejected_by_the_nonce() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let t = tx(
+            1,
+            0,
+            vec![Message::Transfer {
+                to: addr(2),
+                denom: kes(),
+                amount: Amount::from_afri(100),
+            }],
+        );
+
+        let first = exec.execute_block(&mut store, Height(1), std::slice::from_ref(&t));
+        assert_eq!(first.succeeded(), 1);
+
+        let replay = exec.execute_block(&mut store, Height(2), &[t]);
+        assert!(matches!(
+            replay.outcomes[0].result,
+            Err(ExecError::WrongNonce {
+                expected: 1,
+                got: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn a_failing_transaction_still_consumes_its_nonce_and_fee() {
+        // Otherwise a failing transaction is free and infinitely replayable.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let overspend = tx(
+            1,
+            0,
+            vec![Message::Transfer {
+                to: addr(2),
+                denom: kes(),
+                amount: Amount::from_afri(999_999),
+            }],
+        );
+
+        let outcome = exec.execute_block(&mut store, Height(1), &[overspend]);
+        assert!(!outcome.outcomes[0].succeeded());
+        assert_eq!(outcome.outcomes[0].fee_charged, Amount::from_units(1_000));
+
+        let account = load_account(&store, &addr(1)).expect("loads");
+        assert_eq!(
+            account.nonce, 1,
+            "a failed transaction must still consume its nonce"
+        );
+    }
+
+    #[test]
+    fn a_failed_message_leaves_no_partial_state() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        // First message succeeds, second overspends. Neither may apply.
+        let t = tx(
+            1,
+            0,
+            vec![
+                Message::Transfer {
+                    to: addr(2),
+                    denom: kes(),
+                    amount: Amount::from_afri(100),
+                },
+                Message::Transfer {
+                    to: addr(3),
+                    denom: kes(),
+                    amount: Amount::from_afri(999_999),
+                },
+            ],
+        );
+        exec.execute_block(&mut store, Height(1), &[t]);
+
+        let bank = Bank::new(&mut store);
+        assert_eq!(
+            bank.balance(&addr(2), &kes()).expect("read"),
+            Amount::from_afri(10_000),
+            "the first transfer must be rolled back with the second"
+        );
+    }
+
+    #[test]
+    fn fees_accumulate_in_the_fee_collector() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(
+                1,
+                0,
+                vec![Message::Transfer {
+                    to: addr(2),
+                    denom: kes(),
+                    amount: Amount::from_afri(1),
+                }],
+            )],
+        );
+
+        let bank = Bank::new(&mut store);
+        assert_eq!(
+            bank.balance(&fee_collector_address(), &kes())
+                .expect("read"),
+            Amount::from_units(1_000),
+            "fees are collected in the denom the user paid in"
+        );
+    }
+
+    /// The headline end-to-end case: a chama runs a full cycle on-chain.
+    #[test]
+    fn a_chama_collects_contributions_and_pays_out_the_pot() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+
+        let members = vec![
+            FoundingMember::new(addr(1), Role::Treasurer),
+            FoundingMember::new(addr(2), Role::Member),
+            FoundingMember::new(addr(3), Role::Member),
+        ];
+        let create = Message::CreateGroup {
+            name: "Mama Mboga Chama".to_owned(),
+            members,
+            contribution: Contribution {
+                amount: Amount::from_afri(1_000),
+                denom: kes(),
+                period_blocks: 604_800,
+            },
+            policy: PayoutPolicy::Rotation {
+                order: vec![addr(1), addr(2), addr(3)],
+                next: 0,
+            },
+            quorum: Quorum::TWO_THIRDS,
+        };
+
+        // The group address is derived from creator + nonce, so we can predict it.
+        let group_address = Address::derived(
+            Domain::GroupAddress,
+            &[addr(1).as_bytes().as_slice(), &0u64.to_le_bytes()].concat(),
+        );
+
+        let r = exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![create])]);
+        assert_eq!(r.succeeded(), 1, "{:?}", r.outcomes[0].result);
+
+        // Each member contributes 1,000 KES.
+        let contributions: Vec<Transaction> = [(1u8, 1u64), (2, 0), (3, 0)]
+            .into_iter()
+            .map(|(who, nonce)| {
+                tx(
+                    who,
+                    nonce,
+                    vec![Message::ContributeToGroup {
+                        group: group_address,
+                        amount: Amount::from_afri(1_000),
+                    }],
+                )
+            })
+            .collect();
+        let r = exec.execute_block(&mut store, Height(2), &contributions);
+        assert_eq!(r.succeeded(), 3, "{:?}", r.outcomes);
+
+        {
+            let bank = Bank::new(&mut store);
+            assert_eq!(
+                bank.balance(&group_address, &kes()).expect("read"),
+                Amount::from_afri(3_000),
+                "the pot holds every contribution"
+            );
+        }
+
+        // The pot rotates to the first member in the order.
+        let r = exec.execute_block(
+            &mut store,
+            Height(3),
+            &[tx(
+                2,
+                1,
+                vec![Message::GroupPayout {
+                    group: group_address,
+                }],
+            )],
+        );
+        assert_eq!(r.succeeded(), 1, "{:?}", r.outcomes[0].result);
+
+        let bank = Bank::new(&mut store);
+        assert_eq!(
+            bank.balance(&group_address, &kes()).expect("read"),
+            Amount::ZERO,
+            "the pot is emptied on payout"
+        );
+        // Member 1 paid 1,000 in twice (create nonce + contribution) and received 3,000.
+        assert!(
+            bank.balance(&addr(1), &kes()).expect("read") > Amount::from_afri(11_000),
+            "the cycle's recipient is better off by roughly the other members' contributions"
+        );
+
+        // And the contribution history is recorded for credit purposes.
+        let account = load_existing_account(&store, &group_address).expect("group exists");
+        let group = account.as_group().expect("is a group");
+        assert_eq!(group.cycle, 1, "the cycle advanced");
+        assert_eq!(
+            group.member(&addr(2)).expect("member").contributions_made,
+            1
+        );
+    }
+
+    #[test]
+    fn a_non_member_cannot_contribute_to_a_group() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let create = Message::CreateGroup {
+            name: "Closed".to_owned(),
+            members: vec![
+                FoundingMember::new(addr(1), Role::Treasurer),
+                FoundingMember::new(addr(2), Role::Member),
+            ],
+            contribution: Contribution {
+                amount: Amount::from_afri(100),
+                denom: kes(),
+                period_blocks: 100,
+            },
+            policy: PayoutPolicy::Accumulate,
+            quorum: Quorum::TWO_THIRDS,
+        };
+        let group_address = Address::derived(
+            Domain::GroupAddress,
+            &[addr(1).as_bytes().as_slice(), &0u64.to_le_bytes()].concat(),
+        );
+        exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![create])]);
+
+        // Account 4 is not a member.
+        let r = exec.execute_block(
+            &mut store,
+            Height(2),
+            &[tx(
+                4,
+                0,
+                vec![Message::ContributeToGroup {
+                    group: group_address,
+                    amount: Amount::from_afri(100),
+                }],
+            )],
+        );
+        assert!(matches!(
+            r.outcomes[0].result,
+            Err(ExecError::NotAGroupMember)
+        ));
+    }
+
+    #[test]
+    fn a_block_commits_to_its_transactions_and_state() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let txs = vec![tx(
+            1,
+            0,
+            vec![Message::Transfer {
+                to: addr(2),
+                denom: kes(),
+                amount: Amount::from_afri(5),
+            }],
+        )];
+        let (block, outcome) = exec.build_block(
+            &mut store,
+            Height(1),
+            Timestamp::from_millis(1_700_000_000_000),
+            Hash32::ZERO,
+            txs,
+        );
+
+        assert!(
+            block.tx_root_matches(),
+            "header must commit to the transactions carried"
+        );
+        assert_eq!(block.header.app_hash, outcome.app_hash);
+        assert_eq!(block.header.app_hash, store.root());
+        assert_ne!(block.header.id(), Hash32::ZERO);
+    }
+
+    #[test]
+    fn a_transaction_for_another_chain_is_rejected() {
+        let mut store = funded_store();
+        let exec = Executor::new(ChainId::new("afrolink-9").expect("valid"));
+        let r = exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(
+                1,
+                0,
+                vec![Message::Transfer {
+                    to: addr(2),
+                    denom: kes(),
+                    amount: Amount::from_afri(1),
+                }],
+            )],
+        );
+        assert!(matches!(
+            r.outcomes[0].result,
+            Err(ExecError::Tx(TxError::WrongChain { .. }))
+        ));
+    }
+}
