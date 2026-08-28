@@ -36,8 +36,8 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 0 complete.** Six crates, **133 tests passing**. A chain that executes
-blocks deterministically — no networking or consensus yet.
+**Phase 1 in progress.** Seven crates, **184 tests passing**. Deterministic
+execution and the full BFT consensus state machine — no networking yet.
 
 ```
 crates/
@@ -46,10 +46,12 @@ crates/
   state/        sparse Merkle state, membership + absence proofs        18 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     deterministic block execution, blocks and headers       11 tests ✅
+  executor/     block execution, blocks, genesis                         22 tests ✅
+  consensus/    validator sets, vote accounting, round state machine     40 tests ✅
 ```
 
-Next: Phase 1 — the Ubuntu-BFT round state machine, validator set and genesis.
+Next: storage backend, RPC with proof-carrying queries, then libp2p networking
+and a live multi-node testnet.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
 ```bash

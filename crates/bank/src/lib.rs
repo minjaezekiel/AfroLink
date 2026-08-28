@@ -399,6 +399,33 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         Ok(())
     }
 
+    /// Credit an allocation at genesis, raising supply.
+    ///
+    /// The one path that creates value without an authority check, because at
+    /// height 0 there is no authority yet — the genesis file *is* the authority,
+    /// and every node validates it independently before starting. Callers must
+    /// never expose this after genesis; the executor does not.
+    ///
+    /// # Errors
+    /// Returns [`BankError::ZeroAmount`] or [`BankError::Overflow`].
+    pub fn genesis_allocate(&mut self, to: &Address, denom: &Denom, amount: Amount) -> Result<()> {
+        if amount.is_zero() {
+            return Err(BankError::ZeroAmount);
+        }
+        let supply = self.total_supply(denom)?;
+        let new_supply = supply
+            .checked_add(amount)
+            .map_err(|_| BankError::Overflow("genesis/supply"))?;
+        let balance = self.balance(to, denom)?;
+        let new_balance = balance
+            .checked_add(amount)
+            .map_err(|_| BankError::Overflow("genesis/credit"))?;
+
+        self.write_balance(to, denom, new_balance);
+        self.write_supply(denom, new_supply);
+        Ok(())
+    }
+
     /// Register the issuer of a sovereign denomination.
     ///
     /// # Errors

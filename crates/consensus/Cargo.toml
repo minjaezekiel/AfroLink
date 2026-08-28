@@ -1,20 +1,16 @@
 [package]
-name = "afrolink-executor"
+name = "afrolink-consensus"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Deterministic block execution: applies transactions to state and commits an app hash."
+description = "Ubuntu-BFT: validator sets, vote accounting and the consensus round state machine."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
-afrolink-state.workspace = true
-afrolink-types.workspace = true
-afrolink-bank.workspace = true
-afrolink-consensus.workspace = true
 thiserror.workspace = true
 
 [lints]

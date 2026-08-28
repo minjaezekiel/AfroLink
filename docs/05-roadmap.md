@@ -26,9 +26,9 @@ the transaction path is not.)*
 
 ## Phase 1 — Single-node chain
 
-- [ ] Ubuntu-BFT round state machine (propose / prevote / precommit, lock & valid)
-- [ ] Validator set, voting power, +2/3 quorum
-- [ ] Genesis, block production and application
+- [x] Ubuntu-BFT round state machine (propose / prevote / precommit, lock & valid) *(40 tests)*
+- [x] Validator set, voting power, +2/3 quorum, equivocation evidence
+- [x] Genesis, block production and application *(distribution limits enforced)*
 - [ ] Storage backend (RocksDB), pruning
 - [ ] JSON-RPC + gRPC, with proof-carrying queries
 

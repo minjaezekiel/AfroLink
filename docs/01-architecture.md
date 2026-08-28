@@ -187,9 +187,10 @@ assumes the node's peers are hostile and its RPC provider is lying.
 | Sparse Merkle state + proofs | **done**, 18 tests |
 | Accounts, group accounts, transactions | **done**, 33 tests |
 | Bank: balances, supply invariant, issuance | **done**, 18 tests |
-| Deterministic block executor, blocks | **done**, 11 tests |
-| Ubuntu-BFT engine | specified, not built |
+| Deterministic block executor, blocks | **done**, 22 tests |
+| Genesis, with distribution limits enforced | **done** |
+| Ubuntu-BFT: validators, votes, round machine | **done**, 40 tests |
 | Networking, RPC, CLI | not started |
 | CosmWasm integration | not started |
 
-133 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.
+184 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.

@@ -32,8 +32,10 @@
 )]
 
 pub mod block;
+pub mod genesis;
 
 pub use block::{Block, BlockHeader};
+pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
 
 use afrolink_bank::{Bank, BankError};
 use afrolink_crypto::Address;
