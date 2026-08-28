@@ -78,6 +78,17 @@ emotionally resonant story than "you can run an agent node", and we lose that
 marketing simplicity. Wealth concentration in PoS needs active countermeasures
 (stake caps, low delegation minimums, geographic requirements).
 
+## Confirmed empirically
+
+This ADR argued from arithmetic. The experiment has since been examined:
+**Pi Network** ran mobile-first "mining" for low-income markets at 70M+
+registrations, with Nigeria as its third-largest market — and its own FAQ
+confirms the phones never validated anything. It corroborates the demand side of
+this decision (users did not care that consensus was not PoW) and supplies the
+failure modes this ADR could only predict. What that binds us to, including the
+Sybil-resistance question that removing PoW leaves open, is
+[ADR-0007](0007-distribution-and-sybil-resistance.md).
+
 **If the objection is that this departs from the brief:** it departs from the
 stated *mechanism* in order to serve the stated *goal*. If the mechanism itself
 is the requirement, the trade-off to accept knowingly is that issuance leaves the

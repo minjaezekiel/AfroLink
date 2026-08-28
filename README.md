@@ -105,6 +105,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0004](docs/adr/0004-no-proof-of-work.md) | Why no mining — and what replaces it. |
 | [ADR-0005](docs/adr/0005-african-first-design.md) | What "designed for Africa" rejects, keeps, and builds instead. |
 | [ADR-0006](docs/adr/0006-state-persistence-and-retention.md) | State persistence, drawn from XRPL's NodeStore and TRON's lite fullnode. |
+| [ADR-0007](docs/adr/0007-distribution-and-sybil-resistance.md) | What Pi Network's 70M-user experiment proved, and what it rules out. |
 
 ## Decisions taken
 

@@ -29,6 +29,42 @@ mechanisms that do not.
 
 ---
 
+## What "mobile mining" actually did, when someone tried it
+
+**Pi Network** is the only project to have run this experiment at scale —
+70M+ registrations, ~16.5M migrated accounts, Nigeria its third-largest market
+worldwide. It is worth being precise about the result, because it is the
+strongest evidence available for and against everything on this page.
+
+It proved the demand: tens of millions of people in low-income markets will
+participate in a chain for years when onboarding is a phone app, and none of
+them minded that consensus was not proof of work.
+
+It also showed what happens when rewards pay for the wrong thing. Pi's own FAQ
+says the phones never validated — consensus ran on computer nodes, and a mobile
+"miner" contributed trust relationships. Issuance was multiplied by referrals
+(+25% each) and by security-circle size (+20% each, to +100%), so it paid for
+recruiting rather than for anything the network needed. Roughly 100B tokens went
+out before there was anything to buy with them, and the monthly unlocks met no
+demand: **−97% from a $2.99 peak to a ~$0.076 low by July 2026.** Meanwhile a
+community belief that 1 PI is worth $314,159 spread widely enough that merchants
+were urged to price goods at it.
+
+**Three rules this page inherits**, derived in
+[ADR-0007](adr/0007-distribution-and-sybil-resistance.md):
+
+1. **Every mechanism names the resource it buys.** If it cannot, it is a signup
+   bonus and must be called one — not mining.
+2. **No referral multipliers on AFRI issuance, ever.** Growth spend comes from
+   the governed ecosystem fund, capped and visible, never from reward emission.
+3. **Rewards accrue against measured work and continued service**, not against a
+   signup date or a daily streak.
+
+Rule 2 is the expensive one. Referral emissions work — that is precisely the
+problem — and we will grow more slowly without them.
+
+---
+
 ## The four ways to earn
 
 ### 1. Staking and delegation — *earn from a phone, no hardware*
@@ -107,6 +143,21 @@ measured against the eventual consensus. Wrong or manipulated data is slashed.
 Every row except the rejected one is reachable by someone with a phone and no
 capital. That is the requirement the brief was actually expressing (R6), and it
 is met more completely without PoW than with it.
+
+**Why one person cannot become ten thousand people.** Dropping PoW drops the
+thing that made identities expensive, and the usual replacement is mandatory
+KYC run by the project itself — which is how Pi ended up holding government IDs
+and biometrics for tens of millions of people, and deciding whose balance was
+real. We do not do that.
+
+Instead, **every mechanism above pays for a resource, not for an account**: cash
+volume actually settled, queries provably served, accuracy measured against
+eventual consensus, stake at risk. Each of those splits cleanly across
+identities — ten registrations serve no more queries than one machine can, and
+carry ten bonds to slash instead of one. Nothing here rewards *being a person*,
+so nothing here rewards *pretending to be many*. Full argument, including the
+collusion case it does not close, in
+[ADR-0007](adr/0007-distribution-and-sybil-resistance.md).
 
 ---
 

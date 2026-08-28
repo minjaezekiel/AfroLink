@@ -123,6 +123,90 @@ AfroLink as the programmable retail layer that settles into PAPSS is far more
 credible — legally and politically — than positioning it as a replacement for
 national payment systems.
 
+### 3.4 Pi Network: the mobile-mining experiment already ran
+
+Pi Network is the closest thing to a controlled experiment on the exact premise
+behind this project — *put "mining" on a phone, reward ordinary people in a
+low-income market, grow by referral* — and it ran at a scale we will not reach
+for years. **It deserves study precisely because so much of it worked.**
+
+**What it got right, and we should copy:**
+
+- **Scale from a phone app.** 70M+ registered users; ~16.5M KYC-approved and
+  migrated to mainnet by Pi Day 2026. Onboarding through an app store, not a
+  seed phrase, is the single highest-leverage decision they made.
+- **Africa is not a rounding error.** Nigeria is reported as the third-largest
+  market globally (after India and Vietnam) with ~2M registered users — around
+  40% of Pi's African total — and ~850k daily active miners. Growth was carried
+  by Telegram and Facebook groups doing localised education. That is real
+  evidence of demand for exactly our market, from a project with no local
+  partnerships and no regulatory approval.
+- **Zero-energy consensus is acceptable to users.** Nobody left because it wasn't
+  proof of work. This corroborates [ADR-0004](adr/0004-no-proof-of-work.md) from
+  the demand side rather than the arithmetic side.
+- **A bundled developer surface.** Pi Browser, Wallet, App Studio, `.pi` domains
+  and an ad network gave builders one stack instead of five. §7/R7 should learn
+  from this.
+
+**What went wrong is more instructive, and every failure is structural:**
+
+1. **The phones were never mining.** Pi's own FAQ is explicit: "the heavy lifting
+   of running the consensus algorithm … is still falling into computer nodes",
+   and a mobile miner's contribution is "their trust relationships". The product
+   was a daily check-in button. The gap between the marketing word and the
+   mechanism is the origin of most of what follows.
+2. **Consensus was permissioned in practice.** Pi runs a variant of the Stellar
+   Consensus Protocol (federated Byzantine agreement), where decentralisation
+   depends entirely on *who holds the quorum slices*. Reporting through 2025–26
+   put the network at roughly **43 nodes and 3 validators**, with mainnet
+   validation controlled by the core team; community "nodes" did not validate
+   mainnet. FBA does not distribute trust by itself — it only expresses whatever
+   trust distribution you already have.
+3. **Distribution ran years ahead of utility.** ~100B total supply allocated to
+   tens of millions of people before there was anything to buy with it. Monthly
+   unlocks then met thin liquidity: PI fell from a **$2.99 peak (Feb 2025) to a
+   ~$0.076 all-time low by July 2026 — down ~97%** — with ~10.9B of 100B in
+   circulation. Reported on-chain concentration is extreme (top 100 wallets
+   ~96% of circulating supply; core team ~82.8B tokens).
+4. **Referral-weighted issuance is a pyramid gradient.** +25% of base rate per
+   active referral, +20% per security-circle member up to +100%. This pays for
+   *recruiting*, not for anything the network needs. It is why growth was
+   spectacular and usage was not.
+5. **KYC became a corporate chokepoint.** Whether your balance exists at all
+   depended on passing verification run by one company, holding government IDs
+   and biometrics (facial recognition, later palm print). Under Nigeria's NDPA,
+   Kenya's DPA and South Africa's POPIA that is a live legal exposure, not just
+   a trust problem.
+6. **Regulators read it as a scam vector.** Hanoi police warned against Pi and
+   declared its use for payment illegal (fines of VND 50–100M); Chinese
+   authorities issued warnings citing data leaks and exploitation of elderly
+   users. When a token's dominant use is speculation on a future price, this is
+   the default regulatory reading.
+7. **"GCV".** A community belief took hold that 1 PI is worth **$314,159**
+   (π × 100,000) — implying a >$31T market cap — and merchants were urged to
+   price goods at it. The core team never endorsed it and never killed it. This
+   is what a reward asset with no price discovery does to people who have no
+   alternative, and it is the clearest possible vindication of separating a
+   free-floating coin from a settlement unit ([02-tokenomics.md](02-tokenomics.md)).
+8. **The users became the revenue.** With no external funding, the community was
+   surveyed and voted for ads to cover ~$30k/month of server costs. Monetising
+   the attention of poor users is a coherent business model. It is not one we
+   should reach for.
+
+**The lesson, stated once:** Pi proved the *demand* side of this project's thesis
+and disproved the *mechanism*. Tens of millions of people in low-income markets
+will participate in a chain for years if the onboarding is a phone app. What they
+will not get from it is value, if issuance is paid for signing up and recruiting
+rather than for work the network needs, and if the thing they are earning has no
+independent price. Full derivation of what this binds us to:
+[ADR-0007](adr/0007-distribution-and-sybil-resistance.md).
+
+*Sourcing note: user counts, node counts and wallet-concentration figures here
+are as reported by crypto media and community trackers. Pi has not published
+independently verifiable data on active users, transaction volume, validator
+decentralisation or treasury movements, so treat the direction as reliable and
+the precision as not.*
+
 ## 4. The regulatory window is open (and it was not, two years ago)
 
 | Jurisdiction | Status |
@@ -231,6 +315,14 @@ whether this is used by anyone who is not already a crypto holder.
 - [EY: Kenya enacts Virtual Asset Service Providers Act, 2025](https://taxnews.ey.com/news/2025-2314-kenya-enacts-virtual-asset-service-providers-act-2025-a-new-regulatory-era)
 - [Cryptoverse Lawyers: Nigeria crypto regulation — ISA 2025 explained](https://www.cryptoverselawyers.io/nigeria-crypto-regulation-isa-2025)
 - [DLA Piper Africa: FSCA update on licensing and supervision of CASPs](https://www.dlapiperafrica.com/en/south-africa/insights/2026/FSCA_Update_on_Licensing_and_Supervision_of_Crypto_Asset_Service_Providers)
+- [Pi Network FAQ: How can Pi be mined on mobile phones without energy consumption?](https://minepi.com/faqs/how-can-pi-be-mined-on-mobile-phones-without-energy-consumption-typically-known-in-crypto-mining/)
+- [Pi Network: Pi Node](https://minepi.com/pi-blockchain/pi-node/)
+- [crypto.news: How does Pi mining work? The Stellar Consensus Protocol explained](https://crypto.news/how-does-pi-mining-work-stellar-consensus-protocol-explained/)
+- [Coin Bureau: Is Pi Network legit in 2026?](https://coinbureau.com/analysis/is-pi-coin-legit)
+- [crypto.news: Pi Network just hit a new all-time low](https://crypto.news/pi-network-just-hit-a-new-all-time-low/)
+- [BeInCrypto: Hanoi police warning on Pi Network](https://beincrypto.com/pi-network-legal-warning-from-vietnam-police/)
+- [Gate: Pi coin in Nigeria — grassroots mining to cross-border payments](https://www.gate.com/learn/articles/pi-coin-in-nigeria-from-grassroots-mining-to-cross-border-payment-ecosystem/6855)
+- *(remaining Pi sources in [ADR-0007](adr/0007-distribution-and-sybil-resistance.md))*
 - [IEA: Access to electricity — SDG7 data and projections](https://www.iea.org/reports/sdg7-data-and-projections/access-to-electricity)
 - [Energy Transition Africa: Africa is home to 86% of the world's electricity access gap](https://www.energytransitionafrica.com/insights/article/africa-electricity-access-gap-sdg7-report-2026)
 - [GSMA: Accelerating smartphone adoption in Africa (PDF)](https://www.gsma.com/about-us/regions/africa/wp-content/uploads/2025/11/GSMA-SmartPhone_Adoption_Report_sm.pdf)
