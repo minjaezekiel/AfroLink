@@ -29,7 +29,9 @@ the transaction path is not.)*
 - [x] Ubuntu-BFT round state machine (propose / prevote / precommit, lock & valid) *(40 tests)*
 - [x] Validator set, voting power, +2/3 quorum, equivocation evidence
 - [x] Genesis, block production and application *(distribution limits enforced)*
-- [ ] Storage backend (RocksDB), pruning
+- [x] Durable storage backend (redb): blocks, commits, genesis *(10 tests)*
+- [ ] State snapshotting — replay is O(chain) and must not ship to a long-lived network
+- [ ] Pruning
 - [x] Proof-carrying query verification (light client) *(12 tests)*
 - [ ] JSON-RPC + gRPC to serve those queries over a network
 

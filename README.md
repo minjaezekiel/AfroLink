@@ -36,10 +36,10 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Nine crates, **216 tests passing**. A working chain:
-four validators propose, vote and commit blocks, and a light client verifies a
-payment holding nothing but a 32-byte header. Still in-process — no sockets or
-disk yet.
+**Phase 1 in progress.** Ten crates, **226 tests passing**. A working chain:
+four validators propose, vote and commit blocks; a light client verifies a
+payment holding nothing but a 32-byte header; and the chain survives a restart.
+Still in-process — no sockets yet.
 
 ```
 crates/
@@ -52,10 +52,12 @@ crates/
   consensus/    validator sets, vote accounting, round state machine     40 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
   light/        commit + state proof verification for wallets            12 tests ✅
+  store/        durable blocks and commits, state rebuilt by replay      10 tests ✅
 ```
 
-Next: a persistent storage backend and RPC with proof-carrying queries, then
-libp2p to replace the in-process simulator with a real network.
+Next: a JSON-RPC server to serve the proof-carrying queries the light client
+already verifies, then libp2p to replace the in-process simulator with a real
+network.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
 ```bash

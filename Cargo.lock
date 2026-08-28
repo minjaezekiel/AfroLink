@@ -94,6 +94,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-store"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-primitives",
+ "afrolink-state",
+ "redb",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-types"
 version = "0.1.0"
 dependencies = [
@@ -297,6 +311,15 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rustc_version"
