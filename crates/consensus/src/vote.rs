@@ -259,6 +259,20 @@ impl VoteSet {
         self.equivocators.values().map(AsRef::as_ref).collect()
     }
 
+    /// Every vote held for one value, in canonical validator order.
+    ///
+    /// This is how a [`crate::Commit`] is assembled: the precommits that carried
+    /// a block over the quorum line become the portable proof that it was
+    /// finalised, which is what a light client checks.
+    #[must_use]
+    pub fn votes_for(&self, block_id: Option<Hash32>) -> Vec<SignedVote> {
+        self.votes
+            .values()
+            .filter(|v| v.vote.block_id == block_id)
+            .cloned()
+            .collect()
+    }
+
     /// The value that has reached a quorum, if any.
     ///
     /// The outer `Option` is "did anything reach a quorum"; the inner is the

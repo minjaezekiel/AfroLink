@@ -28,10 +28,12 @@
     )
 )]
 
+pub mod commit;
 pub mod round;
 pub mod validator;
 pub mod vote;
 
+pub use commit::{Commit, CommitError};
 pub use round::{Decision, RoundState, Step};
 pub use validator::{CountryCode, Validator, ValidatorError, ValidatorSet};
 pub use vote::{Equivocation, SignedVote, Vote, VoteError, VoteOutcome, VoteSet, VoteType};

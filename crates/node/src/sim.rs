@@ -110,7 +110,7 @@ impl Network {
                     .map(|n| n.handle(event))
                     .unwrap_or_default();
                 for action in &actions {
-                    if let Action::Committed(block) = action {
+                    if let Action::Committed(block, _) = action {
                         commits.push((target, (**block).clone()));
                     }
                 }
@@ -151,7 +151,7 @@ impl Network {
                         }
                     }
                 }
-                Action::Committed(_) | Action::ScheduleTimeout(_, _) => {}
+                Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => {}
             }
         }
     }
@@ -165,6 +165,7 @@ mod tests {
     use afrolink_crypto::Address;
     use afrolink_executor::{Allocation, Genesis, GenesisLimits};
     use afrolink_primitives::{Amount, Denom, Height};
+    use afrolink_state::KeyValueStore;
     use afrolink_types::{Fee, Message, Transaction, TxBody};
 
     const COUNTRIES: [&str; 4] = ["ke", "ng", "za", "tz"];
@@ -185,8 +186,11 @@ mod tests {
         Address::from_public_key(&SecretKey::from_bytes(&[seed; 32]).public_key())
     }
 
-    /// `n` equal validators, one per country, plus a funded user account.
-    fn network(n: u8) -> Network {
+    /// `n` equal validators, one per country, plus two funded user accounts.
+    ///
+    /// Returns the network together with the genesis header and validator set —
+    /// exactly what a wallet would be shipped with.
+    fn setup(n: u8) -> (Network, Block, ValidatorSet) {
         let ks = keys(n);
         let validators = ValidatorSet::new(
             ks.iter()
@@ -226,7 +230,13 @@ mod tests {
         let block = genesis
             .apply(&mut store, GenesisLimits::devnet())
             .expect("genesis applies");
-        Network::new(&chain(), &ks, &validators, &store, &block)
+        let net = Network::new(&chain(), &ks, &validators, &store, &block);
+        (net, block, validators)
+    }
+
+    /// Just the network, for tests that do not need genesis artefacts.
+    fn network(n: u8) -> Network {
+        setup(n).0
     }
 
     fn payment(nonce: u64, amount: u64) -> Transaction {
@@ -483,6 +493,60 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::BroadcastProposal(_))),
             "a non-proposer must not propose"
+        );
+    }
+    #[test]
+    fn a_phone_verifies_a_payment_from_headers_alone() {
+        // The end-to-end thesis, with nothing mocked: real validators reach
+        // consensus, emit a real commit certificate, and a light client holding
+        // only the genesis header and the validator set follows the chain and
+        // checks a balance against a proof from an untrusted server.
+        let (mut net, genesis, validators) = setup(4);
+        let mut client = afrolink_light::LightClient::new(chain(), validators, genesis.header);
+
+        for node in &mut net.nodes {
+            node.mempool.push(payment(0, 750));
+        }
+        net.start_round();
+        net.run(1_000);
+
+        // Take the block and certificate the validators actually produced.
+        let node = net.nodes.first().expect("a node exists");
+        let block = node
+            .committed
+            .first()
+            .expect("a block was committed")
+            .clone();
+        let commit = node
+            .last_commit
+            .clone()
+            .expect("a certificate was produced");
+
+        client
+            .update(block.header, &commit)
+            .expect("a real commit from a real quorum must verify");
+        assert_eq!(client.height(), Height(1));
+
+        // An untrusted server answers the wallet's balance query with a proof.
+        let key = afrolink_state::StoreKey::balance(&addr(51), &kes());
+        let (value, proof) = node.store().get_with_proof(&key);
+
+        let balance = client
+            .verify_balance(&addr(51), &kes(), value.as_deref(), &proof)
+            .expect("the proof must verify against the header the wallet trusts");
+        assert_eq!(
+            balance,
+            Amount::from_afri(10_750),
+            "10,000 at genesis plus a 750 payment"
+        );
+
+        // And the same server cannot inflate the number.
+        let lie = afrolink_primitives::codec::Encode::to_bytes(&Amount::from_afri(9_999_999));
+        assert!(
+            client
+                .verify_balance(&addr(51), &kes(), Some(&lie), &proof)
+                .is_err(),
+            "a forged balance must not verify"
         );
     }
 }

@@ -30,7 +30,8 @@ the transaction path is not.)*
 - [x] Validator set, voting power, +2/3 quorum, equivocation evidence
 - [x] Genesis, block production and application *(distribution limits enforced)*
 - [ ] Storage backend (RocksDB), pruning
-- [ ] JSON-RPC + gRPC, with proof-carrying queries
+- [x] Proof-carrying query verification (light client) *(12 tests)*
+- [ ] JSON-RPC + gRPC to serve those queries over a network
 
 **Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and
 commit, agreeing on both the block and the resulting state root, verified by the

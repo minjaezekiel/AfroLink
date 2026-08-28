@@ -190,9 +190,11 @@ assumes the node's peers are hostile and its RPC provider is lying.
 | Deterministic block executor, blocks | **done**, 22 tests |
 | Genesis, with distribution limits enforced | **done** |
 | Ubuntu-BFT: validators, votes, round machine | **done**, 40 tests |
-| Consensus driver + deterministic simulator | **done**, 9 tests |
+| Consensus driver + deterministic simulator | **done**, 10 tests |
+| Commit certificates | **done**, 10 tests |
+| Light client (header + state proof verification) | **done**, 12 tests |
 | Persistent storage, RPC, CLI | next |
 | libp2p networking | not started |
 | CosmWasm integration | not started |
 
-193 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.
+216 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.

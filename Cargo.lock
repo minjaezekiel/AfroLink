@@ -48,6 +48,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-light"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-primitives",
+ "afrolink-state",
+ "afrolink-types",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-node"
 version = "0.1.0"
 dependencies = [
@@ -55,6 +69,7 @@ dependencies = [
  "afrolink-consensus",
  "afrolink-crypto",
  "afrolink-executor",
+ "afrolink-light",
  "afrolink-primitives",
  "afrolink-state",
  "afrolink-types",

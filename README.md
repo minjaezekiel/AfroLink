@@ -31,14 +31,15 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
-| **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes can verify any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. |
+| **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
 
 ## Status
 
-**Phase 1 in progress.** Eight crates, **193 tests passing**. A working chain:
-four validators propose, vote and commit blocks, agreeing on both the block and
-the resulting state. Still in-process — no sockets or disk yet.
+**Phase 1 in progress.** Nine crates, **216 tests passing**. A working chain:
+four validators propose, vote and commit blocks, and a light client verifies a
+payment holding nothing but a 32-byte header. Still in-process — no sockets or
+disk yet.
 
 ```
 crates/
@@ -49,7 +50,8 @@ crates/
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
   executor/     block execution, blocks, genesis                         22 tests ✅
   consensus/    validator sets, vote accounting, round state machine     40 tests ✅
-  node/         consensus driver, proposals, deterministic simulator      9 tests ✅
+  node/         consensus driver, proposals, deterministic simulator     10 tests ✅
+  light/        commit + state proof verification for wallets            12 tests ✅
 ```
 
 Next: a persistent storage backend and RPC with proof-carrying queries, then

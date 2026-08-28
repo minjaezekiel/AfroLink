@@ -1,25 +1,24 @@
 [package]
-name = "afrolink-node"
+name = "afrolink-light"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The consensus driver: ties Ubuntu-BFT to block execution to produce and commit blocks."
+description = "Light client: verify balances and blocks from 32-byte headers, without trusting the server."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-state.workspace = true
-afrolink-types.workspace = true
-afrolink-bank.workspace = true
-afrolink-executor.workspace = true
 afrolink-consensus.workspace = true
+afrolink-executor.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-afrolink-light.workspace = true
+afrolink-bank.workspace = true
+afrolink-types.workspace = true
 
 [lints]
 workspace = true

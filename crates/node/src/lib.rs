@@ -37,7 +37,7 @@ pub mod sim;
 pub use proposal::{Proposal, SignedProposal};
 
 use afrolink_consensus::{
-    Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet, VoteType,
+    Commit, Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet, VoteType,
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
@@ -66,7 +66,11 @@ pub enum Action {
     /// Broadcast this vote to peers.
     BroadcastVote(Box<SignedVote>),
     /// A block was committed. The height is final.
-    Committed(Box<Block>),
+    ///
+    /// Carries the commit certificate alongside the block: those precommit
+    /// signatures are what lets a light client verify this height without the
+    /// chain, so they are part of the output rather than an internal detail.
+    Committed(Box<Block>, Box<Commit>),
     /// Start a timer for this step.
     ScheduleTimeout(Step, Round),
 }
@@ -92,6 +96,8 @@ pub struct Node {
     pub mempool: Vec<Transaction>,
     /// Blocks committed by this node, in order.
     pub committed: Vec<Block>,
+    /// The certificate for the most recently committed block.
+    pub last_commit: Option<Commit>,
     /// Whether the current height has already been decided.
     decided: bool,
 }
@@ -123,6 +129,7 @@ impl Node {
             precommits: BTreeMap::new(),
             mempool: Vec::new(),
             committed: Vec::new(),
+            last_commit: None,
             decided: false,
         }
     }
@@ -350,6 +357,17 @@ impl Node {
         };
 
         let block = signed.proposal.block;
+
+        // Assemble the certificate from the precommits that carried this block
+        // over the quorum line, before the round's vote sets are cleared.
+        let round = self.round_state.round;
+        let signatures = self
+            .precommits
+            .get(&round)
+            .map(|s| s.votes_for(Some(block_id)))
+            .unwrap_or_default();
+        let commit = Commit::new(self.height, round, block_id, signatures);
+
         self.executor
             .execute_block(&mut self.store, self.height, &block.transactions);
 
@@ -362,8 +380,9 @@ impl Node {
         self.prevotes.clear();
         self.precommits.clear();
         self.decided = false;
+        self.last_commit = Some(commit.clone());
 
-        vec![Action::Committed(Box::new(block))]
+        vec![Action::Committed(Box::new(block), Box::new(commit))]
     }
 
     fn on_timeout(&mut self, step: Step) -> Vec<Action> {
