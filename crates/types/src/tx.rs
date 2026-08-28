@@ -1,0 +1,614 @@
+//! Transactions, messages and signing.
+//!
+//! # Replay protection
+//!
+//! The signed bytes commit to `(chain_id, nonce, valid_until, fee, messages,
+//! memo)`. Each element closes a specific attack:
+//!
+//! * **`chain_id`** — a transaction signed on testnet cannot be replayed on
+//!   mainnet, and vice versa.
+//! * **`nonce`** — the same transfer cannot be submitted twice.
+//! * **`valid_until`** — a transaction that never gets included expires instead
+//!   of sitting in a mempool indefinitely, waiting for a moment when it is
+//!   suddenly harmful.
+//!
+//! The whole document is hashed under [`Domain::TxSignDoc`], so a transaction
+//! signature can never be presented as a consensus vote.
+
+use afrolink_crypto::hash::{Domain, Hash32, hash};
+use afrolink_crypto::{Address, CryptoError, PublicKey, SecretKey, Signature};
+use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exact};
+use afrolink_primitives::{Amount, ChainId, Denom, Height};
+use thiserror::Error;
+
+use crate::group::{Contribution, FoundingMember, PayoutPolicy, Quorum};
+
+/// Maximum bytes in a transaction memo.
+pub const MAX_MEMO_LEN: usize = 256;
+/// Maximum messages in one transaction.
+pub const MAX_MESSAGES: usize = 64;
+
+/// Why a transaction was rejected.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TxError {
+    /// The signature did not verify against the declared public key.
+    #[error("invalid signature")]
+    InvalidSignature,
+    /// The declared public key does not derive the sender's address.
+    #[error("public key does not match sender address")]
+    KeyAddressMismatch,
+    /// The transaction was signed for a different network.
+    #[error("wrong chain id: signed for {signed}, this chain is {expected}")]
+    WrongChain {
+        /// Chain the transaction was signed for.
+        signed: String,
+        /// Chain evaluating it.
+        expected: String,
+    },
+    /// The transaction expired before inclusion.
+    #[error("transaction expired at height {valid_until}, current height is {current}")]
+    Expired {
+        /// Last height at which it was valid.
+        valid_until: u64,
+        /// Current chain height.
+        current: u64,
+    },
+    /// The transaction carried no messages, or too many.
+    #[error("transaction must carry 1..={MAX_MESSAGES} messages, got {0}")]
+    MessageCount(usize),
+    /// The memo exceeded [`MAX_MEMO_LEN`].
+    #[error("memo exceeds {MAX_MEMO_LEN} bytes")]
+    MemoTooLong,
+    /// A transfer of zero.
+    #[error("transfer amount must be greater than zero")]
+    ZeroAmount,
+    /// Underlying crypto failure.
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+}
+
+/// How the fee is paid.
+///
+/// **This is the fee-abstraction primitive** (see architecture §4.1). Two
+/// properties make it different from a conventional chain's fee field:
+///
+/// * `denom` need not be AFRI. Any governance-whitelisted stablecoin works, so a
+///   user sending money home never has to acquire the network's token first.
+/// * `payer` may be someone other than the sender — a merchant, an employer or
+///   an NGO sponsoring its users' fees.
+///
+/// Together they mean a person can hold nothing but their local currency, and
+/// still transact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fee {
+    /// Amount offered.
+    pub amount: Amount,
+    /// Denomination offered — need not be the native coin.
+    pub denom: Denom,
+    /// Who pays. `None` means the transaction's sender.
+    pub payer: Option<Address>,
+}
+
+impl Fee {
+    /// A fee paid by the sender in the given denomination.
+    #[must_use]
+    pub fn new(amount: Amount, denom: Denom) -> Self {
+        Self {
+            amount,
+            denom,
+            payer: None,
+        }
+    }
+
+    /// A fee sponsored by a third party.
+    #[must_use]
+    pub fn sponsored_by(amount: Amount, denom: Denom, payer: Address) -> Self {
+        Self {
+            amount,
+            denom,
+            payer: Some(payer),
+        }
+    }
+
+    /// The account actually charged, given the transaction's sender.
+    #[must_use]
+    pub fn payer_or(&self, sender: Address) -> Address {
+        self.payer.unwrap_or(sender)
+    }
+
+    /// Whether a third party is covering this fee.
+    #[must_use]
+    pub fn is_sponsored(&self) -> bool {
+        self.payer.is_some()
+    }
+}
+
+/// An instruction within a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// Move tokens between accounts.
+    Transfer {
+        /// Recipient.
+        to: Address,
+        /// Asset moved.
+        denom: Denom,
+        /// Quantity moved.
+        amount: Amount,
+    },
+    /// Form a savings group (chama, susu, stokvel, tontine, equb, VSLA).
+    CreateGroup {
+        /// The group's name.
+        name: String,
+        /// Founding members and their roles.
+        members: Vec<FoundingMember>,
+        /// Recurring obligation.
+        contribution: Contribution,
+        /// Rotation or accumulation.
+        policy: PayoutPolicy,
+        /// Approval share for extraordinary withdrawals.
+        quorum: Quorum,
+    },
+    /// Pay this cycle's contribution into a group.
+    ContributeToGroup {
+        /// The group account.
+        group: Address,
+        /// Amount paid in.
+        amount: Amount,
+    },
+    /// Release the pot to the cycle's recipient and advance the rotation.
+    GroupPayout {
+        /// The group account.
+        group: Address,
+    },
+}
+
+/// The signed portion of a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxBody {
+    /// Network this transaction is valid on.
+    pub chain_id: ChainId,
+    /// Account submitting it.
+    pub sender: Address,
+    /// Sender's next sequence number.
+    pub nonce: u64,
+    /// Last block height at which this may be included.
+    pub valid_until: Height,
+    /// Offered fee.
+    pub fee: Fee,
+    /// Instructions to execute, in order.
+    pub messages: Vec<Message>,
+    /// Free-form note.
+    pub memo: String,
+}
+
+impl TxBody {
+    /// The bytes a signature commits to.
+    #[must_use]
+    pub fn sign_doc(&self) -> Vec<u8> {
+        self.to_bytes()
+    }
+
+    /// Sign this body, producing a complete transaction.
+    #[must_use]
+    pub fn sign(self, key: &SecretKey) -> Transaction {
+        let signature = key.sign(Domain::TxSignDoc, &self.sign_doc());
+        Transaction {
+            body: self,
+            public_key: key.public_key(),
+            signature,
+        }
+    }
+
+    /// Structural checks that need no chain state.
+    ///
+    /// # Errors
+    /// Returns the first [`TxError`] encountered.
+    pub fn validate_basic(&self) -> Result<(), TxError> {
+        if self.messages.is_empty() || self.messages.len() > MAX_MESSAGES {
+            return Err(TxError::MessageCount(self.messages.len()));
+        }
+        if self.memo.len() > MAX_MEMO_LEN {
+            return Err(TxError::MemoTooLong);
+        }
+        for msg in &self.messages {
+            match msg {
+                Message::Transfer { amount, .. } | Message::ContributeToGroup { amount, .. } => {
+                    if amount.is_zero() {
+                        return Err(TxError::ZeroAmount);
+                    }
+                }
+                Message::CreateGroup { .. } | Message::GroupPayout { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A signed transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transaction {
+    /// The signed body.
+    pub body: TxBody,
+    /// Public key of the signer.
+    pub public_key: PublicKey,
+    /// Signature over [`TxBody::sign_doc`] in [`Domain::TxSignDoc`].
+    pub signature: Signature,
+}
+
+impl Transaction {
+    /// The transaction's identifier: a hash of its complete encoding.
+    #[must_use]
+    pub fn id(&self) -> Hash32 {
+        hash(Domain::TxId, &self.to_bytes())
+    }
+
+    /// Full stateless verification.
+    ///
+    /// Checks, in order: structure, chain binding, expiry, that the declared key
+    /// actually derives the sender's address, and finally the signature. The key
+    /// check comes before signature verification because a valid signature from
+    /// the *wrong* key would otherwise authorise spending someone else's account.
+    ///
+    /// # Errors
+    /// Returns the first [`TxError`] encountered.
+    pub fn verify(&self, chain_id: &ChainId, current_height: Height) -> Result<(), TxError> {
+        self.body.validate_basic()?;
+
+        if &self.body.chain_id != chain_id {
+            return Err(TxError::WrongChain {
+                signed: self.body.chain_id.to_string(),
+                expected: chain_id.to_string(),
+            });
+        }
+
+        if current_height > self.body.valid_until {
+            return Err(TxError::Expired {
+                valid_until: self.body.valid_until.0,
+                current: current_height.0,
+            });
+        }
+
+        if Address::from_public_key(&self.public_key) != self.body.sender {
+            return Err(TxError::KeyAddressMismatch);
+        }
+
+        self.public_key
+            .verify(Domain::TxSignDoc, &self.body.sign_doc(), &self.signature)
+            .map_err(|_| TxError::InvalidSignature)
+    }
+
+    /// Decode a transaction from untrusted bytes.
+    ///
+    /// # Errors
+    /// Returns a [`CodecError`] if the bytes are malformed or carry trailing data.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode_exact::<Self>(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical encoding
+// ---------------------------------------------------------------------------
+
+impl Encode for Fee {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.amount.encode(out);
+        self.denom.encode(out);
+        self.payer.encode(out);
+    }
+}
+
+impl Decode for Fee {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            amount: Amount::decode(r)?,
+            denom: Denom::decode(r)?,
+            payer: Option::<Address>::decode(r)?,
+        })
+    }
+}
+
+impl Encode for Message {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Transfer { to, denom, amount } => {
+                out.push(0);
+                to.encode(out);
+                denom.encode(out);
+                amount.encode(out);
+            }
+            Self::CreateGroup {
+                name,
+                members,
+                contribution,
+                policy,
+                quorum,
+            } => {
+                out.push(1);
+                name.encode(out);
+                members.encode(out);
+                contribution.encode(out);
+                policy.encode(out);
+                quorum.encode(out);
+            }
+            Self::ContributeToGroup { group, amount } => {
+                out.push(2);
+                group.encode(out);
+                amount.encode(out);
+            }
+            Self::GroupPayout { group } => {
+                out.push(3);
+                group.encode(out);
+            }
+        }
+    }
+}
+
+impl Decode for Message {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        match u8::decode(r)? {
+            0 => Ok(Self::Transfer {
+                to: Address::decode(r)?,
+                denom: Denom::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            1 => Ok(Self::CreateGroup {
+                name: String::decode(r)?,
+                members: Vec::<FoundingMember>::decode(r)?,
+                contribution: Contribution::decode(r)?,
+                policy: PayoutPolicy::decode(r)?,
+                quorum: Quorum::decode(r)?,
+            }),
+            2 => Ok(Self::ContributeToGroup {
+                group: Address::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            3 => Ok(Self::GroupPayout {
+                group: Address::decode(r)?,
+            }),
+            tag => Err(CodecError::UnknownDiscriminant {
+                tag,
+                type_name: "Message",
+            }),
+        }
+    }
+}
+
+impl Encode for TxBody {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.chain_id.encode(out);
+        self.sender.encode(out);
+        self.nonce.encode(out);
+        self.valid_until.encode(out);
+        self.fee.encode(out);
+        self.messages.encode(out);
+        self.memo.encode(out);
+    }
+}
+
+impl Decode for TxBody {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            chain_id: ChainId::decode(r)?,
+            sender: Address::decode(r)?,
+            nonce: u64::decode(r)?,
+            valid_until: Height::decode(r)?,
+            fee: Fee::decode(r)?,
+            messages: Vec::<Message>::decode(r)?,
+            memo: String::decode(r)?,
+        })
+    }
+}
+
+impl Encode for Transaction {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.body.encode(out);
+        self.public_key.encode(out);
+        self.signature.encode(out);
+    }
+}
+
+impl Decode for Transaction {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            body: TxBody::decode(r)?,
+            public_key: PublicKey::decode(r)?,
+            signature: Signature::decode(r)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(seed: u8) -> SecretKey {
+        SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn chain() -> ChainId {
+        ChainId::new("afrolink-1").expect("valid chain id")
+    }
+
+    fn kes() -> Denom {
+        Denom::sovereign("ke", "kes").expect("valid denom")
+    }
+
+    /// Amina sends 500 KES to Kwame, paying the fee in KES — never touching AFRI.
+    fn payment(sender: &SecretKey) -> TxBody {
+        TxBody {
+            chain_id: chain(),
+            sender: Address::from_public_key(&sender.public_key()),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages: vec![Message::Transfer {
+                to: Address::from_public_key(&key(2).public_key()),
+                denom: kes(),
+                amount: Amount::from_afri(500),
+            }],
+            memo: "school fees".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_valid_payment_verifies() {
+        let sk = key(1);
+        let tx = payment(&sk).sign(&sk);
+        assert!(tx.verify(&chain(), Height(10)).is_ok());
+    }
+
+    #[test]
+    fn a_user_can_pay_fees_without_holding_afri() {
+        // The adoption-critical property: the fee denom is a local stablecoin.
+        let sk = key(1);
+        let tx = payment(&sk).sign(&sk);
+        assert!(!tx.body.fee.denom.is_native());
+        assert!(tx.body.fee.denom.is_sovereign());
+        assert!(tx.verify(&chain(), Height(10)).is_ok());
+    }
+
+    #[test]
+    fn a_sponsor_can_cover_someone_elses_fee() {
+        let sk = key(1);
+        let sponsor = Address::from_public_key(&key(9).public_key());
+        let mut body = payment(&sk);
+        body.fee = Fee::sponsored_by(Amount::from_units(1_000), kes(), sponsor);
+        let tx = body.sign(&sk);
+
+        assert!(tx.body.fee.is_sponsored());
+        assert_eq!(tx.body.fee.payer_or(tx.body.sender), sponsor);
+        assert!(tx.verify(&chain(), Height(10)).is_ok());
+    }
+
+    #[test]
+    fn an_unsponsored_fee_is_charged_to_the_sender() {
+        let sk = key(1);
+        let tx = payment(&sk).sign(&sk);
+        assert_eq!(tx.body.fee.payer_or(tx.body.sender), tx.body.sender);
+    }
+
+    #[test]
+    fn a_transaction_signed_for_another_chain_is_rejected() {
+        // Cross-chain replay: a testnet signature must not spend mainnet funds.
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.chain_id = ChainId::new("afrolink-testnet-3").expect("valid");
+        let tx = body.sign(&sk);
+        assert!(matches!(
+            tx.verify(&chain(), Height(10)),
+            Err(TxError::WrongChain { .. })
+        ));
+    }
+
+    #[test]
+    fn an_expired_transaction_is_rejected() {
+        let sk = key(1);
+        let tx = payment(&sk).sign(&sk);
+        assert!(matches!(
+            tx.verify(&chain(), Height(1_001)),
+            Err(TxError::Expired { .. })
+        ));
+        assert!(
+            tx.verify(&chain(), Height(1_000)).is_ok(),
+            "valid_until is inclusive"
+        );
+    }
+
+    #[test]
+    fn tampering_with_the_amount_invalidates_the_signature() {
+        let sk = key(1);
+        let mut tx = payment(&sk).sign(&sk);
+        tx.body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(2).public_key()),
+            denom: kes(),
+            amount: Amount::from_afri(500_000),
+        }];
+        assert_eq!(
+            tx.verify(&chain(), Height(10)),
+            Err(TxError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn tampering_with_the_recipient_invalidates_the_signature() {
+        let sk = key(1);
+        let mut tx = payment(&sk).sign(&sk);
+        tx.body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(77).public_key()),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+        }];
+        assert_eq!(
+            tx.verify(&chain(), Height(10)),
+            Err(TxError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn a_valid_signature_from_the_wrong_key_cannot_spend_an_account() {
+        // Attacker signs a body naming someone else as sender. The signature is
+        // genuine; the key/address binding is what must catch this.
+        let victim = Address::from_public_key(&key(1).public_key());
+        let attacker = key(66);
+        let mut body = payment(&key(1));
+        body.sender = victim;
+        let tx = body.sign(&attacker);
+        assert_eq!(
+            tx.verify(&chain(), Height(10)),
+            Err(TxError::KeyAddressMismatch)
+        );
+    }
+
+    #[test]
+    fn empty_and_oversized_transactions_are_rejected() {
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.messages.clear();
+        assert_eq!(body.validate_basic(), Err(TxError::MessageCount(0)));
+
+        let mut body = payment(&sk);
+        body.memo = "x".repeat(MAX_MEMO_LEN + 1);
+        assert_eq!(body.validate_basic(), Err(TxError::MemoTooLong));
+    }
+
+    #[test]
+    fn zero_value_transfers_are_rejected() {
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(2).public_key()),
+            denom: kes(),
+            amount: Amount::ZERO,
+        }];
+        assert_eq!(body.validate_basic(), Err(TxError::ZeroAmount));
+    }
+
+    #[test]
+    fn transactions_round_trip_through_the_wire_format() {
+        let sk = key(1);
+        let tx = payment(&sk).sign(&sk);
+        let decoded = Transaction::from_bytes(&tx.to_bytes()).expect("decodes");
+        assert_eq!(decoded, tx);
+        assert!(decoded.verify(&chain(), Height(10)).is_ok());
+    }
+
+    #[test]
+    fn trailing_bytes_on_the_wire_are_rejected() {
+        // Otherwise one transaction has many encodings, breaking dedup by id.
+        let sk = key(1);
+        let mut bytes = payment(&sk).sign(&sk).to_bytes();
+        bytes.push(0);
+        assert!(Transaction::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn distinct_transactions_have_distinct_ids() {
+        let sk = key(1);
+        let a = payment(&sk).sign(&sk);
+        let mut body = payment(&sk);
+        body.nonce = 1;
+        let b = body.sign(&sk);
+        assert_ne!(a.id(), b.id(), "the nonce must change the transaction id");
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "afrolink-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Authenticated state storage: a compact sparse Merkle tree with membership and non-membership proofs."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

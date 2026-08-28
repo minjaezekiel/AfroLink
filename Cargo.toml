@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/primitives", "crates/crypto", "crates/state", "crates/types"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/afrolink/afrolink"
+authors = ["AfroLink Contributors"]
+
+[workspace.dependencies]
+afrolink-primitives = { path = "crates/primitives" }
+afrolink-crypto = { path = "crates/crypto" }
+afrolink-state = { path = "crates/state" }
+afrolink-types = { path = "crates/types" }
+afrolink-bank = { path = "crates/bank" }
+afrolink-consensus = { path = "crates/consensus" }
+
+blake3 = "1.8"
+ed25519-dalek = "3.0"
+getrandom = "0.3"
+thiserror = "2.0"
+hex = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Consensus-critical code must never panic on untrusted input.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true

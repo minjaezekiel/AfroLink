@@ -1,0 +1,19 @@
+# Rust build artefacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock is committed: this workspace produces binaries (the node), and a
+# reproducible dependency set is a security property for consensus software.
+
+# Local node data and keys — must never be committed
+/data/
+*.key
+*.pem
+node_key.json
+priv_validator_key.json
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

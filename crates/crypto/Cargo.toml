@@ -1,0 +1,20 @@
+[package]
+name = "afrolink-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Hashing, signatures, addresses and Merkle commitments for AfroLink."
+
+[dependencies]
+afrolink-primitives.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true
