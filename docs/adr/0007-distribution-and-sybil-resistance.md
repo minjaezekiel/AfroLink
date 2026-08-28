@@ -70,10 +70,18 @@ holds the quorum slices, and Pi's were held by one organisation — reportedly
 weights is the right call, and honesty about it is a feature. We add a
 requirement: **decentralisation must be a measured, published metric, not a
 claim** — validator count, Nakamoto coefficient, stake and geographic
-concentration, emitted by the node and served over RPC. The 10% stake cap
-already enforced in `crates/consensus` tests is one such invariant; it needs
-company. A chain that reports "3 validators" honestly is in better shape than
-one that says "decentralised" and means the same thing.
+concentration, emitted by the node and served over RPC. A chain that reports
+"3 validators" honestly is in better shape than one that says "decentralised"
+and means the same thing.
+
+**Implemented:** `crates/consensus/src/decentralization.rs`. Writing it exposed
+a real gap — geographic distribution was *counted* and never *measured*, so a
+set of twelve validators with nine in one jurisdiction passed the 10% stake cap
+and the 15-country minimum while a single country could halt the chain. That
+case is now a test. The report carries Nakamoto coefficients for both halting
+and control, over validators and over countries, plus an HHI that captures the
+shape of the distribution rather than only its head — all in integer arithmetic,
+because a metric two nodes can disagree about is not a metric.
 
 ### 3. Distribution before utility guarantees the collapse
 

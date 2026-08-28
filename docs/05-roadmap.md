@@ -36,7 +36,10 @@ the transaction path is not.)*
 - [ ] Node roles: validator / archive / serving
 - [ ] Pruning
 - [x] Proof-carrying query verification (light client) *(12 tests)*
+- [x] Decentralisation measured, not claimed — stake and **geographic**
+      concentration, Nakamoto coefficients *(ADR-0007, 8 tests)*
 - [ ] JSON-RPC + gRPC to serve those queries over a network
+- [ ] Emit the decentralisation report at startup and over RPC
 
 **Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and
 commit, agreeing on both the block and the resulting state root, verified by the
@@ -49,6 +52,11 @@ deterministic simulator in `crates/node/src/sim.rs`.
       in-process simulator; partition and clock skew still to do
 - [ ] Slashing for double-sign and downtime
 - [ ] Fast sync and state sync
+- [ ] **Free transaction quota per account** — TRON's bandwidth model, so an
+      ordinary user needs neither AFRI nor a sponsor to transact *(R2; the gap
+      surfaced by [06](06-adopted-practices.md))*
+- [ ] State-bloat pricing that is **not** XRPL-style account reserves — a
+      minimum balance to exist excludes the users this chain is for
 - [ ] Explorer, faucet, monitoring
 
 **Exit criterion:** 20 geographically distributed validators; the chain survives
@@ -61,6 +69,12 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
 - [ ] Account abstraction: phone-number aliases, social recovery, sponsored fees
 - [ ] Contract templates: savings, escrow, payroll, rotating savings (chama/susu)
 - [ ] SDKs: Rust, TypeScript, Kotlin, Flutter
+- [ ] **Upgrade governance** — XRPL-style amendment voting: on-chain activation
+      at a supermajority sustained over a period, not a flag day. We currently
+      have none, which [06](06-adopted-practices.md) surfaced
+- [ ] Name the funding model for the public-goods side of the network.
+      [ADR-0007](adr/0007-distribution-and-sybil-resistance.md) rules out Pi's
+      answer (monetising users' attention) without yet naming ours
 - [ ] Local-language docs (Swahili, French, Arabic, Hausa, Amharic, Portuguese)
 
 **Exit criterion:** an external developer ships a working app in a weekend

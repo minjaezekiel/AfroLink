@@ -99,6 +99,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [02 — Tokenomics](docs/02-tokenomics.md) | AFRI vs ASh, supply, fees, sovereign stablecoins. |
 | [04 — Earning](docs/04-earning-and-participation.md) | How people earn without capital or grid power. |
 | [05 — Roadmap](docs/05-roadmap.md) | Phased plan, exit criteria, and the risks that actually matter. |
+| [06 — Adopted practices](docs/06-adopted-practices.md) | What each system we studied contributed, and where it lives in the code. |
 | [ADR-0001](docs/adr/0001-sovereign-rust-l1.md) | Why a sovereign Rust L1, and why the alternatives were declined. |
 | [ADR-0002](docs/adr/0002-consensus.md) | Ubuntu-BFT: why boring consensus. |
 | [ADR-0003](docs/adr/0003-contract-vm.md) | CosmWasm (ink! went unmaintained in Jan 2026). |

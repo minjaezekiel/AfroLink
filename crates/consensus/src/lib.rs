@@ -11,6 +11,7 @@
 //! * [`validator`] — voting power and the `> 2/3` quorum rule.
 //! * [`vote`] — vote accounting, duplicate suppression and equivocation evidence.
 //! * [`round`] — the round state machine and the locking rules.
+//! * [`decentralization`] — concentration measured and published, not claimed.
 //!
 //! There is **no networking here**. This is a pure state machine over messages,
 //! which is what makes Byzantine behaviour testable without a network: every
@@ -29,11 +30,13 @@
 )]
 
 pub mod commit;
+pub mod decentralization;
 pub mod round;
 pub mod validator;
 pub mod vote;
 
 pub use commit::{Commit, CommitError};
+pub use decentralization::Decentralization;
 pub use round::{Decision, RoundState, Step};
 pub use validator::{CountryCode, Validator, ValidatorError, ValidatorSet};
 pub use vote::{Equivocation, SignedVote, Vote, VoteError, VoteOutcome, VoteSet, VoteType};
