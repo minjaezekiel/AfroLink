@@ -26,8 +26,10 @@
     )
 )]
 
+pub mod nodes;
 pub mod smt;
 pub mod store;
 
+pub use nodes::{MemoryNodes, Node, NodeSink, NodeSource, WriteStats, commit_tree, load_tree};
 pub use smt::{Proof, ProofLeaf, SparseMerkleTree};
 pub use store::{KeyValueStore, MemoryStore, StateError, StoreKey};

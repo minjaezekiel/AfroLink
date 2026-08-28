@@ -30,7 +30,10 @@ the transaction path is not.)*
 - [x] Validator set, voting power, +2/3 quorum, equivocation evidence
 - [x] Genesis, block production and application *(distribution limits enforced)*
 - [x] Durable storage backend (redb): blocks, commits, genesis *(10 tests)*
-- [ ] State snapshotting — replay is O(chain) and must not ship to a long-lived network
+- [x] Content-addressed state persistence — O(1) startup *(ADR-0006)*
+- [ ] Retention and garbage collection over shared node structure
+- [ ] Incremental copy-on-write node writes (currently O(n) CPU per commit)
+- [ ] Node roles: validator / archive / serving
 - [ ] Pruning
 - [x] Proof-carrying query verification (light client) *(12 tests)*
 - [ ] JSON-RPC + gRPC to serve those queries over a network

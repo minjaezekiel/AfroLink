@@ -188,6 +188,18 @@ impl MemoryStore {
     pub fn is_empty(&self) -> bool {
         self.tree.is_empty()
     }
+
+    /// The underlying tree, for persistence.
+    #[must_use]
+    pub fn tree(&self) -> &SparseMerkleTree {
+        &self.tree
+    }
+
+    /// Wrap an already-built tree, as reconstructed from persisted nodes.
+    #[must_use]
+    pub fn from_tree(tree: SparseMerkleTree) -> Self {
+        Self { tree }
+    }
 }
 
 impl KeyValueStore for MemoryStore {

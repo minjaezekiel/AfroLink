@@ -1,26 +1,35 @@
 //! Durable storage for the chain.
 //!
-//! # What is persisted, and what is not
+//! # What is persisted
 //!
-//! This store keeps the **genesis file, every block, and every commit
-//! certificate**. It does *not* persist the state tree. On startup the node
-//! replays blocks from genesis to reconstruct state, then checks that the
-//! resulting `app_hash` matches the one in the last stored header.
+//! Genesis, every block, every commit certificate, and — since
+//! [ADR-0006](../../../docs/adr/0006-state-persistence-and-retention.md) — the
+//! **state tree itself**, stored content-addressed in XRP Ledger's
+//! SHAMap/NodeStore style.
 //!
-//! That is a deliberate trade, and worth being explicit about:
+//! Startup is therefore a single root lookup rather than a replay of the chain.
+//! Replay is kept as the repair path: if nodes are missing or were pruned, the
+//! node rebuilds from genesis and checks every block's computed `app_hash`
+//! against its stored header, so corruption or a change in execution semantics
+//! fails loudly instead of forking.
 //!
-//! * **Cost:** startup is `O(chain length)`. At 1s blocks a year of history is
-//!   ~31 million blocks, which is far too slow — so state snapshotting is
-//!   required before any long-lived network, and is on the Phase 2 roadmap.
-//! * **Benefit:** there is exactly one source of truth. A state snapshot that
-//!   disagrees with the blocks is a silent, catastrophic class of bug; replay
-//!   makes that disagreement impossible to represent, and the app-hash check on
-//!   startup turns database corruption or an accidental change in execution
-//!   semantics into a loud failure rather than a fork.
-//!
-//! Blocks and commits are stored together and atomically, because a block
+//! Blocks and commits are written together and atomically, because a block
 //! without its certificate cannot be served to a light client, and a certificate
 //! without its block proves nothing.
+//!
+//! TRON needs an explicit checkpoint mechanism here because its underlying
+//! stores cannot make one atomic write across several databases. redb gives us
+//! real multi-table transactions, so the atomicity comes from the storage layer
+//! rather than from a protocol on top of it.
+//!
+//! # Not yet done
+//!
+//! * **Retention.** Nothing is ever deleted. XRPL's `online_delete` keeps the
+//!   most recent 2,000 ledgers by default, and its full history had reached
+//!   ~39 TB by January 2026 — bounded retention is not optional at scale.
+//! * **Incremental writes.** Only new nodes reach disk, so writes are already
+//!   `O(log n)` per changed key, but the node set is recomputed each commit at
+//!   `O(n)` CPU. Copy-on-write updates are the follow-up.
 
 #![cfg_attr(
     test,
@@ -39,7 +48,8 @@ use afrolink_crypto::hash::Hash32;
 use afrolink_executor::{Block, Executor, Genesis, GenesisError, GenesisLimits};
 use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Encode, decode_exact};
-use afrolink_state::MemoryStore;
+use afrolink_state::nodes::{Node, NodeSink, NodeSource, WriteStats, commit_tree, load_tree};
+use afrolink_state::{KeyValueStore, MemoryStore};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use thiserror::Error;
@@ -50,6 +60,8 @@ const BLOCKS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("blocks");
 const COMMITS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("commits");
 /// Singleton values: genesis, latest height.
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
+/// State tree nodes, keyed by their own hash (ADR-0006).
+const NODES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("nodes");
 
 const KEY_GENESIS: &str = "genesis";
 const KEY_HEIGHT: &str = "height";
@@ -126,6 +138,7 @@ impl ChainStore {
             tx.open_table(BLOCKS).map_err(db_err)?;
             tx.open_table(COMMITS).map_err(db_err)?;
             tx.open_table(META).map_err(db_err)?;
+            tx.open_table(NODES).map_err(db_err)?;
         }
         tx.commit().map_err(db_err)?;
         Ok(Self { db })
@@ -280,6 +293,81 @@ impl ChainStore {
         Ok((state, tip))
     }
 
+    /// Persist the state tree, writing only nodes not already stored.
+    ///
+    /// Implements [ADR-0006]: nodes are content-addressed, so unchanged subtrees
+    /// keep their hashes and are skipped. Returns the root and how many nodes
+    /// were actually written.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Database`] on write failure.
+    pub fn persist_state(&self, state: &MemoryStore) -> Result<(Hash32, WriteStats)> {
+        let tx = self.db.begin_write().map_err(db_err)?;
+        let result = {
+            let table = tx.open_table(NODES).map_err(db_err)?;
+            let mut sink = TableSink {
+                table,
+                failed: None,
+            };
+            let (root, stats) = commit_tree(state.tree(), &mut sink);
+            match sink.failed {
+                Some(e) => Err(StoreError::Database(e)),
+                None => Ok((root, stats)),
+            }
+        };
+        let out = result?;
+        tx.commit().map_err(db_err)?;
+        Ok(out)
+    }
+
+    /// Reconstruct state from the nodes reachable from `root`.
+    ///
+    /// Returns `None` if any node is missing, which is how a truncated or
+    /// pruned store is detected rather than silently yielding partial state.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Database`] on read failure.
+    pub fn load_state(&self, root: Hash32) -> Result<Option<MemoryStore>> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let table = tx.open_table(NODES).map_err(db_err)?;
+        let source = TableSource { table };
+        Ok(load_tree(root, &source).map(MemoryStore::from_tree))
+    }
+
+    /// Open state for the stored tip, replaying only if necessary.
+    ///
+    /// The fast path is a single root lookup, which is the point of ADR-0006:
+    /// startup no longer costs `O(chain length)`. Replay remains as the repair
+    /// path for a store whose nodes are missing or pruned, and its app-hash
+    /// check still catches corruption.
+    ///
+    /// Returns the state, the tip block, and whether replay was needed.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if neither path can produce verified state.
+    pub fn open_state(&self, limits: GenesisLimits) -> Result<(MemoryStore, Block, bool)> {
+        let height = self.height()?;
+
+        if height == Height::GENESIS {
+            let (state, tip) = self.replay(limits)?;
+            return Ok((state, tip, true));
+        }
+
+        if let Some(tip) = self.block(height)?
+            && let Some(state) = self.load_state(tip.header.app_hash)?
+        {
+            // Cheap sanity check: the reconstructed tree must hash to the root
+            // we asked for. Guards against a node store that decodes but is
+            // structurally wrong.
+            if state.root() == tip.header.app_hash {
+                return Ok((state, tip, false));
+            }
+        }
+
+        let (state, tip) = self.replay(limits)?;
+        Ok((state, tip, true))
+    }
+
     /// The state root the store's tip claims.
     ///
     /// # Errors
@@ -290,6 +378,45 @@ impl ChainStore {
             return Ok(None);
         }
         Ok(self.block(height)?.map(|b| b.header.app_hash))
+    }
+}
+
+/// Reads nodes straight out of the database.
+struct TableSource {
+    table: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+}
+
+impl NodeSource for TableSource {
+    fn get_node(&self, hash: Hash32) -> Option<Node> {
+        let raw = self.table.get(hash.as_bytes().as_slice()).ok()??;
+        decode_exact::<Node>(raw.value()).ok()
+    }
+}
+
+/// Writes nodes into the database, skipping any already present.
+///
+/// Content addressing makes the skip safe: a node's key *is* its hash, so an
+/// existing entry is byte-identical to what we would write.
+struct TableSink<'txn> {
+    table: redb::Table<'txn, &'static [u8], &'static [u8]>,
+    /// First write error, surfaced after the tree walk rather than panicking
+    /// inside it — this runs on the commit path and must not abort a node.
+    failed: Option<String>,
+}
+
+impl NodeSink for TableSink<'_> {
+    fn has_node(&self, hash: Hash32) -> bool {
+        matches!(self.table.get(hash.as_bytes().as_slice()), Ok(Some(_)))
+    }
+
+    fn put_node(&mut self, hash: Hash32, node: &Node) {
+        if let Err(e) = self
+            .table
+            .insert(hash.as_bytes().as_slice(), node.to_bytes().as_slice())
+            && self.failed.is_none()
+        {
+            self.failed = Some(e.to_string());
+        }
     }
 }
 
@@ -573,5 +700,143 @@ mod tests {
         let (temp, live) = seeded("tiphash", 3);
         let store = ChainStore::open(temp.path()).expect("reopens");
         assert_eq!(store.tip_app_hash().expect("reads"), Some(live.root()));
+    }
+    #[test]
+    fn state_persists_and_reloads_from_its_root() {
+        // The ADR-0006 fast path: startup is a root lookup, not a replay.
+        let (temp, live) = seeded("persist", 3);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+
+        let (root, _) = store.persist_state(&live).expect("persists");
+        assert_eq!(root, live.root());
+
+        let reloaded = store
+            .load_state(root)
+            .expect("reads")
+            .expect("all nodes present");
+        assert_eq!(
+            reloaded.root(),
+            live.root(),
+            "reloaded state must match exactly"
+        );
+    }
+
+    #[test]
+    fn startup_uses_the_fast_path_when_state_is_persisted() {
+        let (temp, live) = seeded("faststart", 3);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+        store.persist_state(&live).expect("persists");
+
+        let (state, tip, replayed) = store.open_state(GenesisLimits::devnet()).expect("opens");
+        assert!(!replayed, "persisted state must not trigger a replay");
+        assert_eq!(state.root(), live.root());
+        assert_eq!(tip.header.height, Height(3));
+    }
+
+    #[test]
+    fn startup_falls_back_to_replay_when_nodes_are_absent() {
+        // A store with blocks but no persisted nodes — an older database, or one
+        // that was pruned. It must still start, just slowly.
+        let (temp, live) = seeded("fallback", 3);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+
+        let (state, tip, replayed) = store.open_state(GenesisLimits::devnet()).expect("opens");
+        assert!(replayed, "with no nodes stored, replay is the only route");
+        assert_eq!(
+            state.root(),
+            live.root(),
+            "and it must land on the same state"
+        );
+        assert_eq!(tip.header.height, Height(3));
+    }
+
+    #[test]
+    fn only_changed_nodes_are_written_between_versions() {
+        // Structural sharing at the database layer: a second commit that changes
+        // little must write little, or persistence costs O(state) per block.
+        let temp = TempDb::new("sharing");
+        let store = ChainStore::open(temp.path()).expect("opens");
+        let g = genesis();
+        store.put_genesis(&g).expect("stores genesis");
+
+        let mut state = MemoryStore::new();
+        g.apply(&mut state, GenesisLimits::devnet())
+            .expect("applies");
+        for i in 0..400u32 {
+            state.set(
+                &afrolink_state::StoreKey::balance(&addr(60), &kes()),
+                i.to_le_bytes().to_vec(),
+            );
+            state.set(
+                &afrolink_state::StoreKey::new(
+                    afrolink_state::store::Namespace::Account,
+                    &[&i.to_le_bytes()],
+                ),
+                vec![1],
+            );
+        }
+        let (_, first) = store.persist_state(&state).expect("persists");
+
+        state.set(
+            &afrolink_state::StoreKey::balance(&addr(61), &kes()),
+            vec![9],
+        );
+        let (_, second) = store.persist_state(&state).expect("persists again");
+
+        assert!(
+            second.written < first.written / 10,
+            "second commit wrote {} of {} nodes — sharing is not working",
+            second.written,
+            first.written
+        );
+    }
+
+    #[test]
+    fn re_persisting_unchanged_state_writes_nothing() {
+        let (temp, live) = seeded("idempotent", 2);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+        store.persist_state(&live).expect("first");
+        let (_, again) = store.persist_state(&live).expect("second");
+        assert_eq!(again.written, 0, "identical state must cost no writes");
+    }
+
+    #[test]
+    fn an_unknown_root_reports_absence_rather_than_partial_state() {
+        let (temp, live) = seeded("unknownroot", 1);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+        store.persist_state(&live).expect("persists");
+
+        // A root that was never committed has no nodes behind it.
+        let bogus = afrolink_crypto::hash::hash(
+            afrolink_crypto::hash::Domain::StateNode,
+            b"never committed",
+        );
+        assert!(store.load_state(bogus).expect("reads").is_none());
+    }
+
+    #[test]
+    fn historical_state_stays_addressable_after_newer_commits() {
+        // XRPL's property, at the database layer: old roots keep resolving,
+        // which is what makes an archive node a config flag rather than a fork.
+        let (temp, mut live) = seeded("history", 1);
+        let store = ChainStore::open(temp.path()).expect("reopens");
+        let (old_root, _) = store.persist_state(&live).expect("persists");
+
+        live.set(
+            &afrolink_state::StoreKey::balance(&addr(50), &kes()),
+            vec![7],
+        );
+        let (new_root, _) = store.persist_state(&live).expect("persists");
+        assert_ne!(old_root, new_root);
+
+        let old = store
+            .load_state(old_root)
+            .expect("reads")
+            .expect("old root resolves");
+        assert_eq!(
+            old.root(),
+            old_root,
+            "historical state must still reconstruct"
+        );
     }
 }

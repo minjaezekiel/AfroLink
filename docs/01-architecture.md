@@ -193,9 +193,9 @@ assumes the node's peers are hostile and its RPC provider is lying.
 | Consensus driver + deterministic simulator | **done**, 10 tests |
 | Commit certificates | **done**, 10 tests |
 | Light client (header + state proof verification) | **done**, 12 tests |
-| Durable block/commit storage (redb) | **done**, 10 tests |
+| Durable storage: blocks, commits, content-addressed state | **done**, 17 tests |
 | RPC, CLI | next |
 | libp2p networking | not started |
 | CosmWasm integration | not started |
 
-226 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.
+241 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.

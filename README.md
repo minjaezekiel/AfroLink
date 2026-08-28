@@ -36,7 +36,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Ten crates, **226 tests passing**. A working chain:
+**Phase 1 in progress.** Ten crates, **241 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; and the chain survives a restart.
 Still in-process — no sockets yet.
@@ -52,7 +52,7 @@ crates/
   consensus/    validator sets, vote accounting, round state machine     40 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
   light/        commit + state proof verification for wallets            12 tests ✅
-  store/        durable blocks and commits, state rebuilt by replay      10 tests ✅
+  store/        durable blocks, commits and content-addressed state     17 tests ✅
 ```
 
 Next: a JSON-RPC server to serve the proof-carrying queries the light client
@@ -104,6 +104,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0003](docs/adr/0003-contract-vm.md) | CosmWasm (ink! went unmaintained in Jan 2026). |
 | [ADR-0004](docs/adr/0004-no-proof-of-work.md) | Why no mining — and what replaces it. |
 | [ADR-0005](docs/adr/0005-african-first-design.md) | What "designed for Africa" rejects, keeps, and builds instead. |
+| [ADR-0006](docs/adr/0006-state-persistence-and-retention.md) | State persistence, drawn from XRPL's NodeStore and TRON's lite fullnode. |
 
 ## Decisions taken
 

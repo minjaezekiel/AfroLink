@@ -189,6 +189,23 @@ impl SparseMerkleTree {
         self.entries.get(&key_hash(key))
     }
 
+    /// Iterate entries as `(path hash, value)`, in canonical order.
+    ///
+    /// Used by [`crate::nodes`] to materialise the tree for persistence.
+    pub fn entries(&self) -> impl Iterator<Item = (Hash32, &Vec<u8>)> {
+        self.entries.iter().map(|(k, v)| (*k, v))
+    }
+
+    /// Build a tree directly from already-hashed entries.
+    ///
+    /// The counterpart of [`Self::entries`], used when reconstructing a tree
+    /// from persisted nodes. Keys are already path hashes, so they are not
+    /// re-hashed.
+    #[must_use]
+    pub fn from_entries(entries: BTreeMap<Hash32, Vec<u8>>) -> Self {
+        Self { entries }
+    }
+
     /// The current root hash.
     #[must_use]
     pub fn root(&self) -> Hash32 {
