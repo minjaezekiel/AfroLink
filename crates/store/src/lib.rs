@@ -430,7 +430,7 @@ mod tests {
     use afrolink_bank::Issuer;
     use afrolink_consensus::{CountryCode, Validator, ValidatorSet, Vote, VoteType};
     use afrolink_crypto::{Address, SecretKey};
-    use afrolink_executor::Allocation;
+    use afrolink_executor::{Allocation, ValidatorSets};
     use afrolink_primitives::{Amount, ChainId, Denom, Round, Timestamp};
     use afrolink_state::KeyValueStore;
     use std::path::PathBuf;
@@ -514,6 +514,7 @@ mod tests {
             Timestamp::from_millis(1_700_000_001_000),
             parent.header.id(),
             Vec::new(),
+            ValidatorSets::unchanged(&validators()),
         );
         let block_id = block.header.id();
         let signatures = (1..=3u8)

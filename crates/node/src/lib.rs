@@ -41,7 +41,7 @@ use afrolink_consensus::{
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
-use afrolink_executor::{Block, Executor};
+use afrolink_executor::{Block, Executor, ValidatorSets};
 use afrolink_primitives::{ChainId, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore};
 use afrolink_types::Transaction;
@@ -208,12 +208,16 @@ impl Node {
     /// Build a block by executing `transactions` against a copy of state.
     fn build_block(&self, time: Timestamp, transactions: Vec<Transaction>) -> Block {
         let mut trial = self.store.clone();
+        // Validator set changes are not implemented yet, so this block and the
+        // next are signed by the same set. The header commits to both regardless,
+        // which is what lets a light client skip ahead (ADR-0010).
         let (block, _) = self.executor.build_block(
             &mut trial,
             self.height,
             time,
             self.last_block_id,
             transactions,
+            ValidatorSets::unchanged(&self.validators),
         );
         block
     }

@@ -35,7 +35,10 @@ the transaction path is not.)*
 - [ ] Incremental copy-on-write node writes (currently O(n) CPU per commit)
 - [ ] Node roles: validator / archive / serving
 - [ ] Pruning
-- [x] Proof-carrying query verification (light client) *(12 tests)*
+- [x] Proof-carrying query verification (light client) *(20 tests)*
+- [x] **Long-range attack defence** — trusting period, validator-set commitments
+      in headers, skipping verification, checkpoint onboarding
+      *(ADR-0010, 8 adversarial tests)*
 - [x] Decentralisation measured, not claimed — stake and **geographic**
       concentration, Nakamoto coefficients *(ADR-0007, 8 tests)*
 - [x] Query protocol — typed queries, proof-carrying answers, adversarial tests
@@ -55,7 +58,12 @@ deterministic simulator in `crates/node/src/sim.rs`.
 - [ ] libp2p networking, gossip, peer scoring
 - [~] Byzantine testing — equivocation and crash-fault cases covered by the
       in-process simulator; partition and clock skew still to do
-- [ ] Slashing for double-sign and downtime
+- [ ] Staking and validator set changes — the headers already commit to set
+      transitions, so light clients follow them safely once this lands *(ADR-0010)*
+- [ ] Slashing for double-sign and downtime, and enforcing the 21-day unbonding
+      period the trusting period is derived from *(ADR-0010)*
+- [ ] Bisection helper for skipping sync — the protocol supports it; the retry
+      loop that halves the gap on `InsufficientOverlap` is not written
 - [ ] Fast sync and state sync
 - [ ] **Free transaction quota per account** — TRON's bandwidth model, so an
       ordinary user needs neither AFRI nor a sponsor to transact *(R2; the gap

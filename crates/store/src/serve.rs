@@ -88,7 +88,7 @@ mod tests {
     use afrolink_bank::Issuer;
     use afrolink_consensus::{Commit, CountryCode, Validator, ValidatorSet, Vote, VoteType};
     use afrolink_crypto::{Address, SecretKey};
-    use afrolink_executor::{Allocation, Block, Executor, Genesis, GenesisLimits};
+    use afrolink_executor::{Allocation, Block, Executor, Genesis, GenesisLimits, ValidatorSets};
     use afrolink_light::LightClient;
     use afrolink_primitives::{Amount, Denom, Round, Timestamp};
     use afrolink_rpc::{Query, Response, answer};
@@ -99,6 +99,11 @@ mod tests {
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&key(seed).public_key())
+    }
+
+    /// A wall-clock reading well inside the trusting period for these fixtures.
+    fn now() -> Timestamp {
+        Timestamp::from_millis(1_700_000_100_000)
     }
 
     fn chain() -> ChainId {
@@ -178,6 +183,7 @@ mod tests {
             Timestamp::from_millis(1_700_000_001_000),
             genesis_block.header.id(),
             Vec::new(),
+            ValidatorSets::unchanged(&validators()),
         );
         let tip_commit = commit_for(&tip);
         store.put_block(&tip, &tip_commit).unwrap();
@@ -186,7 +192,15 @@ mod tests {
         // The wallet starts at genesis — its only act of trust — and walks
         // forward by verifying commits, exactly as it would in the field.
         let mut client = LightClient::new(chain(), validators(), genesis_block.header.clone());
-        client.update(tip.header.clone(), &tip_commit).unwrap();
+        client
+            .update(
+                tip.header.clone(),
+                &tip_commit,
+                validators(),
+                validators(),
+                now(),
+            )
+            .unwrap();
 
         (store, state, tip, client)
     }
@@ -313,6 +327,7 @@ mod tests {
             Timestamp::from_millis(1_700_000_002_000),
             parent.header.id(),
             transactions,
+            ValidatorSets::unchanged(&validators()),
         );
         assert_eq!(
             outcome.succeeded(),
@@ -328,7 +343,15 @@ mod tests {
         let commit = commit_for(&block);
         store.put_block(&block, &commit).unwrap();
         store.persist_state(state).unwrap();
-        client.update(block.header.clone(), &commit).unwrap();
+        client
+            .update(
+                block.header.clone(),
+                &commit,
+                validators(),
+                validators(),
+                now(),
+            )
+            .unwrap();
         block
     }
 

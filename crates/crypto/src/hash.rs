@@ -110,6 +110,9 @@ pub enum Domain {
     GroupAddress,
     /// A module-owned account address, derived from the module's name.
     ModuleAddress,
+    /// Commits to a validator set, so a header can name who may sign the next
+    /// block without carrying the whole set.
+    ValidatorSetHash,
     /// Commits to a phone number or email address without revealing it.
     ///
     /// The identifier never reaches the chain; only this commitment does. The
@@ -135,6 +138,7 @@ impl Domain {
             Self::ValidatorId => "afrolink/v1/validator-id",
             Self::GroupAddress => "afrolink/v1/group-address",
             Self::ModuleAddress => "afrolink/v1/module-address",
+            Self::ValidatorSetHash => "afrolink/v1/validator-set-hash",
             Self::ContactCommitment => "afrolink/v1/contact-commitment",
         }
     }

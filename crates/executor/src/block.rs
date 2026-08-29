@@ -1,5 +1,6 @@
 //! Block and header types.
 
+use afrolink_consensus::ValidatorSet;
 use afrolink_crypto::hash::{Domain, Hash32, hash};
 use afrolink_crypto::merkle::MerkleTree;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
@@ -26,6 +27,20 @@ pub struct BlockHeader {
     pub tx_root: Hash32,
     /// State root *after* this block is applied.
     pub app_hash: Hash32,
+    /// Commitment to the validator set that signed **this** block.
+    ///
+    /// Lets a light client check that a set handed to it is the one the chain
+    /// committed to, rather than one an attacker chose.
+    pub validators_hash: Hash32,
+    /// Commitment to the validator set that will sign the **next** block.
+    ///
+    /// This is the field that makes skipping verification possible: a client
+    /// verifying header `h` learns, from `h` itself, who is entitled to sign
+    /// `h+1`. Without it a client must download every intervening header to
+    /// follow validator set changes, which is the difference between syncing a
+    /// phone in seconds and syncing it in hours
+    /// ([ADR-0010](../../../docs/adr/0010-long-range-attacks.md)).
+    pub next_validators_hash: Hash32,
 }
 
 impl BlockHeader {
@@ -33,6 +48,30 @@ impl BlockHeader {
     #[must_use]
     pub fn id(&self) -> Hash32 {
         hash(Domain::BlockId, &self.to_bytes())
+    }
+}
+
+/// The validator sets a header commits to.
+///
+/// Bundled rather than passed loose so the two can never be swapped at a call
+/// site — reversing them would make a light client verify the wrong set and
+/// silently break skipping verification.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatorSets<'a> {
+    /// The set signing this block.
+    pub current: &'a ValidatorSet,
+    /// The set entitled to sign the next one.
+    pub next: &'a ValidatorSet,
+}
+
+impl<'a> ValidatorSets<'a> {
+    /// Both sets are the same — the common case, since the set changes rarely.
+    #[must_use]
+    pub fn unchanged(set: &'a ValidatorSet) -> Self {
+        Self {
+            current: set,
+            next: set,
+        }
     }
 }
 
@@ -70,6 +109,8 @@ impl Encode for BlockHeader {
         self.parent.encode(out);
         self.tx_root.encode(out);
         self.app_hash.encode(out);
+        self.validators_hash.encode(out);
+        self.next_validators_hash.encode(out);
     }
 }
 
@@ -82,6 +123,8 @@ impl Decode for BlockHeader {
             parent: Hash32::decode(r)?,
             tx_root: Hash32::decode(r)?,
             app_hash: Hash32::decode(r)?,
+            validators_hash: Hash32::decode(r)?,
+            next_validators_hash: Hash32::decode(r)?,
         })
     }
 }

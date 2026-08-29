@@ -187,6 +187,10 @@ impl Genesis {
             store.set_encoded(&StoreKey::account(&address), &Account::individual(address));
         }
 
+        // Genesis signs for itself and for the next block: the set does not
+        // change at height 0, and a light client's root of trust is exactly
+        // this pair of commitments.
+        let validators_hash = self.validators.hash();
         let header = BlockHeader {
             chain_id: self.chain_id.clone(),
             height: Height::GENESIS,
@@ -194,6 +198,8 @@ impl Genesis {
             parent: Hash32::ZERO,
             tx_root: Block::tx_root(&[]),
             app_hash: store.root(),
+            validators_hash,
+            next_validators_hash: validators_hash,
         };
         Ok(Block {
             header,

@@ -75,6 +75,10 @@ impl Network {
 
     /// Start the current round on every live node.
     pub fn start_round(&mut self) {
+        // Advance one second per round. Header times are strictly monotonic on
+        // a real chain, and a light client depends on that to bound how stale
+        // its trusted header is (ADR-0010).
+        self.time = Timestamp::from_millis(self.time.0.saturating_add(1_000));
         let time = self.time;
         for i in 0..self.nodes.len() {
             if !self.is_live(i) {
@@ -169,6 +173,11 @@ mod tests {
     use afrolink_types::{Fee, Message, Transaction, TxBody};
 
     const COUNTRIES: [&str; 4] = ["ke", "ng", "za", "tz"];
+
+    /// A wall-clock reading well inside the trusting period for these fixtures.
+    fn now() -> Timestamp {
+        Timestamp::from_millis(1_700_000_100_000)
+    }
 
     fn chain() -> ChainId {
         ChainId::new("afrolink-1").expect("valid")
@@ -434,7 +443,9 @@ mod tests {
         let actions = net
             .nodes
             .get_mut(proposer)
-            .map(|n| n.start_round(Timestamp::from_millis(1_700_000_000_000)))
+            // One second after genesis: header times are strictly monotonic, and
+            // a light client relies on that to bound how stale its trust is.
+            .map(|n| n.start_round(Timestamp::from_millis(1_700_000_001_000)))
             .unwrap_or_default();
 
         let mut forged = actions
@@ -486,7 +497,9 @@ mod tests {
         let actions = net
             .nodes
             .get_mut(impostor)
-            .map(|n| n.start_round(Timestamp::from_millis(1_700_000_000_000)))
+            // One second after genesis: header times are strictly monotonic, and
+            // a light client relies on that to bound how stale its trust is.
+            .map(|n| n.start_round(Timestamp::from_millis(1_700_000_001_000)))
             .unwrap_or_default();
 
         assert!(
@@ -503,7 +516,8 @@ mod tests {
         // only the genesis header and the validator set follows the chain and
         // checks a balance against a proof from an untrusted server.
         let (mut net, genesis, validators) = setup(4);
-        let mut client = afrolink_light::LightClient::new(chain(), validators, genesis.header);
+        let mut client =
+            afrolink_light::LightClient::new(chain(), validators.clone(), genesis.header);
 
         for node in &mut net.nodes {
             node.mempool.push(payment(0, 750));
@@ -524,7 +538,13 @@ mod tests {
             .expect("a certificate was produced");
 
         client
-            .update(block.header, &commit)
+            .update(
+                block.header,
+                &commit,
+                validators.clone(),
+                validators.clone(),
+                now(),
+            )
             .expect("a real commit from a real quorum must verify");
         assert_eq!(client.height(), Height(1));
 

@@ -34,7 +34,7 @@
 pub mod block;
 pub mod genesis;
 
-pub use block::{Block, BlockHeader};
+pub use block::{Block, BlockHeader, ValidatorSets};
 pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
 
 use afrolink_alias::{BindError, Bindings, Registry, RegistryError};
@@ -174,6 +174,9 @@ impl Executor {
     }
 
     /// Build the header for a block, executing it to obtain the app hash.
+    /// `sets` names who signs this block and who may sign the next. Committing
+    /// to both is what lets a light client skip ahead safely
+    /// ([ADR-0010](../../../docs/adr/0010-long-range-attacks.md)).
     pub fn build_block<S>(
         &self,
         store: &mut S,
@@ -181,6 +184,7 @@ impl Executor {
         time: Timestamp,
         parent: Hash32,
         transactions: Vec<Transaction>,
+        sets: ValidatorSets<'_>,
     ) -> (Block, BlockOutcome)
     where
         S: KeyValueStore + Clone,
@@ -194,6 +198,8 @@ impl Executor {
             parent,
             tx_root,
             app_hash: outcome.app_hash,
+            validators_hash: sets.current.hash(),
+            next_validators_hash: sets.next.hash(),
         };
         (
             Block {
@@ -515,6 +521,18 @@ mod tests {
 
     fn sk(seed: u8) -> SecretKey {
         SecretKey::from_bytes(&[seed; 32])
+    }
+
+    /// A single-validator set, enough for the header commitments these tests
+    /// exercise. Validator-set *changes* are covered in `crates/light`.
+    fn validators() -> afrolink_consensus::ValidatorSet {
+        use afrolink_consensus::{CountryCode, Validator, ValidatorSet};
+        ValidatorSet::new(vec![Validator::new(
+            sk(1).public_key(),
+            10,
+            CountryCode::new("ke").expect("valid"),
+        )])
+        .expect("valid set")
     }
 
     fn addr(seed: u8) -> Address {
@@ -1070,6 +1088,7 @@ mod tests {
             Timestamp::from_millis(1_700_000_000_000),
             Hash32::ZERO,
             txs,
+            ValidatorSets::unchanged(&validators()),
         );
 
         assert!(

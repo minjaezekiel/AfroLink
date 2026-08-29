@@ -54,12 +54,22 @@ be fine rather than pretending otherwise.
 
 ---
 
+## Cardano / Ouroboros — [ADR-0010](adr/0010-long-range-attacks.md)
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **Ouroboros Genesis chain-density rule** — bootstrap from genesis with no checkpoint at all | **Admired, not built.** Theoretically the strongest answer, and it removes the social trust assumption entirely. Cardano's own implementation is still a prototype under audit after years; inventing our own would be worse | [ADR-0010](adr/0010-long-range-attacks.md) | **Rejected** (revisit) |
+| **Key-evolving signatures (KES)** — old keys are erased, so a leaked key cannot re-sign old slots | Deferred. Closes posterior corruption cryptographically rather than economically, but requires every validator to erase key material correctly on schedule, and a mistake is silent | [ADR-0010](adr/0010-long-range-attacks.md) | **Open** (post-mainnet) |
+
+---
+
 ## Ethereum — [ADR-0009](adr/0009-developer-payment-surface.md)
 
 | Practice | Decision | Where it lives | Status |
 |---|---|---|---|
 | **ERC-681 payment request URIs** — one string a merchant emits, any wallet understands | Taken as the `afri:` scheme. The integration is a string, never an SDK | `crates/pay/src/request.rs` | **In code** |
 | **x402 / HTTP 402** — a machine-checkable paywall with no account, card or subscription | Taken. We build a facilitator rather than a competing standard | [ADR-0009](adr/0009-developer-payment-surface.md) §1.2 | **Open** (Phase 2) |
+| **Weak subjectivity checkpoints** — a syncing node needs a recent finalised checkpoint | Taken, with the social assumption named rather than hidden | `LightClient::from_checkpoint`, [ADR-0010](adr/0010-long-range-attacks.md) | **In code** |
 | ERC-20 — assets as contracts | **Not needed.** Assets are native ledger objects, so a stablecoin is not a contract someone might have written wrong | `crates/bank` | **In code** |
 | ERC-4337 / EIP-7702 account abstraction, to pay gas in something other than the native coin | **Not needed.** Fee abstraction is in the base protocol: any whitelisted denom, and a third party may pay | `crates/types/src/tx.rs` (`Fee`) | **In code** |
 | EIP-3009 / ERC-2612 gasless approvals | **Not needed** — same reason | — | **Rejected** |
@@ -110,6 +120,8 @@ adopted practice than any other single source, in both directions.
 | Equivocation evidence as a first-class object | Taken | `crates/consensus/src/vote.rs` | **In code** |
 | Commit certificates a light client can verify | Taken | `crates/consensus/src/commit.rs`, `crates/light` | **In code** |
 | **State sync** — join in minutes by verifying state against a header you checked independently | Taken; we already have every piece | ADR-0006 §4, `crates/light` | **Decided** |
+| **Trusting period and skipping verification** — refuse to verify past a deadline shorter than unbonding; skip ahead on ⅓ overlap | Taken wholesale. This is the long-range attack defence, and the reason a phone can sync at all | `crates/light`, [ADR-0010](adr/0010-long-range-attacks.md) | **In code** |
+| **21-day unbonding period** (Cosmos Hub) | Taken as the economic root the trusting period is derived from | `crates/light` (`UNBONDING_MS`) | **In code** (parameter) / **Open** (enforcement, Phase 2) |
 | CosmWasm as the contract VM | Taken (ink! unmaintained since Jan 2026) | ADR-0003 | **Decided** |
 | IBC for interop | Taken | ADR-0001, Phase 4 | **Open** |
 | The Cosmos SDK itself | **Rejected** — Go, and the monetary modules we need cannot live at application layer | ADR-0001 | **Rejected** |

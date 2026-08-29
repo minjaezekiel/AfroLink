@@ -38,7 +38,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Thirteen crates, **350 tests passing**. A working chain:
+**Phase 1 in progress.** Thirteen crates, **358 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -53,7 +53,7 @@ crates/
   executor/     block execution, blocks, genesis                         26 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   58 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
-  light/        commit + state proof verification for wallets            12 tests ✅
+  light/        commit + proof verification, long-range defence         20 tests ✅
   store/        durable storage, and the view that serves queries       26 tests ✅
   rpc/          proof-carrying query protocol (no networking)           14 tests ✅
   alias/        usernames, phone/email bindings, SIM-swap defence        50 tests ✅
@@ -96,6 +96,7 @@ The tests are written adversarially and named for the attack they prevent —
 `a_server_cannot_inflate_a_balance_it_reports`, `a_server_cannot_deny_a_balance_that_exists`,
 `a_proof_for_one_account_cannot_be_replayed_for_another`,
 `a_sim_swap_alone_cannot_redirect_an_alias`, `a_confusable_name_cannot_be_registered`,
+`a_client_outside_the_trusting_period_refuses_to_verify`, `a_substituted_validator_set_is_rejected`,
 `a_validator_count_hides_geographic_concentration`,
 `odd_width_does_not_collide_like_bitcoins_duplicate_rule`.
 
@@ -119,6 +120,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0007](docs/adr/0007-distribution-and-sybil-resistance.md) | What Pi Network's 70M-user experiment proved, and what it rules out. |
 | [ADR-0008](docs/adr/0008-human-readable-addressing.md) | Usernames, phone and email — and why an alias never authorises. |
 | [ADR-0009](docs/adr/0009-developer-payment-surface.md) | Accepting payment, building dApps, and what we take from Ethereum, Polkadot and XRPL. |
+| [ADR-0010](docs/adr/0010-long-range-attacks.md) | Long-range attacks — the one thing proof of stake has to answer, and how. |
 
 ## Decisions taken
 

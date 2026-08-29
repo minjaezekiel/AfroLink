@@ -26,6 +26,23 @@
 //!
 //! Crucially the second also proves **absence**, so a server cannot lie by
 //! omission — "you have no balance" is a claim it must prove like any other.
+//!
+//! # The third thing: staying inside the trusting period
+//!
+//! Signature arithmetic alone is not enough on a proof-of-stake chain. A
+//! validator who has since unbonded has nothing left to lose, so an attacker who
+//! later acquires those old keys can sign a perfectly valid-looking alternate
+//! history — a **long-range attack**. Every signature checks out; the chain is a
+//! fiction.
+//!
+//! The defence is economic and it has a deadline. Stake stays slashable for the
+//! **unbonding period** after a validator exits, so within that window forging
+//! history is punishable. Past it, it is free. A client whose trusted header is
+//! older than that window therefore cannot safely verify anything, and this
+//! client says so ([`LightError::TrustExpired`]) rather than accepting a chain
+//! it cannot judge.
+//!
+//! Full reasoning: [ADR-0010](../../../docs/adr/0010-long-range-attacks.md).
 
 #![cfg_attr(
     test,
@@ -44,7 +61,7 @@ use afrolink_crypto::Address;
 use afrolink_crypto::hash::Hash32;
 use afrolink_executor::BlockHeader;
 use afrolink_primitives::codec::decode_exact;
-use afrolink_primitives::{Amount, ChainId, Denom, Height};
+use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::{Proof, StoreKey};
 use thiserror::Error;
 
@@ -82,14 +99,76 @@ pub enum LightError {
     /// A proved value did not decode.
     #[error("proved value is malformed")]
     MalformedValue,
+    /// The trusted header is older than the trusting period.
+    ///
+    /// **Not a transient failure.** The client can no longer distinguish the
+    /// real chain from a forged one, and no amount of retrying changes that. It
+    /// needs a fresh checkpoint from a source it trusts.
+    #[error(
+        "trusted header is {age_ms}ms old, trusting period is {period_ms}ms — \
+         a new checkpoint is required"
+    )]
+    TrustExpired {
+        /// Age of the trusted header, in milliseconds.
+        age_ms: u64,
+        /// The configured trusting period, in milliseconds.
+        period_ms: u64,
+    },
+    /// A header moved backwards in time.
+    #[error("header time {got} is not after the trusted header time {trusted}")]
+    NonMonotonicTime {
+        /// Time on the offered header.
+        got: u64,
+        /// Time on the trusted header.
+        trusted: u64,
+    },
+    /// The validator set offered does not match what the chain committed to.
+    #[error("validator set does not match the commitment in the header")]
+    ValidatorSetMismatch,
+    /// Too little of the *trusted* set signed the new header to justify skipping.
+    #[error("only {got} of {needed} trusted voting power signed; cannot skip to this height")]
+    InsufficientOverlap {
+        /// Trusted power that signed.
+        got: u64,
+        /// Trusted power required.
+        needed: u64,
+    },
 }
 
-/// A wallet's view of the chain: a validator set and one trusted header.
+/// How long a trusted header stays usable, in milliseconds.
+///
+/// Two thirds of [`UNBONDING_MS`], following Tendermint's practice of keeping
+/// the trusting period comfortably inside the unbonding period. The margin is
+/// what gives the network time to detect misbehaviour and slash while the
+/// offender's stake is still bonded.
+pub const TRUSTING_PERIOD_MS: u64 = UNBONDING_MS / 3 * 2;
+
+/// How long stake stays slashable after a validator begins exiting.
+///
+/// 21 days, matching the Cosmos Hub. The number is not arbitrary: it must exceed
+/// the time it takes humans to notice an attack, agree it happened, and act —
+/// because after it elapses the offender's stake is beyond reach and forging old
+/// history becomes free.
+pub const UNBONDING_MS: u64 = 21 * 24 * 60 * 60 * 1_000;
+
+// The margin between the two is the whole mechanism: it leaves time to detect
+// misbehaviour and slash while the offender's stake is still bonded. If they
+// were equal, an attacker could unbond at the exact moment a client's trust
+// expired. Enforced at compile time so no future edit can close the gap.
+const _: () = assert!(TRUSTING_PERIOD_MS < UNBONDING_MS);
+
+/// A wallet's view of the chain.
+///
+/// Holds the trusted header plus the validator set that signed it and the set
+/// entitled to sign the next one. Carrying `next_validators` is what allows an
+/// update across a set change to be *verified* rather than assumed.
 #[derive(Debug, Clone)]
 pub struct LightClient {
     chain_id: ChainId,
     validators: ValidatorSet,
+    next_validators: ValidatorSet,
     trusted: BlockHeader,
+    trusting_period_ms: u64,
 }
 
 impl LightClient {
@@ -102,9 +181,70 @@ impl LightClient {
     pub fn new(chain_id: ChainId, validators: ValidatorSet, genesis_header: BlockHeader) -> Self {
         Self {
             chain_id,
+            next_validators: validators.clone(),
             validators,
             trusted: genesis_header,
+            trusting_period_ms: TRUSTING_PERIOD_MS,
         }
+    }
+
+    /// Start from a checkpoint rather than from genesis.
+    ///
+    /// **This is the intended way to onboard a wallet**, and the honest name for
+    /// the trust it requires. Syncing from genesis is safe but slow; syncing
+    /// from a recent header is fast and requires believing whoever supplied it.
+    ///
+    /// The belief is cheap to check and hard to abuse: a checkpoint is a height
+    /// and a hash, publishable by every validator, exchange, wallet vendor and
+    /// block explorer independently. A user who compares two sources that do not
+    /// collude has a stronger guarantee than any purely cryptographic one
+    /// available here — which is what "weak subjectivity" actually means.
+    ///
+    /// # Errors
+    /// Returns [`LightError::ValidatorSetMismatch`] if either set does not match
+    /// the header's commitments — so a bad checkpoint fails immediately rather
+    /// than poisoning every later verification.
+    pub fn from_checkpoint(
+        chain_id: ChainId,
+        header: BlockHeader,
+        validators: ValidatorSet,
+        next_validators: ValidatorSet,
+    ) -> Result<Self, LightError> {
+        if validators.hash() != header.validators_hash
+            || next_validators.hash() != header.next_validators_hash
+        {
+            return Err(LightError::ValidatorSetMismatch);
+        }
+        Ok(Self {
+            chain_id,
+            validators,
+            next_validators,
+            trusted: header,
+            trusting_period_ms: TRUSTING_PERIOD_MS,
+        })
+    }
+
+    /// Override the trusting period. Testing and bespoke deployments only.
+    #[must_use]
+    pub fn with_trusting_period(mut self, period_ms: u64) -> Self {
+        self.trusting_period_ms = period_ms;
+        self
+    }
+
+    /// Whether the trusted header is still inside the trusting period at `now`.
+    ///
+    /// A wallet should check this before showing a balance, not only before
+    /// updating: a stale trusted header makes every proof against it
+    /// meaningless, however well-formed.
+    #[must_use]
+    pub fn is_trusted_at(&self, now: Timestamp) -> bool {
+        now.0.saturating_sub(self.trusted.time.0) <= self.trusting_period_ms
+    }
+
+    /// The set entitled to sign the next block.
+    #[must_use]
+    pub fn next_validators(&self) -> &ValidatorSet {
+        &self.next_validators
     }
 
     /// The header currently trusted.
@@ -125,23 +265,29 @@ impl LightClient {
         self.trusted.app_hash
     }
 
-    /// Verify `header` and its `commit`, and adopt it as the new trusted head.
+    /// Verify the next header in sequence and adopt it.
     ///
-    /// Requires the header to be the direct successor of the trusted one. That
-    /// is the strict form; skipping ahead over many heights is a later
-    /// optimisation and needs its own trust argument about validator-set drift,
-    /// so it is deliberately not offered yet.
+    /// The strict path: `header` must be the direct successor of the trusted
+    /// one. Cheap, and the right choice when a client is already up to date.
+    ///
+    /// `validators` is the set that signed `header`. It is checked against the
+    /// trusted header's `next_validators_hash`, so a caller cannot substitute a
+    /// set of its own choosing.
     ///
     /// # Errors
-    /// Returns the first [`LightError`] encountered. The trusted header is left
+    /// Returns the first [`LightError`] encountered. The trusted state is left
     /// unchanged on any failure.
-    pub fn update(&mut self, header: BlockHeader, commit: &Commit) -> Result<(), LightError> {
-        if header.chain_id != self.chain_id {
-            return Err(LightError::WrongChain {
-                got: header.chain_id.to_string(),
-                expected: self.chain_id.to_string(),
-            });
-        }
+    pub fn update(
+        &mut self,
+        header: BlockHeader,
+        commit: &Commit,
+        validators: ValidatorSet,
+        next_validators: ValidatorSet,
+        now: Timestamp,
+    ) -> Result<(), LightError> {
+        self.check_freshness(now)?;
+        self.check_chain_and_time(&header)?;
+
         if header.height != self.trusted.height.next() {
             return Err(LightError::NonSequential {
                 got: header.height.0,
@@ -151,15 +297,188 @@ impl LightClient {
         if header.parent != self.trusted.id() {
             return Err(LightError::BrokenChain);
         }
-        // The commit must finalise *this* header, not merely be well-formed.
+        self.check_commit_and_sets(&header, commit, &validators, &next_validators)?;
+        // The set signing this block must be the one the trusted header said
+        // would sign it.
+        if header.validators_hash != self.trusted.next_validators_hash {
+            return Err(LightError::ValidatorSetMismatch);
+        }
+
+        commit.verify(&self.chain_id, &validators)?;
+        self.adopt(header, validators, next_validators);
+        Ok(())
+    }
+
+    /// Verify a header many blocks ahead without downloading the ones between.
+    ///
+    /// **This is what makes syncing a phone practical.** Walking every header
+    /// from a month-old checkpoint at one-second blocks means ~1.8 million
+    /// headers; skipping means a handful.
+    ///
+    /// The safety argument is the `1/3` overlap rule. If more than one third of
+    /// the *currently trusted* voting power signed the new header, then at least
+    /// one correct validator signed it — because a Byzantine coalition is
+    /// bounded by one third. One correct signer is enough, since a correct
+    /// validator will not sign a header on a forked chain.
+    ///
+    /// Note the threshold is `> 1/3` of the **trusted** set, *and* separately a
+    /// full `> 2/3` quorum of the **new** set. Both are required: the first ties
+    /// the new header to the history the client already believes, the second is
+    /// ordinary consensus validity.
+    ///
+    /// When overlap is insufficient the caller should bisect — verify a header
+    /// halfway between and try again — which is why
+    /// [`LightError::InsufficientOverlap`] is a distinct, recoverable error
+    /// rather than a flat rejection.
+    ///
+    /// # Errors
+    /// Returns the first [`LightError`] encountered. The trusted state is left
+    /// unchanged on any failure.
+    pub fn verify_skipping(
+        &mut self,
+        header: BlockHeader,
+        commit: &Commit,
+        validators: ValidatorSet,
+        next_validators: ValidatorSet,
+        now: Timestamp,
+    ) -> Result<(), LightError> {
+        self.check_freshness(now)?;
+        self.check_chain_and_time(&header)?;
+
+        if header.height <= self.trusted.height {
+            return Err(LightError::NonSequential {
+                got: header.height.0,
+                trusted: self.trusted.height.0,
+            });
+        }
+
+        self.check_commit_and_sets(&header, commit, &validators, &next_validators)?;
+
+        // Ordinary validity: the new set reached a quorum on this block.
+        commit.verify(&self.chain_id, &validators)?;
+
+        // The sequential case needs no overlap argument — the trusted header
+        // already named this exact set.
+        if header.height == self.trusted.height.next()
+            && header.validators_hash == self.trusted.next_validators_hash
+        {
+            self.adopt(header, validators, next_validators);
+            return Ok(());
+        }
+
+        // Skipping: require more than a third of the trusted set to have signed.
+        let overlap = self.trusted_power_in(commit);
+        let needed = self.validators.max_byzantine_power().saturating_add(1);
+        if overlap < needed {
+            return Err(LightError::InsufficientOverlap {
+                got: overlap,
+                needed,
+            });
+        }
+
+        self.adopt(header, validators, next_validators);
+        Ok(())
+    }
+
+    /// How much of the currently trusted voting power signed `commit`.
+    ///
+    /// Counts each trusted validator at most once and only for signatures that
+    /// actually verify, so a commit stuffed with repeated or forged entries
+    /// gains nothing.
+    fn trusted_power_in(&self, commit: &Commit) -> u64 {
+        let mut counted: Vec<Address> = Vec::new();
+        let mut power: u64 = 0;
+
+        for signed in &commit.signatures {
+            let address = signed.vote.validator;
+            if counted.contains(&address) {
+                continue;
+            }
+            let Some(validator) = self.validators.get(&address) else {
+                continue;
+            };
+            if validator
+                .public_key
+                .verify(
+                    afrolink_crypto::hash::Domain::VoteSignDoc,
+                    &signed.vote.sign_doc(),
+                    &signed.signature,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            counted.push(address);
+            power = power.saturating_add(validator.voting_power);
+        }
+        power
+    }
+
+    /// Network and time checks, run before anything more expensive.
+    fn check_chain_and_time(&self, header: &BlockHeader) -> Result<(), LightError> {
+        if header.chain_id != self.chain_id {
+            return Err(LightError::WrongChain {
+                got: header.chain_id.to_string(),
+                expected: self.chain_id.to_string(),
+            });
+        }
+        // Header times are strictly monotonic. Without this an attacker could
+        // present an older-timestamped header and rewind the trusting-period
+        // clock, keeping a stale client alive indefinitely.
+        if header.time <= self.trusted.time {
+            return Err(LightError::NonMonotonicTime {
+                got: header.time.0,
+                trusted: self.trusted.time.0,
+            });
+        }
+        Ok(())
+    }
+
+    /// The commit must finalise *this* header, and the supplied sets must be
+    /// the ones the header commits to.
+    ///
+    /// The second half is the check that closes the substitution hole: without
+    /// it a caller supplies both a header and the set that validates it, which
+    /// validates nothing.
+    fn check_commit_and_sets(
+        &self,
+        header: &BlockHeader,
+        commit: &Commit,
+        validators: &ValidatorSet,
+        next_validators: &ValidatorSet,
+    ) -> Result<(), LightError> {
         if commit.block_id != header.id() || commit.height != header.height {
             return Err(LightError::HeaderMismatch);
         }
-
-        commit.verify(&self.chain_id, &self.validators)?;
-
-        self.trusted = header;
+        if validators.hash() != header.validators_hash
+            || next_validators.hash() != header.next_validators_hash
+        {
+            return Err(LightError::ValidatorSetMismatch);
+        }
         Ok(())
+    }
+
+    /// Refuse to verify anything once the trusted header is too old.
+    fn check_freshness(&self, now: Timestamp) -> Result<(), LightError> {
+        let age = now.0.saturating_sub(self.trusted.time.0);
+        if age > self.trusting_period_ms {
+            return Err(LightError::TrustExpired {
+                age_ms: age,
+                period_ms: self.trusting_period_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn adopt(
+        &mut self,
+        header: BlockHeader,
+        validators: ValidatorSet,
+        next_validators: ValidatorSet,
+    ) {
+        self.trusted = header;
+        self.validators = validators;
+        self.next_validators = next_validators;
     }
 
     /// Verify a value the server claims is at `key`, against the trusted root.
@@ -210,7 +529,7 @@ mod tests {
     use afrolink_bank::{Bank, Issuer};
     use afrolink_consensus::{CountryCode, Validator, Vote, VoteType};
     use afrolink_crypto::SecretKey;
-    use afrolink_executor::{Allocation, Block, Executor, Genesis, GenesisLimits};
+    use afrolink_executor::{Allocation, Block, Executor, Genesis, GenesisLimits, ValidatorSets};
     use afrolink_primitives::codec::Encode;
     use afrolink_primitives::{Round, Timestamp};
     use afrolink_state::{KeyValueStore, MemoryStore};
@@ -221,6 +540,11 @@ mod tests {
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&key(seed).public_key())
+    }
+
+    /// A wall-clock reading well inside the trusting period for these fixtures.
+    fn now() -> Timestamp {
+        Timestamp::from_millis(1_700_000_100_000)
     }
 
     fn chain() -> ChainId {
@@ -272,9 +596,12 @@ mod tests {
         let (block, _) = executor.build_block(
             store,
             parent.header.height.next(),
-            Timestamp::from_millis(1_700_000_001_000),
+            // Time advances with height, as it does on a real chain: header
+            // times are strictly monotonic and the client relies on it.
+            Timestamp::from_millis(1_700_000_000_000 + parent.header.height.next().0 * 1_000),
             parent.header.id(),
             Vec::new(),
+            ValidatorSets::unchanged(&validators()),
         );
         let block_id = block.header.id();
         let signatures = seeds
@@ -365,7 +692,13 @@ mod tests {
         let (block, commit) = next_block(&mut store, &genesis, &[1, 2, 3]);
 
         client
-            .update(block.header.clone(), &commit)
+            .update(
+                block.header.clone(),
+                &commit,
+                validators(),
+                validators(),
+                now(),
+            )
             .expect("valid commit");
         assert_eq!(client.height(), Height(1));
         assert_eq!(client.app_hash(), block.header.app_hash);
@@ -377,7 +710,11 @@ mod tests {
         let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
         let (block, commit) = next_block(&mut store, &genesis, &[1, 2]); // 2 of 4
 
-        assert!(client.update(block.header, &commit).is_err());
+        assert!(
+            client
+                .update(block.header, &commit, validators(), validators(), now())
+                .is_err()
+        );
         assert_eq!(
             client.trusted_header(),
             &genesis.header,
@@ -394,7 +731,7 @@ mod tests {
         commit.block_id = Hash32::ZERO;
 
         assert_eq!(
-            client.update(block.header, &commit),
+            client.update(block.header, &commit, validators(), validators(), now()),
             Err(LightError::HeaderMismatch)
         );
     }
@@ -407,7 +744,7 @@ mod tests {
         block.header.height = Height(5);
 
         assert!(matches!(
-            client.update(block.header, &commit),
+            client.update(block.header, &commit, validators(), validators(), now()),
             Err(LightError::NonSequential { .. })
         ));
     }
@@ -420,7 +757,7 @@ mod tests {
         block.header.parent = Hash32::ZERO;
 
         assert_eq!(
-            client.update(block.header, &commit),
+            client.update(block.header, &commit, validators(), validators(), now()),
             Err(LightError::BrokenChain)
         );
     }
@@ -433,7 +770,7 @@ mod tests {
         block.header.chain_id = ChainId::new("afrolink-testnet-3").expect("valid");
 
         assert!(matches!(
-            client.update(block.header, &commit),
+            client.update(block.header, &commit, validators(), validators(), now()),
             Err(LightError::WrongChain { .. })
         ));
     }
@@ -447,7 +784,15 @@ mod tests {
         let mut parent = genesis;
         for _ in 0..3 {
             let (block, commit) = next_block(&mut store, &parent, &[1, 2, 3, 4]);
-            client.update(block.header.clone(), &commit).expect("valid");
+            client
+                .update(
+                    block.header.clone(),
+                    &commit,
+                    validators(),
+                    validators(),
+                    now(),
+                )
+                .expect("valid");
             parent = block;
         }
         assert_eq!(client.height(), Height(3));
@@ -459,7 +804,9 @@ mod tests {
                 .expect("transfers");
         }
         let (block, commit) = next_block(&mut store, &parent, &[1, 2, 3, 4]);
-        client.update(block.header, &commit).expect("valid");
+        client
+            .update(block.header, &commit, validators(), validators(), now())
+            .expect("valid");
 
         let key = StoreKey::balance(&addr(51), &kes());
         let (value, proof) = store.get_with_proof(&key);
@@ -497,6 +844,242 @@ mod tests {
         assert_eq!(
             client.verify_balance(&addr(50), &kes(), new_value.as_deref(), &old_proof),
             Err(LightError::BadProof)
+        );
+    }
+
+    // -- Long-range attack defence (ADR-0010) --------------------------------
+
+    #[test]
+    fn a_client_outside_the_trusting_period_refuses_to_verify() {
+        // The headline defence. Past the trusting period the old validator set
+        // may have unbonded, so a forged history is no longer punishable and
+        // the client cannot tell it from the real one. It must say so rather
+        // than accept a chain it cannot judge.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+        let (block, commit) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        let stale = Timestamp::from_millis(genesis.header.time.0 + TRUSTING_PERIOD_MS + 1);
+
+        let err = client
+            .update(block.header, &commit, validators(), validators(), stale)
+            .expect_err("a stale client must refuse");
+
+        assert!(
+            matches!(err, LightError::TrustExpired { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            client.height(),
+            Height::GENESIS,
+            "and must not move on failure"
+        );
+    }
+
+    #[test]
+    fn freshness_is_reported_before_a_balance_is_shown() {
+        // A wallet must be able to ask "is my trust still good?" without
+        // attempting an update, because a stale trusted header makes every
+        // proof against it meaningless however well-formed.
+        let (_store, genesis) = genesis_chain();
+        let client = LightClient::new(chain(), validators(), genesis.header.clone());
+
+        let fresh = Timestamp::from_millis(genesis.header.time.0 + 1_000);
+        let stale = Timestamp::from_millis(genesis.header.time.0 + TRUSTING_PERIOD_MS + 1);
+
+        assert!(client.is_trusted_at(fresh));
+        assert!(!client.is_trusted_at(stale));
+    }
+
+    #[test]
+    fn the_trusting_period_sits_inside_the_unbonding_period() {
+        // The ordering itself is asserted at compile time above; this pins the
+        // ratio, so a future tuning change is a deliberate edit here rather
+        // than a silent one.
+        assert_eq!(TRUSTING_PERIOD_MS, UNBONDING_MS / 3 * 2);
+        assert_eq!(UNBONDING_MS, 21 * 24 * 60 * 60 * 1_000, "21 days");
+    }
+
+    #[test]
+    fn a_substituted_validator_set_is_rejected() {
+        // The attack this closes: a server hands a wallet a header together
+        // with a validator set of the attacker's choosing. The signatures would
+        // verify perfectly against that set. The header's commitment is what
+        // makes the substitution detectable.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+        let (block, commit) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        let attacker_set = ValidatorSet::new(vec![Validator::new(
+            key(66).public_key(),
+            1,
+            CountryCode::new("ke").expect("valid"),
+        )])
+        .expect("valid set");
+
+        assert_eq!(
+            client.update(
+                block.header,
+                &commit,
+                attacker_set.clone(),
+                attacker_set,
+                now()
+            ),
+            Err(LightError::ValidatorSetMismatch)
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_with_a_mismatched_set_is_refused_at_construction() {
+        // A bad checkpoint must fail immediately rather than poisoning every
+        // later verification.
+        let (_store, genesis) = genesis_chain();
+        let wrong = ValidatorSet::new(vec![Validator::new(
+            key(66).public_key(),
+            1,
+            CountryCode::new("ke").expect("valid"),
+        )])
+        .expect("valid set");
+
+        assert_eq!(
+            LightClient::from_checkpoint(chain(), genesis.header.clone(), wrong.clone(), wrong)
+                .err(),
+            Some(LightError::ValidatorSetMismatch)
+        );
+
+        // The honest checkpoint is accepted.
+        let client = LightClient::from_checkpoint(
+            chain(),
+            genesis.header.clone(),
+            validators(),
+            validators(),
+        )
+        .expect("a matching checkpoint is accepted");
+        assert_eq!(client.height(), Height::GENESIS);
+    }
+
+    #[test]
+    fn a_client_can_skip_many_heights_at_once() {
+        // What makes syncing a phone practical: at one-second blocks a
+        // month-old checkpoint is ~2.6 million headers. Skipping needs a
+        // handful.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+
+        let mut parent = genesis;
+        let mut latest = None;
+        for _ in 0..8 {
+            let (block, commit) = next_block(&mut store, &parent, &[1, 2, 3, 4]);
+            parent = block.clone();
+            latest = Some((block, commit));
+        }
+        let (block, commit) = latest.expect("blocks were produced");
+        let target = block.header.height;
+
+        client
+            .verify_skipping(block.header, &commit, validators(), validators(), now())
+            .expect("full overlap must allow the skip");
+
+        assert_eq!(
+            client.height(),
+            target,
+            "jumped without the headers between"
+        );
+    }
+
+    #[test]
+    fn skipping_needs_more_than_a_third_of_the_trusted_set() {
+        // The safety argument: above one third, at least one *correct*
+        // validator signed, because Byzantine power is bounded by one third.
+        // One correct signer is enough, since a correct validator will not sign
+        // on a forked chain.
+        //
+        // Here the trusted set has four equal validators, so a single signer is
+        // 25% — below the bar — while the new set still reaches its own quorum.
+        let (mut store, genesis) = genesis_chain();
+
+        // A disjoint set takes over, and only one original validator overlaps.
+        let successor = ValidatorSet::new(vec![
+            Validator::new(
+                key(1).public_key(),
+                1,
+                CountryCode::new("ke").expect("valid"),
+            ),
+            Validator::new(
+                key(70).public_key(),
+                1,
+                CountryCode::new("ng").expect("valid"),
+            ),
+            Validator::new(
+                key(71).public_key(),
+                1,
+                CountryCode::new("za").expect("valid"),
+            ),
+            Validator::new(
+                key(72).public_key(),
+                1,
+                CountryCode::new("gh").expect("valid"),
+            ),
+        ])
+        .expect("valid set");
+
+        let executor = Executor::new(chain());
+        let (block, _) = executor.build_block(
+            &mut store,
+            Height(5),
+            Timestamp::from_millis(1_700_000_005_000),
+            genesis.header.id(),
+            Vec::new(),
+            ValidatorSets {
+                current: &successor,
+                next: &successor,
+            },
+        );
+        let block_id = block.header.id();
+        let signatures = [1u8, 70, 71, 72]
+            .iter()
+            .map(|s| {
+                Vote {
+                    chain_id: chain(),
+                    height: block.header.height,
+                    round: Round::ZERO,
+                    vote_type: VoteType::Precommit,
+                    block_id: Some(block_id),
+                    validator: Address::from_public_key(&key(*s).public_key()),
+                }
+                .sign(&key(*s))
+            })
+            .collect();
+        let commit = Commit::new(block.header.height, Round::ZERO, block_id, signatures);
+
+        let mut client = LightClient::new(chain(), validators(), genesis.header);
+        let err = client
+            .verify_skipping(block.header, &commit, successor.clone(), successor, now())
+            .expect_err("25% overlap is not enough to skip");
+
+        assert!(
+            matches!(err, LightError::InsufficientOverlap { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(client.height(), Height::GENESIS, "and the client stays put");
+    }
+
+    #[test]
+    fn a_header_that_rewinds_time_is_refused() {
+        // Otherwise an attacker replays an old-timestamped header to reset the
+        // trusting-period clock and keep a stale client alive forever.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+        let (mut block, commit) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        block.header.time = Timestamp::from_millis(genesis.header.time.0 - 1);
+
+        let err = client
+            .update(block.header, &commit, validators(), validators(), now())
+            .expect_err("time must move forward");
+        assert!(
+            matches!(err, LightError::NonMonotonicTime { .. }),
+            "got {err:?}"
         );
     }
 }

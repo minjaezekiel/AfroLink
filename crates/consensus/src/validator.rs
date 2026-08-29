@@ -12,7 +12,7 @@
 //! [`ValidatorSet::quorum_threshold`] is therefore `floor(2 * total / 3) + 1`,
 //! and it is tested against every total from 1 to 1000.
 
-use afrolink_crypto::hash::{Domain, hash_parts};
+use afrolink_crypto::hash::{Domain, Hash32, hash, hash_parts};
 use afrolink_crypto::{Address, PublicKey};
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 use afrolink_primitives::{Height, Round};
@@ -201,6 +201,31 @@ impl ValidatorSet {
         let total = u128::from(self.total_power);
         let f = total.saturating_sub(1) / 3;
         u64::try_from(f).unwrap_or(u64::MAX)
+    }
+
+    /// A commitment to this exact set: members, powers and order.
+    ///
+    /// A block header carries this rather than the set itself, so a light client
+    /// can check that a validator set someone hands it is the one the chain
+    /// actually committed to. Without it, a client updating across a validator
+    /// set change has to *trust* the new set — which is precisely the hole a
+    /// long-range attack walks through
+    /// ([ADR-0010](../../../docs/adr/0010-long-range-attacks.md)).
+    ///
+    /// Covers voting power, so an attacker cannot present the same members with
+    /// their own weights.
+    #[must_use]
+    pub fn hash(&self) -> Hash32 {
+        let mut bytes = Vec::new();
+        // The set is canonically ordered by address at construction, so this is
+        // deterministic across nodes.
+        for v in &self.validators {
+            bytes.extend_from_slice(v.address.as_bytes());
+            bytes.extend_from_slice(&v.public_key.to_bytes());
+            bytes.extend_from_slice(&v.voting_power.to_le_bytes());
+            bytes.extend_from_slice(v.country.as_str().as_bytes());
+        }
+        hash(Domain::ValidatorSetHash, &bytes)
     }
 
     /// Look up a validator by address.
