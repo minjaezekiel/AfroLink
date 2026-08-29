@@ -85,6 +85,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-rpc"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-light",
+ "afrolink-primitives",
+ "afrolink-state",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-state"
 version = "0.1.0"
 dependencies = [
@@ -101,7 +115,9 @@ dependencies = [
  "afrolink-consensus",
  "afrolink-crypto",
  "afrolink-executor",
+ "afrolink-light",
  "afrolink-primitives",
+ "afrolink-rpc",
  "afrolink-state",
  "redb",
  "thiserror",

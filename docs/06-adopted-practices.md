@@ -29,7 +29,7 @@ cites a dozen influences in its docs and none of them are visible in the code.
 | **Node roles** — validating, archiving and serving are different jobs | Taken | ADR-0006 §2 | **Decided** |
 | `online_delete`-style bounded retention | Taken in principle | ADR-0006 §3 | **Open** — needs reference tracking first; GC over shared structure fails silently |
 | **History sharding** — volunteers each hold a range, so the network retains everything without every node doing so | Taken, but paid rather than volunteered | ADR-0006 §5, [04](04-earning-and-participation.md) | **Decided** |
-| **Clio** — a read-optimised server that does not join P2P | Taken as the "serving" role | ADR-0006 §2 | **Decided** |
+| **Clio** — a read-optimised server that does not join P2P | Taken as the "serving" role; the query protocol is already transport- and consensus-free, so a serving node is a `ChainView` without a validator | ADR-0006 §2, `crates/rpc` | **In code** (partial) |
 | Amendment voting — on-chain upgrade activation at a supermajority held over a period | Worth taking; we have no upgrade governance yet | — | **Open** (Phase 3) |
 | Account reserves to prevent state bloat | **Rejected as specified.** A minimum balance to *exist* excludes exactly the users this chain is for. State bloat is real, so the cost must fall somewhere else — sponsored or fee-side | [ADR-0005](adr/0005-african-first-design.md) | **Open** (Phase 2) |
 
@@ -93,7 +93,7 @@ adopted practice than any other single source, in both directions.
 | Namespaced denominations, so `sov/ke/kes` is unambiguous about who issued it | Taken | `crates/primitives/src/denom.rs` | **In code** |
 | Payments-first L1 design; assets as a native concept rather than a token contract | Taken | `crates/bank` | **In code** |
 | Celo's **phone-number addressing** — the address a user already knows | Taken in principle; alias resolution is not built | [01](01-architecture.md) | **Open** (Phase 3) |
-| Celo's mobile-first, light-client-first posture | Taken | `crates/light`, R3 | **In code** |
+| Celo's mobile-first, light-client-first posture | Taken | `crates/light`, `crates/rpc`, R3 | **In code** |
 | Federated Byzantine agreement (Stellar's SCP) | **Rejected.** Sound protocol, but its decentralisation is entirely a function of who holds the quorum slices — Pi demonstrated the failure mode. An explicit, published validator set is more honest and more testable | ADR-0002, ADR-0007 §2 | **Rejected** |
 | USD-denominated rails (Visa×Yellow Card, Onafriq×Circle) | **Rejected as the default denomination.** This is the strategic gap the project exists to close, not a model to copy | [00 §3.2](00-research.md) | **Rejected** |
 
@@ -120,7 +120,7 @@ adopted practice than any other single source, in both directions.
 | Length-prefixed domain separation on every hash | Taken | `crates/crypto/src/hash.rs` | **In code** |
 | bech32m (BIP-350) addresses, checksummed and human-readable | Taken, with the BIP's own test vectors | `crates/crypto/src/bech32.rs` | **In code** |
 | Ed25519 with `verify_strict` — rejecting the malleable and small-order edge cases | Taken | `crates/crypto/src/keys.rs` | **In code** |
-| **Absence proofs**, not only membership proofs | Taken — a phone must be able to verify that something is *not* there | `crates/state/src/smt.rs`, `crates/light` | **In code** |
+| **Absence proofs**, not only membership proofs | Taken — a phone must be able to verify that something is *not* there | `crates/state/src/smt.rs`, `crates/light`, `crates/rpc` | **In code** |
 | Proof of work | **Rejected** on arithmetic grounds | [ADR-0004](adr/0004-no-proof-of-work.md) | **Rejected** |
 
 These are the primitives [ADR-0005](adr/0005-african-first-design.md) declines to

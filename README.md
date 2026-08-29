@@ -36,27 +36,29 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Ten crates, **241 tests passing**. A working chain:
+**Phase 1 in progress.** Eleven crates, **268 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
-payment holding nothing but a 32-byte header; and the chain survives a restart.
-Still in-process — no sockets yet.
+payment holding nothing but a 32-byte header; the chain survives a restart; and
+a node answers queries with proofs. Still in-process — no sockets yet.
 
 ```
 crates/
   primitives/   canonical consensus codec, checked amounts, denoms      21 tests ✅
   crypto/       BLAKE3 + Ed25519, bech32m addresses, RFC 6962 Merkle    32 tests ✅
-  state/        sparse Merkle state, membership + absence proofs        18 tests ✅
+  state/        sparse Merkle state, membership + absence proofs        26 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
   executor/     block execution, blocks, genesis                         22 tests ✅
-  consensus/    validator sets, vote accounting, round state machine     40 tests ✅
+  consensus/    validator sets, votes, rounds, decentralisation report   58 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
   light/        commit + state proof verification for wallets            12 tests ✅
-  store/        durable blocks, commits and content-addressed state     17 tests ✅
+  store/        durable storage, and the view that serves queries       22 tests ✅
+  rpc/          proof-carrying query protocol (no networking)           14 tests ✅
 ```
 
-Next: a JSON-RPC server to serve the proof-carrying queries the light client
-already verifies, then libp2p to replace the in-process simulator with a real
+A node can now answer a wallet's question from disk with a proof, and every way
+of lying about the answer is a named test. Next: an HTTP/gRPC transport around
+the protocol, then libp2p to replace the in-process simulator with a real
 network.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
@@ -87,8 +89,10 @@ panic         = "deny"
 - **Checked arithmetic on all balances.** Overspending errors; it never wraps.
 
 The tests are written adversarially and named for the attack they prevent —
-`a_server_cannot_forge_a_balance`, `a_server_cannot_deny_a_funded_account`,
-`signatures_do_not_cross_domains`, `odd_width_does_not_collide_like_bitcoins_duplicate_rule`.
+`a_server_cannot_inflate_a_balance_it_reports`, `a_server_cannot_deny_a_balance_that_exists`,
+`a_proof_for_one_account_cannot_be_replayed_for_another`,
+`a_validator_count_hides_geographic_concentration`,
+`odd_width_does_not_collide_like_bitcoins_duplicate_rule`.
 
 ## Documentation
 

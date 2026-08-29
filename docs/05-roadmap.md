@@ -38,7 +38,12 @@ the transaction path is not.)*
 - [x] Proof-carrying query verification (light client) *(12 tests)*
 - [x] Decentralisation measured, not claimed — stake and **geographic**
       concentration, Nakamoto coefficients *(ADR-0007, 8 tests)*
-- [ ] JSON-RPC + gRPC to serve those queries over a network
+- [x] Query protocol — typed queries, proof-carrying answers, adversarial tests
+      *(`crates/rpc`, 14 tests)*
+- [x] Served from durable storage end to end *(`ChainStore` → `ServedChain` →
+      light client, 5 tests)*
+- [ ] HTTP/gRPC transport around the protocol *(the part that needs an async
+      runtime and its own security review)*
 - [ ] Emit the decentralisation report at startup and over RPC
 
 **Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and

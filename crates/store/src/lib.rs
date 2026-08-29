@@ -43,6 +43,10 @@
     )
 )]
 
+pub mod serve;
+
+pub use serve::ServedChain;
+
 use afrolink_consensus::Commit;
 use afrolink_crypto::hash::Hash32;
 use afrolink_executor::{Block, Executor, Genesis, GenesisError, GenesisLimits};

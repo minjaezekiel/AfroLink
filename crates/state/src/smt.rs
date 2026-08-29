@@ -19,7 +19,15 @@
 //! which would let a server show a wallet somebody else's balance.
 
 use afrolink_crypto::hash::{Domain, Hash32, hash, hash_parts};
+use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_bytes, encode_bytes};
 use std::collections::BTreeMap;
+
+/// The deepest a proof can be: one sibling per bit of the 256-bit key hash.
+///
+/// Real proofs are 20–30 hashes because the tree is compacted. This is the
+/// absolute ceiling, and it is enforced when decoding a proof from an untrusted
+/// source as well as when verifying one.
+pub const MAX_PROOF_DEPTH: usize = 256;
 
 /// The hash of an empty subtree.
 ///
@@ -91,7 +99,7 @@ impl Proof {
     pub fn compute_root(&self, key: &[u8]) -> Option<Hash32> {
         let kh = key_hash(key);
         let depth = self.siblings.len();
-        if depth > 256 {
+        if depth > MAX_PROOF_DEPTH {
             return None;
         }
 
@@ -289,6 +297,75 @@ impl SparseMerkleTree {
                 }
             }
         }
+    }
+}
+
+impl Encode for ProofLeaf {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Present { value } => {
+                out.push(0);
+                encode_bytes(value, out);
+            }
+            Self::Absent => out.push(1),
+            Self::AbsentOccupied {
+                other_key_hash,
+                other_value,
+            } => {
+                out.push(2);
+                other_key_hash.encode(out);
+                encode_bytes(other_value, out);
+            }
+        }
+    }
+}
+
+impl Decode for ProofLeaf {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        match u8::decode(r)? {
+            0 => Ok(Self::Present {
+                value: decode_bytes(r)?,
+            }),
+            1 => Ok(Self::Absent),
+            2 => Ok(Self::AbsentOccupied {
+                other_key_hash: Hash32::decode(r)?,
+                other_value: decode_bytes(r)?,
+            }),
+            tag => Err(CodecError::UnknownDiscriminant {
+                tag,
+                type_name: "ProofLeaf",
+            }),
+        }
+    }
+}
+
+impl Encode for Proof {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.siblings.encode(out);
+        self.leaf.encode(out);
+    }
+}
+
+impl Decode for Proof {
+    /// # Errors
+    /// Rejects a sibling list longer than the tree can produce.
+    ///
+    /// A proof arrives from an untrusted server, so the length bound is enforced
+    /// at decode rather than left to [`Proof::compute_root`]. Without it, a
+    /// server could send a multi-gigabyte sibling list and make a phone allocate
+    /// it before discovering the proof was nonsense.
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let siblings = Vec::<Hash32>::decode(r)?;
+        if siblings.len() > MAX_PROOF_DEPTH {
+            return Err(CodecError::Invalid(format!(
+                "proof has {} siblings, maximum is {MAX_PROOF_DEPTH}",
+                siblings.len()
+            )));
+        }
+        Ok(Self {
+            siblings,
+            leaf: ProofLeaf::decode(r)?,
+        })
     }
 }
 

@@ -1,12 +1,12 @@
 [package]
-name = "afrolink-store"
+name = "afrolink-rpc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Durable block, commit and state-node storage, and the view that serves proof-carrying queries from it."
+description = "The proof-carrying query protocol: every state answer arrives with a proof, or not at all."
 
 [dependencies]
 afrolink-primitives.workspace = true
@@ -14,13 +14,11 @@ afrolink-crypto.workspace = true
 afrolink-state.workspace = true
 afrolink-consensus.workspace = true
 afrolink-executor.workspace = true
-afrolink-rpc.workspace = true
-redb.workspace = true
+afrolink-light.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 afrolink-bank.workspace = true
-afrolink-light.workspace = true
 
 [lints]
 workspace = true
