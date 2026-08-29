@@ -1,5 +1,6 @@
 //! Request and response types, and their canonical wire encoding.
 
+use afrolink_alias::{ContactCommitment, Username};
 use afrolink_consensus::{Commit, ValidatorSet};
 use afrolink_crypto::Address;
 use afrolink_executor::BlockHeader;
@@ -73,6 +74,26 @@ pub enum Query {
         /// Account to check.
         address: Address,
     },
+
+    // -- Human-readable addressing (ADR-0008) --------------------------------
+    /// Which account a username points at.
+    ResolveName {
+        /// The name to look up.
+        name: Username,
+    },
+    /// Which account a phone or email commitment points at.
+    ///
+    /// Takes a commitment, so a node serving this query never learns the
+    /// identifier and a chain scrape never reveals one.
+    ResolveContact {
+        /// Commitment to the identifier.
+        commitment: ContactCommitment,
+    },
+    /// The name a wallet should display for an address.
+    PrimaryAlias {
+        /// The address to name.
+        address: Address,
+    },
 }
 
 impl Query {
@@ -90,6 +111,9 @@ impl Query {
             Self::Supply { denom } => Some(StoreKey::supply(denom)),
             Self::Issuer { denom } => Some(StoreKey::issuer(denom)),
             Self::Frozen { denom, address } => Some(StoreKey::frozen(denom, address)),
+            Self::ResolveName { name } => Some(StoreKey::alias(name.as_str())),
+            Self::ResolveContact { commitment } => Some(StoreKey::contact(commitment.as_hash())),
+            Self::PrimaryAlias { address } => Some(StoreKey::alias_reverse(address)),
         }
     }
 }
@@ -280,6 +304,18 @@ impl Encode for Query {
                 denom.encode(out);
                 address.encode(out);
             }
+            Self::ResolveName { name } => {
+                out.push(7);
+                name.encode(out);
+            }
+            Self::ResolveContact { commitment } => {
+                out.push(8);
+                commitment.encode(out);
+            }
+            Self::PrimaryAlias { address } => {
+                out.push(9);
+                address.encode(out);
+            }
         }
     }
 }
@@ -306,6 +342,15 @@ impl Decode for Query {
             }),
             6 => Ok(Self::Frozen {
                 denom: Denom::decode(r)?,
+                address: Address::decode(r)?,
+            }),
+            7 => Ok(Self::ResolveName {
+                name: Username::decode(r)?,
+            }),
+            8 => Ok(Self::ResolveContact {
+                commitment: ContactCommitment::decode(r)?,
+            }),
+            9 => Ok(Self::PrimaryAlias {
                 address: Address::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {

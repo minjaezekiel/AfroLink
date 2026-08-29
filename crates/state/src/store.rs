@@ -50,6 +50,20 @@ pub enum Namespace {
     /// stablecoin for an account and can never touch AFRI, another country's
     /// currency, or anything else that account holds.
     Frozen = 0x09,
+    /// Username registrations, keyed by the canonical name.
+    Alias = 0x0a,
+    /// Confusable-skeleton index, keyed by skeleton.
+    ///
+    /// Separate from [`Self::Alias`] because it answers a different question:
+    /// not "who owns this name" but "does a name that *looks like* this already
+    /// exist". See `crates/alias`.
+    AliasSkeleton = 0x0b,
+    /// Reverse lookup: the name a wallet should display for an address.
+    AliasReverse = 0x0c,
+    /// Phone and email bindings, keyed by commitment — never by the identifier.
+    Contact = 0x0d,
+    /// Registry of parties licensed to attest contact bindings.
+    Attestor = 0x0e,
 }
 
 /// A namespaced state key.
@@ -105,6 +119,40 @@ impl StoreKey {
             Namespace::Frozen,
             &[denom.as_str().as_bytes(), address.as_bytes()],
         )
+    }
+
+    /// The key for a username registration.
+    #[must_use]
+    pub fn alias(name: &str) -> Self {
+        Self::new(Namespace::Alias, &[name.as_bytes()])
+    }
+
+    /// The key for a confusable-skeleton index entry.
+    #[must_use]
+    pub fn alias_skeleton(skeleton: &str) -> Self {
+        Self::new(Namespace::AliasSkeleton, &[skeleton.as_bytes()])
+    }
+
+    /// The key for the display name an address resolves back to.
+    #[must_use]
+    pub fn alias_reverse(address: &afrolink_crypto::Address) -> Self {
+        Self::new(Namespace::AliasReverse, &[address.as_bytes()])
+    }
+
+    /// The key for a phone or email binding.
+    ///
+    /// Takes the *commitment*, never the identifier. There is deliberately no
+    /// constructor that accepts a phone number: the type system is where this
+    /// rule is cheapest to enforce.
+    #[must_use]
+    pub fn contact(commitment: &Hash32) -> Self {
+        Self::new(Namespace::Contact, &[commitment.as_bytes()])
+    }
+
+    /// The key for a licensed attestor's registration.
+    #[must_use]
+    pub fn attestor(address: &afrolink_crypto::Address) -> Self {
+        Self::new(Namespace::Attestor, &[address.as_bytes()])
     }
 
     /// The raw key bytes.

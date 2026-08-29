@@ -20,7 +20,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 afrolink-bank.workspace = true
+afrolink-types.workspace = true
 afrolink-light.workspace = true
+afrolink-alias.workspace = true
 
 [lints]
 workspace = true

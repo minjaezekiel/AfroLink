@@ -71,7 +71,10 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
 
 - [ ] CosmWasm integration, gas metering, deterministic execution
 - [ ] **Fee abstraction** — pay gas in any whitelisted stablecoin *(R2)*
-- [ ] Account abstraction: phone-number aliases, social recovery, sponsored fees
+- [x] **Human-readable addressing** — usernames, phone and email aliases with
+      time-locked, vetoable rebinding *(ADR-0008, `crates/alias` 44 tests, plus 8 end-to-end)*
+- [ ] Off-chain resolver service *(specified in [07](07-resolver-service.md))*
+- [ ] Social recovery; sponsored fees
 - [ ] Contract templates: savings, escrow, payroll, rotating savings (chama/susu)
 - [ ] SDKs: Rust, TypeScript, Kotlin, Flutter
 - [ ] **Upgrade governance** — XRPL-style amendment voting: on-chain activation

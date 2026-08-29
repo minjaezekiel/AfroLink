@@ -37,6 +37,7 @@ pub mod genesis;
 pub use block::{Block, BlockHeader};
 pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
 
+use afrolink_alias::{BindError, Bindings, Registry, RegistryError};
 use afrolink_bank::{Bank, BankError};
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::{Domain, Hash32};
@@ -87,6 +88,12 @@ pub enum ExecError {
     /// A group payout was requested for an accumulating group.
     #[error("this group accumulates its pot and has no rotation recipient")]
     NoRotationRecipient,
+    /// A username registry operation failed.
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    /// A contact binding operation failed.
+    #[error(transparent)]
+    Bind(#[from] BindError),
     /// Corrupt state.
     #[error(transparent)]
     State(#[from] StateError),
@@ -260,7 +267,7 @@ impl Executor {
         let mut sandbox = store.clone();
         let mut failure = None;
         for msg in &tx.body.messages {
-            if let Err(e) = self.apply_message(&mut sandbox, tx.body.sender, msg) {
+            if let Err(e) = self.apply_message(&mut sandbox, height, tx.body.sender, msg) {
                 failure = Some(e);
                 break;
             }
@@ -294,6 +301,7 @@ impl Executor {
     fn apply_message<S>(
         &self,
         store: &mut S,
+        height: Height,
         sender: Address,
         msg: &Message,
     ) -> Result<(), ExecError>
@@ -374,6 +382,63 @@ impl Executor {
                     g.advance_cycle();
                 }
                 store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            // -- Human-readable addressing (ADR-0008) ------------------------
+            //
+            // Every arm below is a registry write. None of them move value, and
+            // none of them can: an alias resolves, it never authorises.
+            Message::RegisterName { name } => {
+                Registry::new(store).register(name, sender, height)?;
+                Ok(())
+            }
+
+            Message::RenewName { name } => {
+                Registry::new(store).renew(name, sender, height)?;
+                Ok(())
+            }
+
+            Message::TransferName { name, to } => {
+                Registry::new(store).transfer(name, sender, *to, height)?;
+                ensure_account(store, to);
+                Ok(())
+            }
+
+            Message::SetPrimaryAlias { name } => {
+                Registry::new(store).set_primary(name, sender, height)?;
+                Ok(())
+            }
+
+            Message::AttestContact {
+                commitment,
+                address,
+            } => {
+                // The sender is the attestor; the binding is checked against the
+                // attestor registry, so an ordinary account cannot bind anyone.
+                Bindings::new(store).attest(commitment, *address, sender, height)?;
+                ensure_account(store, address);
+                Ok(())
+            }
+
+            Message::RequestRebind {
+                commitment,
+                new_address,
+            } => {
+                Bindings::new(store).request_rebind(commitment, *new_address, sender, height)?;
+                Ok(())
+            }
+
+            Message::VetoRebind { commitment } => {
+                // `sender` is the signer of this transaction, so reaching here
+                // already proves possession of the key. Whether that key holds
+                // the bound account is what `veto_rebind` checks.
+                Bindings::new(store).veto_rebind(commitment, sender)?;
+                Ok(())
+            }
+
+            Message::RevokeContact { commitment } => {
+                Bindings::new(store).revoke(commitment, sender)?;
                 Ok(())
             }
         }
@@ -470,6 +535,151 @@ mod tests {
             memo: String::new(),
         }
         .sign(&sk(sender))
+    }
+
+    // -- Human-readable addressing (ADR-0008) --------------------------------
+
+    #[test]
+    fn a_name_registered_through_a_transaction_resolves_to_its_owner() {
+        use afrolink_alias::{Registry, Username};
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let name = Username::new("amina").expect("valid");
+
+        let outcome = exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(1, 0, vec![Message::RegisterName { name: name.clone() }])],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+
+        let record = Registry::new(&mut store)
+            .get(&name)
+            .expect("reads")
+            .expect("registered");
+        assert_eq!(record.owner, addr(1));
+    }
+
+    #[test]
+    fn a_confusable_registration_fails_the_transaction() {
+        // The check has to bite at execution, not only in the library: two
+        // wallets racing for lookalike names must not both succeed.
+        use afrolink_alias::Username;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+
+        let first = exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(
+                1,
+                0,
+                vec![Message::RegisterName {
+                    name: Username::new("amina").expect("valid"),
+                }],
+            )],
+        );
+        assert_eq!(first.succeeded(), 1);
+
+        let second = exec.execute_block(
+            &mut store,
+            Height(2),
+            &[tx(
+                2,
+                0,
+                vec![Message::RegisterName {
+                    name: Username::new("arnina").expect("valid"),
+                }],
+            )],
+        );
+        assert_eq!(second.succeeded(), 0, "the lookalike must be refused");
+    }
+
+    #[test]
+    fn a_stranger_cannot_take_over_someone_elses_name() {
+        use afrolink_alias::{Registry, Username};
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let name = Username::new("amina").expect("valid");
+
+        exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(1, 0, vec![Message::RegisterName { name: name.clone() }])],
+        );
+
+        // Account 2 tries to hand account 1's name to itself.
+        let theft = exec.execute_block(
+            &mut store,
+            Height(2),
+            &[tx(
+                2,
+                0,
+                vec![Message::TransferName {
+                    name: name.clone(),
+                    to: addr(2),
+                }],
+            )],
+        );
+        assert_eq!(theft.succeeded(), 0);
+        assert_eq!(
+            Registry::new(&mut store)
+                .get(&name)
+                .expect("reads")
+                .expect("registered")
+                .owner,
+            addr(1)
+        );
+    }
+
+    #[test]
+    fn an_alias_message_never_moves_money() {
+        // The invariant behind the whole design: registering, renaming and
+        // rebinding are registry writes. If one of them could move value, the
+        // "resolves but never authorises" rule would be a comment rather than a
+        // property.
+        use afrolink_alias::Username;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+
+        let outcome = exec.execute_block(
+            &mut store,
+            Height(1),
+            &[tx(
+                1,
+                0,
+                vec![
+                    Message::RegisterName {
+                        name: Username::new("amina").expect("valid"),
+                    },
+                    Message::SetPrimaryAlias {
+                        name: Username::new("amina").expect("valid"),
+                    },
+                ],
+            )],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+
+        let after = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+        let fee = outcome.outcomes[0].fee_charged;
+
+        // The only movement is the fee. Nothing else left the account.
+        assert_eq!(
+            after,
+            before.checked_sub(fee).expect("fee is affordable"),
+            "an alias message must not move value beyond the fee"
+        );
     }
 
     #[test]

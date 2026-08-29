@@ -1,25 +1,18 @@
 [package]
-name = "afrolink-rpc"
+name = "afrolink-alias"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The proof-carrying query protocol: every state answer arrives with a proof, or not at all."
+description = "Human-readable addressing: usernames, and phone/email bindings that resolve without ever storing the identifier."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-state.workspace = true
-afrolink-consensus.workspace = true
-afrolink-executor.workspace = true
-afrolink-light.workspace = true
-afrolink-alias.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-afrolink-bank.workspace = true
 
 [lints]
 workspace = true

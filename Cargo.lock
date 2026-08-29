@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "afrolink-alias"
+version = "0.1.0"
+dependencies = [
+ "afrolink-crypto",
+ "afrolink-primitives",
+ "afrolink-state",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-bank"
 version = "0.1.0"
 dependencies = [
@@ -38,6 +48,7 @@ dependencies = [
 name = "afrolink-executor"
 version = "0.1.0"
 dependencies = [
+ "afrolink-alias",
  "afrolink-bank",
  "afrolink-consensus",
  "afrolink-crypto",
@@ -88,6 +99,7 @@ dependencies = [
 name = "afrolink-rpc"
 version = "0.1.0"
 dependencies = [
+ "afrolink-alias",
  "afrolink-bank",
  "afrolink-consensus",
  "afrolink-crypto",
@@ -111,6 +123,7 @@ dependencies = [
 name = "afrolink-store"
 version = "0.1.0"
 dependencies = [
+ "afrolink-alias",
  "afrolink-bank",
  "afrolink-consensus",
  "afrolink-crypto",
@@ -119,6 +132,7 @@ dependencies = [
  "afrolink-primitives",
  "afrolink-rpc",
  "afrolink-state",
+ "afrolink-types",
  "redb",
  "thiserror",
 ]
@@ -127,6 +141,7 @@ dependencies = [
 name = "afrolink-types"
 version = "0.1.0"
 dependencies = [
+ "afrolink-alias",
  "afrolink-crypto",
  "afrolink-primitives",
  "thiserror",

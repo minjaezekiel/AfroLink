@@ -15,6 +15,7 @@
 //! The whole document is hashed under [`Domain::TxSignDoc`], so a transaction
 //! signature can never be presented as a consensus vote.
 
+use afrolink_alias::{ContactCommitment, Username};
 use afrolink_crypto::hash::{Domain, Hash32, hash};
 use afrolink_crypto::{Address, CryptoError, PublicKey, SecretKey, Signature};
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exact};
@@ -160,6 +161,64 @@ pub enum Message {
         /// The group account.
         group: Address,
     },
+
+    // -- Human-readable addressing (ADR-0008) --------------------------------
+    //
+    // Note what is *not* here: no message accepts an alias as a payment
+    // destination. `Transfer` takes an `Address` and always will. A wallet
+    // resolves a name to an address, shows the user who they are about to pay,
+    // and signs the address — so a rebinding that lands between signing and
+    // inclusion cannot redirect the money.
+    /// Claim an unregistered username.
+    RegisterName {
+        /// The name to claim.
+        name: Username,
+    },
+    /// Extend a registration the sender owns.
+    RenewName {
+        /// The name to renew.
+        name: Username,
+    },
+    /// Hand a username to another account.
+    TransferName {
+        /// The name to hand over.
+        name: Username,
+        /// The new owner.
+        to: Address,
+    },
+    /// Choose which owned name wallets display for the sender's address.
+    SetPrimaryAlias {
+        /// The name to display.
+        name: Username,
+    },
+    /// Bind a phone number or email to an account. Sender must be a licensed
+    /// attestor.
+    AttestContact {
+        /// Commitment to the identifier — never the identifier itself.
+        commitment: ContactCommitment,
+        /// The account it resolves to.
+        address: Address,
+    },
+    /// Ask to point a contact at a different account, subject to the delay.
+    RequestRebind {
+        /// The contact to move.
+        commitment: ContactCommitment,
+        /// Where it should point once the delay elapses.
+        new_address: Address,
+    },
+    /// Cancel a pending rebinding. **Only the currently bound account may.**
+    ///
+    /// This is the SIM-swap defence expressed as a message: possession of the
+    /// number is not possession of the account.
+    VetoRebind {
+        /// The contact whose rebinding should be cancelled.
+        commitment: ContactCommitment,
+    },
+    /// Remove a contact binding, by the account it points at.
+    RevokeContact {
+        /// The contact to unbind.
+        commitment: ContactCommitment,
+    },
 }
 
 /// The signed portion of a transaction.
@@ -217,7 +276,18 @@ impl TxBody {
                         return Err(TxError::ZeroAmount);
                     }
                 }
-                Message::CreateGroup { .. } | Message::GroupPayout { .. } => {}
+                // Alias messages move no value, so there is nothing here to
+                // check beyond what their own types already enforce on decode.
+                Message::CreateGroup { .. }
+                | Message::GroupPayout { .. }
+                | Message::RegisterName { .. }
+                | Message::RenewName { .. }
+                | Message::TransferName { .. }
+                | Message::SetPrimaryAlias { .. }
+                | Message::AttestContact { .. }
+                | Message::RequestRebind { .. }
+                | Message::VetoRebind { .. }
+                | Message::RevokeContact { .. } => {}
             }
         }
         Ok(())
@@ -340,6 +410,47 @@ impl Encode for Message {
                 out.push(3);
                 group.encode(out);
             }
+            Self::RegisterName { name } => {
+                out.push(4);
+                name.encode(out);
+            }
+            Self::RenewName { name } => {
+                out.push(5);
+                name.encode(out);
+            }
+            Self::TransferName { name, to } => {
+                out.push(6);
+                name.encode(out);
+                to.encode(out);
+            }
+            Self::SetPrimaryAlias { name } => {
+                out.push(7);
+                name.encode(out);
+            }
+            Self::AttestContact {
+                commitment,
+                address,
+            } => {
+                out.push(8);
+                commitment.encode(out);
+                address.encode(out);
+            }
+            Self::RequestRebind {
+                commitment,
+                new_address,
+            } => {
+                out.push(9);
+                commitment.encode(out);
+                new_address.encode(out);
+            }
+            Self::VetoRebind { commitment } => {
+                out.push(10);
+                commitment.encode(out);
+            }
+            Self::RevokeContact { commitment } => {
+                out.push(11);
+                commitment.encode(out);
+            }
         }
     }
 }
@@ -365,6 +476,33 @@ impl Decode for Message {
             }),
             3 => Ok(Self::GroupPayout {
                 group: Address::decode(r)?,
+            }),
+            4 => Ok(Self::RegisterName {
+                name: Username::decode(r)?,
+            }),
+            5 => Ok(Self::RenewName {
+                name: Username::decode(r)?,
+            }),
+            6 => Ok(Self::TransferName {
+                name: Username::decode(r)?,
+                to: Address::decode(r)?,
+            }),
+            7 => Ok(Self::SetPrimaryAlias {
+                name: Username::decode(r)?,
+            }),
+            8 => Ok(Self::AttestContact {
+                commitment: ContactCommitment::decode(r)?,
+                address: Address::decode(r)?,
+            }),
+            9 => Ok(Self::RequestRebind {
+                commitment: ContactCommitment::decode(r)?,
+                new_address: Address::decode(r)?,
+            }),
+            10 => Ok(Self::VetoRebind {
+                commitment: ContactCommitment::decode(r)?,
+            }),
+            11 => Ok(Self::RevokeContact {
+                commitment: ContactCommitment::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

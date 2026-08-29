@@ -31,12 +31,13 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
+| **Send to `@amina`, not to `afri1qzp8h4c…`** | Usernames, phone numbers and email addresses resolve to addresses — *with a proof*. An alias resolves; it never authorises, so a stolen SIM cannot touch the money. Raw addresses keep working for exchanges and existing tooling. |
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
 
 ## Status
 
-**Phase 1 in progress.** Eleven crates, **268 tests passing**. A working chain:
+**Phase 1 in progress.** Twelve crates, **320 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -48,12 +49,13 @@ crates/
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, blocks, genesis                         22 tests ✅
+  executor/     block execution, blocks, genesis                         26 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   58 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
   light/        commit + state proof verification for wallets            12 tests ✅
-  store/        durable storage, and the view that serves queries       22 tests ✅
+  store/        durable storage, and the view that serves queries       26 tests ✅
   rpc/          proof-carrying query protocol (no networking)           14 tests ✅
+  alias/        usernames, phone/email bindings, SIM-swap defence        44 tests ✅
 ```
 
 A node can now answer a wallet's question from disk with a proof, and every way
@@ -91,6 +93,7 @@ panic         = "deny"
 The tests are written adversarially and named for the attack they prevent —
 `a_server_cannot_inflate_a_balance_it_reports`, `a_server_cannot_deny_a_balance_that_exists`,
 `a_proof_for_one_account_cannot_be_replayed_for_another`,
+`a_sim_swap_alone_cannot_redirect_an_alias`, `a_confusable_name_cannot_be_registered`,
 `a_validator_count_hides_geographic_concentration`,
 `odd_width_does_not_collide_like_bitcoins_duplicate_rule`.
 
@@ -104,6 +107,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [04 — Earning](docs/04-earning-and-participation.md) | How people earn without capital or grid power. |
 | [05 — Roadmap](docs/05-roadmap.md) | Phased plan, exit criteria, and the risks that actually matter. |
 | [06 — Adopted practices](docs/06-adopted-practices.md) | What each system we studied contributed, and where it lives in the code. |
+| [07 — Resolver service](docs/07-resolver-service.md) | How a phone number becomes a lookup, and the wallet screen that stops mistakes. |
 | [ADR-0001](docs/adr/0001-sovereign-rust-l1.md) | Why a sovereign Rust L1, and why the alternatives were declined. |
 | [ADR-0002](docs/adr/0002-consensus.md) | Ubuntu-BFT: why boring consensus. |
 | [ADR-0003](docs/adr/0003-contract-vm.md) | CosmWasm (ink! went unmaintained in Jan 2026). |
@@ -111,6 +115,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0005](docs/adr/0005-african-first-design.md) | What "designed for Africa" rejects, keeps, and builds instead. |
 | [ADR-0006](docs/adr/0006-state-persistence-and-retention.md) | State persistence, drawn from XRPL's NodeStore and TRON's lite fullnode. |
 | [ADR-0007](docs/adr/0007-distribution-and-sybil-resistance.md) | What Pi Network's 70M-user experiment proved, and what it rules out. |
+| [ADR-0008](docs/adr/0008-human-readable-addressing.md) | Usernames, phone and email — and why an alias never authorises. |
 
 ## Decisions taken
 

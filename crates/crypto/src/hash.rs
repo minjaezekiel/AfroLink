@@ -110,6 +110,12 @@ pub enum Domain {
     GroupAddress,
     /// A module-owned account address, derived from the module's name.
     ModuleAddress,
+    /// Commits to a phone number or email address without revealing it.
+    ///
+    /// The identifier never reaches the chain; only this commitment does. The
+    /// domain keeps a contact commitment from ever colliding with an address or
+    /// a state leaf, so a commitment can never be mistaken for one.
+    ContactCommitment,
 }
 
 impl Domain {
@@ -129,6 +135,7 @@ impl Domain {
             Self::ValidatorId => "afrolink/v1/validator-id",
             Self::GroupAddress => "afrolink/v1/group-address",
             Self::ModuleAddress => "afrolink/v1/module-address",
+            Self::ContactCommitment => "afrolink/v1/contact-commitment",
         }
     }
 }

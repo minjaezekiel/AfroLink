@@ -294,4 +294,230 @@ mod tests {
         assert_eq!(balance, Amount::from_afri(2_500));
         let _ = std::fs::remove_file(&path);
     }
+
+    // -- Human-readable addressing, end to end (ADR-0008) --------------------
+
+    /// Seal the current state into a block, store it, and advance `client`.
+    fn seal_block(
+        store: &ChainStore,
+        state: &mut MemoryStore,
+        parent: &Block,
+        client: &mut LightClient,
+        transactions: Vec<afrolink_types::Transaction>,
+    ) -> Block {
+        let expected = transactions.len();
+        let executor = Executor::new(chain());
+        let (block, outcome) = executor.build_block(
+            state,
+            parent.header.height.next(),
+            Timestamp::from_millis(1_700_000_002_000),
+            parent.header.id(),
+            transactions,
+        );
+        assert_eq!(
+            outcome.succeeded(),
+            expected,
+            "expected {expected} successful transactions, got {:?}",
+            outcome
+                .outcomes
+                .iter()
+                .map(|o| &o.result)
+                .collect::<Vec<_>>()
+        );
+
+        let commit = commit_for(&block);
+        store.put_block(&block, &commit).unwrap();
+        store.persist_state(state).unwrap();
+        client.update(block.header.clone(), &commit).unwrap();
+        block
+    }
+
+    /// A signed transaction from account 50 carrying `messages`.
+    fn tx_from_50(messages: Vec<afrolink_types::Message>) -> afrolink_types::Transaction {
+        use afrolink_types::{Fee, TxBody};
+
+        TxBody {
+            chain_id: chain(),
+            sender: addr(50),
+            nonce: 0,
+            valid_until: Height(10_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages,
+            memo: String::new(),
+        }
+        .sign(&key(50))
+    }
+
+    #[test]
+    fn a_wallet_resolves_a_username_to_an_address_with_a_proof() {
+        // The whole point of ADR-0008, end to end and through a real database:
+        // a user types @amina, and the wallet learns which address that is
+        // without trusting the node that told it.
+        use afrolink_alias::{NameRecord, Username};
+        use afrolink_primitives::codec::decode_exact;
+
+        let path = temp_path("resolve-name");
+        let (store, mut state, tip, mut client) = chain_on_disk(&path);
+
+        let name = Username::new("amina").unwrap();
+        seal_block(
+            &store,
+            &mut state,
+            &tip,
+            &mut client,
+            vec![tx_from_50(vec![afrolink_types::Message::RegisterName {
+                name: name.clone(),
+            }])],
+        );
+
+        let view = ServedChain::new(chain(), &store, &state);
+        let query = Query::ResolveName { name };
+
+        let response = answer(&view, &query).unwrap();
+        let bytes = response
+            .as_value()
+            .unwrap()
+            .verify(&client, &query.store_key().unwrap())
+            .unwrap()
+            .expect("the name is registered");
+
+        let record = decode_exact::<NameRecord>(bytes).unwrap();
+        assert_eq!(record.owner, addr(50));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_node_cannot_lie_about_who_owns_a_name() {
+        // A hostile node's best attack is to answer with an address it
+        // controls. The proof is against the app hash in a header the wallet
+        // verified from commit signatures, so the substitution cannot survive.
+        use afrolink_alias::{NameRecord, Username};
+        use afrolink_primitives::codec::{Encode, decode_exact};
+
+        let path = temp_path("forge-name");
+        let (store, mut state, tip, mut client) = chain_on_disk(&path);
+
+        let name = Username::new("amina").unwrap();
+        seal_block(
+            &store,
+            &mut state,
+            &tip,
+            &mut client,
+            vec![tx_from_50(vec![afrolink_types::Message::RegisterName {
+                name: name.clone(),
+            }])],
+        );
+
+        let view = ServedChain::new(chain(), &store, &state);
+        let query = Query::ResolveName { name };
+        let honest = answer(&view, &query).unwrap();
+        let proof = honest.as_value().unwrap().proof().clone();
+
+        // Forge the response the way a hostile node actually would: assemble
+        // the wire bytes with the attacker's address and the honest proof, and
+        // hand them to the wallet to decode.
+        let forged_record = NameRecord {
+            owner: addr(66),
+            registered_at: Height(1),
+            expires_at: Height(999_999),
+        };
+
+        let mut wire = vec![2u8]; // Response::Value
+        honest.as_value().unwrap().height().encode(&mut wire);
+        Some(forged_record.to_bytes()).encode(&mut wire);
+        proof.encode(&mut wire);
+
+        let forged = decode_exact::<afrolink_rpc::Response>(&wire).unwrap();
+
+        assert!(
+            forged
+                .as_value()
+                .unwrap()
+                .verify(&client, &query.store_key().unwrap())
+                .is_err(),
+            "a substituted owner must not verify"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolving_an_unregistered_name_is_a_proved_absence() {
+        // "Nobody has that name" is a claim the node must prove like any other,
+        // so it cannot quietly withhold a registration it dislikes.
+        use afrolink_alias::Username;
+
+        let path = temp_path("absent-name");
+        let (store, state, _tip, client) = chain_on_disk(&path);
+        let view = ServedChain::new(chain(), &store, &state);
+
+        let query = Query::ResolveName {
+            name: Username::new("nobody").unwrap(),
+        };
+        let response = answer(&view, &query).unwrap();
+
+        assert_eq!(
+            response
+                .as_value()
+                .unwrap()
+                .verify(&client, &query.store_key().unwrap())
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_phone_number_resolves_without_the_chain_ever_holding_it() {
+        // Resolution works from a commitment alone. The node answering the
+        // query never sees the number, and neither does the state it serves.
+        use afrolink_alias::{Attestor, Bindings, ContactCommitment, ContactKind, ContactRecord};
+        use afrolink_primitives::codec::decode_exact;
+        use afrolink_state::KeyValueStore;
+
+        let path = temp_path("resolve-phone");
+        let (store, mut state, tip, mut client) = chain_on_disk(&path);
+
+        // Licence an attestor directly in state: attestor registration is a
+        // governance action, and governance is not built yet.
+        Bindings::new(&mut state).register_attestor(
+            &addr(10),
+            &Attestor {
+                country: *b"ke",
+                name: "Safaricom".to_owned(),
+                active: true,
+            },
+        );
+
+        let pepper = b"a-sixteen-byte-pepper-or-longer";
+        let commitment =
+            ContactCommitment::new(ContactKind::Phone, "+254712345678", pepper).unwrap();
+        Bindings::new(&mut state)
+            .attest(&commitment, addr(50), addr(10), Height(1))
+            .unwrap();
+
+        // Seal that state into a block so a header commits to it.
+        seal_block(&store, &mut state, &tip, &mut client, Vec::new());
+
+        let view = ServedChain::new(chain(), &store, &state);
+        let query = Query::ResolveContact { commitment };
+        let response = answer(&view, &query).unwrap();
+        let bytes = response
+            .as_value()
+            .unwrap()
+            .verify(&client, &query.store_key().unwrap())
+            .unwrap()
+            .expect("the contact is bound");
+
+        let record = decode_exact::<ContactRecord>(bytes).unwrap();
+        assert_eq!(record.address, addr(50));
+
+        // And the number appears nowhere in the state that was served.
+        let key = query.store_key().unwrap();
+        let stored = state.get(&key).unwrap();
+        assert!(
+            !stored.windows(9).any(|w| w == b"712345678"),
+            "the served record must not contain the number"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

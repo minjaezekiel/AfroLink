@@ -11,6 +11,7 @@ description = "Accounts, group (chama/susu/stokvel) accounts, transactions and m
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
+afrolink-alias.workspace = true
 thiserror.workspace = true
 
 [lints]
