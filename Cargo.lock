@@ -159,6 +159,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-witness"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-light",
+ "afrolink-primitives",
+ "afrolink-state",
+ "thiserror",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

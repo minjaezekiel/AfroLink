@@ -1,0 +1,27 @@
+[package]
+name = "afrolink-witness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Append-only witness logs and the corroboration rules a wallet uses to obtain a checkpoint it can check rather than be told."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The end-to-end test walks a wallet from scanned bytes to a verified balance.
+# These are dev-only: nothing in this crate depends on consensus or execution,
+# and it must stay that way — a witness observes, it never participates.
+afrolink-light.workspace = true
+afrolink-executor.workspace = true
+afrolink-consensus.workspace = true
+afrolink-state.workspace = true
+afrolink-bank.workspace = true
+
+[lints]
+workspace = true

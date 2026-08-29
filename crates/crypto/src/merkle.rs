@@ -1,4 +1,4 @@
-//! Binary Merkle trees with inclusion proofs (RFC 6962 shape).
+//! Binary Merkle trees with inclusion and consistency proofs (RFC 6962 shape).
 //!
 //! Used for the transaction root in each block header, and as the building block
 //! that lets a phone verify "my payment is in block N" while holding only the
@@ -13,6 +13,18 @@
 //!   the final node when a level has odd width, which makes two different
 //!   transaction lists produce the same root (CVE-2012-2459). RFC 6962's uneven
 //!   split has no such collision.
+//!
+//! # Why consistency proofs are here
+//!
+//! An inclusion proof answers "is this leaf in that tree?". A
+//! [`ConsistencyProof`] answers a different and, for an append-only log, more
+//! important question: **"is the tree I saw before still a prefix of the tree
+//! you are showing me now?"**
+//!
+//! That is what turns a Merkle tree into a log nobody can rewrite. A witness
+//! that quietly drops or edits history cannot produce one, because there is no
+//! sequence of hashes that reconciles the old root with the new. See
+//! [ADR-0011](../../../docs/adr/0011-objective-anchors.md) and `crates/witness`.
 
 use crate::hash::{Domain, Hash32, hash, hash_parts};
 use crate::{CryptoError, Result};
@@ -32,6 +44,21 @@ pub struct MerkleProof {
     pub total: usize,
     /// Sibling hashes, ordered from the leaf upward.
     pub siblings: Vec<Hash32>,
+}
+
+/// Proof that a tree of `old_size` leaves is a prefix of one of `new_size`.
+///
+/// RFC 6962 §2.1.2. The nodes are the minimal set from which *both* roots can be
+/// recomputed; a verifier that reproduces the old root it already trusted and
+/// the new root it was offered knows nothing between them was altered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsistencyProof {
+    /// Size of the earlier tree.
+    pub old_size: usize,
+    /// Size of the later tree.
+    pub new_size: usize,
+    /// Subtree hashes, in the order the recursion consumes them.
+    pub nodes: Vec<Hash32>,
 }
 
 /// Hash of an empty tree.
@@ -126,6 +153,50 @@ impl MerkleTree {
         })
     }
 
+    /// Build a proof that the first `old_size` leaves of this tree are exactly
+    /// the tree that had that size.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidProof`] if `old_size` exceeds the tree.
+    pub fn prove_consistency(&self, old_size: usize) -> Result<ConsistencyProof> {
+        let new_size = self.leaves.len();
+        if old_size > new_size {
+            return Err(CryptoError::InvalidProof("old size exceeds tree size"));
+        }
+        let mut nodes = Vec::new();
+        // Both degenerate cases need no nodes: an empty tree is a prefix of
+        // everything, and a tree is trivially a prefix of itself.
+        if old_size != 0 && old_size != new_size {
+            Self::collect_consistency(&self.leaves, old_size, true, &mut nodes);
+        }
+        Ok(ConsistencyProof {
+            old_size,
+            new_size,
+            nodes,
+        })
+    }
+
+    /// RFC 6962 `SUBPROOF`. `is_top` tracks whether the old root is the one the
+    /// verifier already holds — in which case it is omitted rather than sent.
+    fn collect_consistency(leaves: &[Hash32], m: usize, is_top: bool, out: &mut Vec<Hash32>) {
+        let n = leaves.len();
+        if m == n {
+            if !is_top {
+                out.push(Self::root_of(leaves));
+            }
+            return;
+        }
+        let k = split_point(n);
+        let (left, right) = leaves.split_at(k);
+        if m <= k {
+            Self::collect_consistency(left, m, is_top, out);
+            out.push(Self::root_of(right));
+        } else {
+            Self::collect_consistency(right, m.saturating_sub(k), false, out);
+            out.push(Self::root_of(left));
+        }
+    }
+
     fn collect_siblings(leaves: &[Hash32], index: usize, out: &mut Vec<Hash32>) {
         if leaves.len() <= 1 {
             return;
@@ -199,6 +270,111 @@ impl MerkleProof {
     }
 }
 
+impl ConsistencyProof {
+    /// Check that `old_root` is a prefix of `new_root`.
+    ///
+    /// Both roots are supplied by the caller and both are *recomputed* from the
+    /// proof. Reproducing only one would let a log rewrite history and hand over
+    /// a matching root for the version it wanted believed.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidProof`] if the sizes are inconsistent, the
+    /// node count does not match the tree shape, or either root fails to
+    /// reproduce.
+    pub fn verify(&self, old_root: Hash32, new_root: Hash32) -> Result<()> {
+        if self.old_size > self.new_size {
+            return Err(CryptoError::InvalidProof("old size exceeds new size"));
+        }
+        // An empty tree is a prefix of every tree, and a tree is a prefix of
+        // itself. Both must carry no nodes, or a caller could smuggle in a
+        // proof body that is never checked.
+        if self.old_size == 0 || self.old_size == self.new_size {
+            if !self.nodes.is_empty() {
+                return Err(CryptoError::InvalidProof(
+                    "degenerate consistency proof must be empty",
+                ));
+            }
+            let expected = if self.old_size == 0 {
+                empty_root()
+            } else {
+                new_root
+            };
+            return if old_root == expected {
+                Ok(())
+            } else {
+                Err(CryptoError::InvalidProof("old root does not match"))
+            };
+        }
+
+        let mut nodes = self.nodes.iter();
+        let (old, new) = Self::replay(self.old_size, self.new_size, true, old_root, &mut nodes)?;
+        if nodes.next().is_some() {
+            return Err(CryptoError::InvalidProof(
+                "consistency proof has spare nodes",
+            ));
+        }
+        if old != old_root {
+            return Err(CryptoError::InvalidProof(
+                "proof does not reproduce the old root",
+            ));
+        }
+        if new != new_root {
+            return Err(CryptoError::InvalidProof(
+                "proof does not reproduce the new root",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recompute `(old_root, new_root)`, mirroring
+    /// [`MerkleTree::collect_consistency`] exactly.
+    fn replay<'a, I>(
+        m: usize,
+        n: usize,
+        is_top: bool,
+        known_old: Hash32,
+        nodes: &mut I,
+    ) -> Result<(Hash32, Hash32)>
+    where
+        I: Iterator<Item = &'a Hash32>,
+    {
+        if m == n {
+            // At the top the old root is the one the verifier already holds, so
+            // the prover never sends it.
+            if is_top {
+                return Ok((known_old, known_old));
+            }
+            let h = *next_node(nodes)?;
+            return Ok((h, h));
+        }
+        let k = split_point(n);
+        if m <= k {
+            // The old tree sits entirely inside the left subtree.
+            let (old, new_left) = Self::replay(m, k, is_top, known_old, nodes)?;
+            let right = *next_node(nodes)?;
+            Ok((old, node_hash(new_left, right)))
+        } else {
+            // The old tree spans the whole left subtree plus part of the right,
+            // so the same left node completes both roots.
+            let (old_right, new_right) = Self::replay(
+                m.saturating_sub(k),
+                n.saturating_sub(k),
+                false,
+                known_old,
+                nodes,
+            )?;
+            let left = *next_node(nodes)?;
+            Ok((node_hash(left, old_right), node_hash(left, new_right)))
+        }
+    }
+}
+
+fn next_node<'a, I: Iterator<Item = &'a Hash32>>(nodes: &mut I) -> Result<&'a Hash32> {
+    nodes.next().ok_or(CryptoError::InvalidProof(
+        "consistency proof ran out of nodes",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +443,99 @@ mod tests {
     #[test]
     fn empty_tree_has_a_defined_root() {
         assert_eq!(MerkleTree::default().root(), empty_root());
+    }
+
+    #[test]
+    fn an_append_only_log_proves_consistent_at_every_pair_of_sizes() {
+        // Sweep every (old, new) pair, because the RFC 6962 recursion has three
+        // distinct shapes and only an exhaustive sweep exercises all of them.
+        for new_size in 0..=33 {
+            let new = tree(new_size);
+            for old_size in 0..=new_size {
+                let old = tree(old_size);
+                let proof = new.prove_consistency(old_size).expect("size in range");
+                assert!(
+                    proof.verify(old.root(), new.root()).is_ok(),
+                    "old={old_size} new={new_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_that_rewrote_an_old_entry_cannot_prove_consistency() {
+        // The whole point. A witness that edits history has no sequence of
+        // hashes that reconciles the root a client already saw with its new one.
+        let honest = tree(16);
+        let old_root = tree(6).root();
+
+        let mut leaves: Vec<_> = (0..16)
+            .map(|i| leaf_hash(format!("tx-{i}").as_bytes()))
+            .collect();
+        leaves[2] = leaf_hash(b"tampered");
+        let rewritten = MerkleTree::from_leaf_hashes(leaves);
+
+        let proof = rewritten.prove_consistency(6).expect("size in range");
+        assert!(
+            proof.verify(old_root, rewritten.root()).is_err(),
+            "a rewritten prefix must be unprovable"
+        );
+        // And the honest log still verifies, so the test is not passing by
+        // accident of a broken verifier.
+        assert!(
+            honest
+                .prove_consistency(6)
+                .expect("size in range")
+                .verify(old_root, honest.root())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_truncated_log_cannot_prove_consistency() {
+        // Dropping entries is as much a rewrite as changing them.
+        let old_root = tree(10).root();
+        let truncated = tree(7);
+        assert!(truncated.prove_consistency(10).is_err());
+        // Nor can it claim the old size was smaller than it was and pass off
+        // the resulting proof as covering the client's actual position.
+        let proof = truncated.prove_consistency(4).expect("size in range");
+        assert!(proof.verify(old_root, truncated.root()).is_err());
+    }
+
+    #[test]
+    fn a_degenerate_proof_may_not_smuggle_nodes() {
+        // old == new needs no nodes; accepting a body there would leave bytes
+        // that are never checked.
+        let t = tree(8);
+        let mut proof = t.prove_consistency(8).expect("size in range");
+        assert!(proof.nodes.is_empty());
+        proof.nodes.push(Hash32::from_bytes([9u8; 32]));
+        assert!(proof.verify(t.root(), t.root()).is_err());
+    }
+
+    #[test]
+    fn spare_or_missing_nodes_are_rejected() {
+        let new = tree(13);
+        let old = tree(5);
+        let good = new.prove_consistency(5).expect("size in range");
+        assert!(good.verify(old.root(), new.root()).is_ok());
+
+        let mut extra = good.clone();
+        extra.nodes.push(Hash32::from_bytes([1u8; 32]));
+        assert!(extra.verify(old.root(), new.root()).is_err());
+
+        let mut short = good;
+        short.nodes.pop();
+        assert!(short.verify(old.root(), new.root()).is_err());
+    }
+
+    #[test]
+    fn an_empty_log_is_a_prefix_of_every_log() {
+        let new = tree(9);
+        let proof = new.prove_consistency(0).expect("size in range");
+        assert!(proof.verify(empty_root(), new.root()).is_ok());
+        // But only against the real empty root.
+        assert!(proof.verify(Hash32::ZERO, new.root()).is_err());
     }
 }

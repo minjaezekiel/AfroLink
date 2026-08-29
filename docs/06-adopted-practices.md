@@ -60,6 +60,35 @@ be fine rather than pretending otherwise.
 |---|---|---|---|
 | **Ouroboros Genesis chain-density rule** — bootstrap from genesis with no checkpoint at all | **Admired, not built.** Theoretically the strongest answer, and it removes the social trust assumption entirely. Cardano's own implementation is still a prototype under audit after years; inventing our own would be worse | [ADR-0010](adr/0010-long-range-attacks.md) | **Rejected** (revisit) |
 | **Key-evolving signatures (KES)** — old keys are erased, so a leaked key cannot re-sign old slots | Deferred. Closes posterior corruption cryptographically rather than economically, but requires every validator to erase key material correctly on schedule, and a mistake is silent | [ADR-0010](adr/0010-long-range-attacks.md) | **Open** (post-mainnet) |
+| **Ouroboros Samasika / Mina-style recursive proofs** — one small proof of the whole chain | **Rejected, on grounds of misattribution.** A recursive proof that set A signed the rotation to set B is a proof the *attacker* can also produce, since they hold A's keys. ZK makes verification succinct; it creates no economic cost, and long-range defence is entirely a question of cost. Mina's bootstrappability comes from Samasika's density rule, not from the SNARK | [ADR-0011](adr/0011-objective-anchors.md) | **Rejected** |
+
+---
+
+## Certificate Transparency — [ADR-0011](adr/0011-objective-anchors.md)
+
+The one system studied here that is not a blockchain, and the closest match to
+the problem a returning wallet actually has.
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **Append-only Merkle logs with signed tree heads** | Taken wholesale. A witness records what it saw and signs a head; the shape is RFC 6962's | `crates/witness/src/log.rs`, `head.rs` | **In code** |
+| **Consistency proofs** — prove the log you saw is still a prefix of the log now | Taken, and it is the load-bearing mechanism. A wallet remembers 40 bytes and can check six months of growth against them; a rewritten log has no proof that reconciles | `crates/crypto/src/merkle.rs`, `crates/witness/src/audit.rs` | **In code** |
+| **Non-equivocation by detection, not prevention** | Taken with the limit stated: only same-size conflicts are compactly provable. An unavailable log is unavailable, not provably dishonest, and is handled by corroboration instead | `crates/witness/src/head.rs` (`Equivocation`) | **In code** |
+| **A consequence that bites** — CT works because Google can distrust a CA | Taken, and it is why this design fits *here* specifically: [ADR-0007](adr/0007-distribution-and-sybil-resistance.md)'s attestors are licensed entities. The penalty is a licence, not a slashed bond | [ADR-0011](adr/0011-objective-anchors.md) | **Decided** (enforcement is off-chain by design) |
+| Gossip between clients to detect a split view | Taken in a narrower form: corroboration across jurisdictions, and any disagreement refuses outright rather than picking a winner | `crates/witness/src/policy.rs` | **In code** |
+
+---
+
+## Bitcoin — [ADR-0011](adr/0011-objective-anchors.md)
+
+Rejected as a consensus mechanism in [ADR-0004](adr/0004-no-proof-of-work.md);
+taken here for the one property proof of work has that proof of stake cannot.
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **An objectively verifiable header chain** — checkable from a hardcoded genesis by cumulative work alone, with no social input | Taken as the layer-2 anchor. This is the only mechanism that *removes* weak subjectivity rather than narrowing it | [ADR-0011](adr/0011-objective-anchors.md) | **Decided** (Phase 2) |
+| **Timestamping** (Babylon, OpenTimestamps) — publish a digest into a chain nobody can rewrite | Taken, with ADR-0010's objection answered architecturally: the dependency is one-directional and non-blocking, so Bitcoin becoming unusable costs an anchor and not liveness | [ADR-0011](adr/0011-objective-anchors.md) | **Open** (Phase 2) |
+| **Verifiable delay functions as a history anchor** | **Rejected.** Would convert forgery cost from zero back to wall-clock time, and a VDF used only for anchoring is not mining. But it degrades against hardware — a 10× faster evaluator forges a year in five weeks — and costs a new primitive, a new node role and a new incentive | [ADR-0011](adr/0011-objective-anchors.md) | **Rejected** |
 
 ---
 
@@ -192,6 +221,16 @@ Writing the ledger exposed gaps that reading the research had not:
    nobody has to. Phase 2.
 4. **We reject Pi's funding model without naming ours.** Recorded as open in
    ADR-0007 rather than left implicit.
+5. **The light client's own documentation over-promised.** `from_checkpoint`
+   said "a checkpoint is a height and a hash" while requiring a header and both
+   validator sets. The doc comment described the trust model correctly and the
+   API did not express it. `LightClient::from_block_id` now does, which is what
+   makes a scannable checkpoint possible: `crates/light/src/lib.rs`.
+6. **Header time was bounded in one direction only.** Monotonicity stops an
+   attacker rewinding the trusting-period clock; nothing stopped a header dated
+   next year parking the deadline in the future and keeping a client trusting a
+   dead chain. Now `MAX_CLOCK_DRIFT_MS`, with
+   `a_header_dated_in_the_future_is_refused`.
 
 Items 2–4 are in [05-roadmap.md](05-roadmap.md). This document is updated
 whenever an ADR is accepted; a practice cited nowhere in a status column is a

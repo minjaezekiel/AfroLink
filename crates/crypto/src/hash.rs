@@ -119,6 +119,18 @@ pub enum Domain {
     /// domain keeps a contact commitment from ever colliding with an address or
     /// a state leaf, so a commitment can never be mistaken for one.
     ContactCommitment,
+    /// Derives a witness log's identifier from its public key.
+    ///
+    /// Binding the identifier to the key means a log cannot be impersonated by
+    /// claiming someone else's name.
+    WitnessLogId,
+    /// The bytes a witness signs when it publishes a tree head.
+    ///
+    /// Separate from every other signing domain so a tree head can never be
+    /// replayed as a vote, a transaction, or a contact attestation.
+    TreeHeadSignDoc,
+    /// A leaf in a witness log: one observation of the chain.
+    WitnessEntry,
 }
 
 impl Domain {
@@ -140,6 +152,9 @@ impl Domain {
             Self::ModuleAddress => "afrolink/v1/module-address",
             Self::ValidatorSetHash => "afrolink/v1/validator-set-hash",
             Self::ContactCommitment => "afrolink/v1/contact-commitment",
+            Self::WitnessLogId => "afrolink/v1/witness-log-id",
+            Self::TreeHeadSignDoc => "afrolink/v1/tree-head-sign-doc",
+            Self::WitnessEntry => "afrolink/v1/witness-entry",
         }
     }
 }

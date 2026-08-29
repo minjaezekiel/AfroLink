@@ -34,11 +34,12 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers. |
 | **Send to `@amina`, not to `afri1qzp8h4c…`** | Usernames, phone numbers and email addresses resolve to addresses — *with a proof*. An alias resolves; it never authorises, so a stolen SIM cannot touch the money. Raw addresses keep working for exchanges and existing tooling. |
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
+| **Recovers from a QR code after six months offline** | Bootstrapping costs 32 scannable bytes, and returning costs forty remembered ones — checked against append-only witness logs in different jurisdictions, so no single party's word is load-bearing. Built for intermittent connectivity rather than apologising for it. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
 
 ## Status
 
-**Phase 1 in progress.** Thirteen crates, **358 tests passing**. A working chain:
+**Phase 1 in progress.** Fourteen crates, **407 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -46,18 +47,19 @@ a node answers queries with proofs. Still in-process — no sockets yet.
 ```
 crates/
   primitives/   canonical consensus codec, checked amounts, denoms      21 tests ✅
-  crypto/       BLAKE3 + Ed25519, bech32m addresses, RFC 6962 Merkle    32 tests ✅
+  crypto/       BLAKE3 + Ed25519, bech32m, RFC 6962 Merkle + consistency 38 tests ✅
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
   executor/     block execution, blocks, genesis                         26 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   58 tests ✅
   node/         consensus driver, proposals, deterministic simulator     10 tests ✅
-  light/        commit + proof verification, long-range defence         20 tests ✅
+  light/        commit + proof verification, long-range defence         25 tests ✅
   store/        durable storage, and the view that serves queries       26 tests ✅
   rpc/          proof-carrying query protocol (no networking)           14 tests ✅
   alias/        usernames, phone/email bindings, SIM-swap defence        50 tests ✅
   pay/          afri: payment URIs, payment references                   16 tests ✅
+  witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
 ```
 
 A node can now answer a wallet's question from disk with a proof, and every way
@@ -121,6 +123,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0008](docs/adr/0008-human-readable-addressing.md) | Usernames, phone and email — and why an alias never authorises. |
 | [ADR-0009](docs/adr/0009-developer-payment-surface.md) | Accepting payment, building dApps, and what we take from Ethereum, Polkadot and XRPL. |
 | [ADR-0010](docs/adr/0010-long-range-attacks.md) | Long-range attacks — the one thing proof of stake has to answer, and how. |
+| [ADR-0011](docs/adr/0011-objective-anchors.md) | Witness logs: a starting point a wallet can check, not one it is told. |
 
 ## Decisions taken
 

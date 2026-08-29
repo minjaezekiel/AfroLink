@@ -156,9 +156,18 @@ users. Mitigations: checkpoints are tiny and cacheable, wallet vendors can ship
 them with updates, and an agent can serve one offline. But it is friction, and
 the alternative was accepting forged history.
 
+> **Superseded in part by [ADR-0011](0011-objective-anchors.md).** That friction
+> is now retired: a wallet recovers from forty remembered bytes via a witness
+> log's consistency proof, or from a 32-byte checkpoint in a QR code. The
+> trusting period below is unchanged — ADR-0011 improves how a client *obtains*
+> a starting point, not what it does once it has one.
+
 We also now depend on a social assumption for first sync. This is honest rather
 than avoidable: Ethereum has the same one, and Ouroboros Genesis — the only
 design that removes it — remains an unshipped prototype after years of work.
+ADR-0011 narrows this assumption from "believe whoever supplied the checkpoint"
+to "believe that witnesses in several jurisdictions are not colluding", and
+specifies a Bitcoin anchor that would remove it outright.
 
 **Deliberately not done.** Validator set *changes* are committed to in headers
 but there is no mechanism to actually change the set yet — that is staking, and

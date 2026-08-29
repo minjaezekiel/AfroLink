@@ -12,7 +12,8 @@ Cryptographic and state primitives, with adversarial tests.
 - [x] Canonical consensus codec — one encoding, bounded, strict *(21 tests)*
 - [x] Hashing with domain separation; Ed25519 with `verify_strict` *(32 tests)*
 - [x] Bech32m addresses, tested against BIP-350 vectors
-- [x] RFC 6962 Merkle trees (no CVE-2012-2459 collision)
+- [x] RFC 6962 Merkle trees (no CVE-2012-2459 collision), with **consistency
+      proofs** — what makes an append-only log unrewritable *(ADR-0011)*
 - [x] Sparse Merkle state with membership **and non-membership** proofs *(18 tests)*
 - [x] Transaction types, signing, replay protection *(33 tests)*
 - [x] Group accounts — chama/susu/stokvel as a native type *(ADR-0005)*
@@ -64,6 +65,13 @@ deterministic simulator in `crates/node/src/sim.rs`.
       period the trusting period is derived from *(ADR-0010)*
 - [ ] Bisection helper for skipping sync — the protocol supports it; the retry
       loop that halves the gap on `InsufficientOverlap` is not written
+- [ ] **Witness log transport** — `crates/witness` is transport-free by design;
+      fetching signed tree heads and proofs rides on the same layer as the RPC
+      protocol *(ADR-0011)*
+- [ ] **Bitcoin anchoring of witness roots** — layer 2 of ADR-0011, and the only
+      mechanism that removes the social assumption outright rather than
+      narrowing it. Deliberately deferred: an anchor needs history worth forging
+      before it is worth paying for
 - [ ] Fast sync and state sync
 - [ ] **Free transaction quota per account** — TRON's bandwidth model, so an
       ordinary user needs neither AFRI nor a sponsor to transact *(R2; the gap

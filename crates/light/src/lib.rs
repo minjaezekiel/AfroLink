@@ -42,7 +42,16 @@
 //! client says so ([`LightError::TrustExpired`]) rather than accepting a chain
 //! it cannot judge.
 //!
-//! Full reasoning: [ADR-0010](../../../docs/adr/0010-long-range-attacks.md).
+//! That deadline has a cost, and it lands on exactly the users this chain is
+//! for: a wallet offline longer than the trusting period needs a fresh
+//! checkpoint before it can do anything. [`LightClient::from_block_id`] makes
+//! that checkpoint as small as it can possibly be — a chain, a height and 32
+//! bytes — so it fits in a QR code an agent can hand out with no network at all.
+//! `crates/witness` is how a wallet obtains those 32 bytes without having to
+//! believe any single source.
+//!
+//! Full reasoning: [ADR-0010](../../../docs/adr/0010-long-range-attacks.md) and
+//! [ADR-0011](../../../docs/adr/0011-objective-anchors.md).
 
 #![cfg_attr(
     test,
@@ -133,6 +142,19 @@ pub enum LightError {
         /// Trusted power required.
         needed: u64,
     },
+    /// The header is dated further ahead than any honest clock skew explains.
+    #[error("header time {got} is more than {drift_ms}ms ahead of the local clock {now}")]
+    FromTheFuture {
+        /// Time on the offered header.
+        got: u64,
+        /// The client's own clock.
+        now: u64,
+        /// Drift allowance.
+        drift_ms: u64,
+    },
+    /// The header offered is not the block the checkpoint names.
+    #[error("header does not match the checkpointed block")]
+    WrongBlock,
 }
 
 /// How long a trusted header stays usable, in milliseconds.
@@ -156,6 +178,17 @@ pub const UNBONDING_MS: u64 = 21 * 24 * 60 * 60 * 1_000;
 // were equal, an attacker could unbond at the exact moment a client's trust
 // expired. Enforced at compile time so no future edit can close the gap.
 const _: () = assert!(TRUSTING_PERIOD_MS < UNBONDING_MS);
+
+/// How far ahead of the local clock a header's time may be.
+///
+/// Monotonic time alone stops an attacker *rewinding* the trusting-period clock.
+/// It does nothing about the opposite move: a header dated next year parks the
+/// deadline in the future and keeps a client accepting a dead chain
+/// indefinitely. Both directions have to be bounded.
+///
+/// Five seconds is generous against real clock skew on a handset and useless as
+/// an attack window at one-second blocks.
+pub const MAX_CLOCK_DRIFT_MS: u64 = 5_000;
 
 /// A wallet's view of the chain.
 ///
@@ -224,6 +257,48 @@ impl LightClient {
         })
     }
 
+    /// Start from a block identifier alone — the smallest possible root of trust.
+    ///
+    /// **This is what makes a checkpoint scannable.** `from_checkpoint` needs a
+    /// header and both validator sets, which is far too much to read off a
+    /// screen or carry on paper. But a header's identifier commits to its own
+    /// contents, including both validator-set hashes, and each set is checked
+    /// against those. So the header and the sets can come from **anybody at all**
+    /// — a hostile server, a stranger's phone — and only `block_id` has to be
+    /// obtained honestly.
+    ///
+    /// A chain identifier, a height and 32 bytes: small enough for a QR code an
+    /// agent prints once and hands out offline, which is the difference between
+    /// a defensible security model and one that strands users with intermittent
+    /// connectivity.
+    ///
+    /// Obtain `block_id` from `afrolink_witness::corroborate` rather than from a
+    /// single source, so that no one party's word is load-bearing.
+    ///
+    /// # Errors
+    /// [`LightError::WrongBlock`] if `header` is not that block,
+    /// [`LightError::WrongChain`] if it belongs to another network, or
+    /// [`LightError::ValidatorSetMismatch`] if either set does not match the
+    /// header's commitments.
+    pub fn from_block_id(
+        chain_id: ChainId,
+        block_id: Hash32,
+        header: BlockHeader,
+        validators: ValidatorSet,
+        next_validators: ValidatorSet,
+    ) -> Result<Self, LightError> {
+        if header.chain_id != chain_id {
+            return Err(LightError::WrongChain {
+                got: header.chain_id.to_string(),
+                expected: chain_id.to_string(),
+            });
+        }
+        if header.id() != block_id {
+            return Err(LightError::WrongBlock);
+        }
+        Self::from_checkpoint(chain_id, header, validators, next_validators)
+    }
+
     /// Override the trusting period. Testing and bespoke deployments only.
     #[must_use]
     pub fn with_trusting_period(mut self, period_ms: u64) -> Self {
@@ -286,7 +361,7 @@ impl LightClient {
         now: Timestamp,
     ) -> Result<(), LightError> {
         self.check_freshness(now)?;
-        self.check_chain_and_time(&header)?;
+        self.check_chain_and_time(&header, now)?;
 
         if header.height != self.trusted.height.next() {
             return Err(LightError::NonSequential {
@@ -343,7 +418,7 @@ impl LightClient {
         now: Timestamp,
     ) -> Result<(), LightError> {
         self.check_freshness(now)?;
-        self.check_chain_and_time(&header)?;
+        self.check_chain_and_time(&header, now)?;
 
         if header.height <= self.trusted.height {
             return Err(LightError::NonSequential {
@@ -415,20 +490,31 @@ impl LightClient {
     }
 
     /// Network and time checks, run before anything more expensive.
-    fn check_chain_and_time(&self, header: &BlockHeader) -> Result<(), LightError> {
+    fn check_chain_and_time(&self, header: &BlockHeader, now: Timestamp) -> Result<(), LightError> {
         if header.chain_id != self.chain_id {
             return Err(LightError::WrongChain {
                 got: header.chain_id.to_string(),
                 expected: self.chain_id.to_string(),
             });
         }
-        // Header times are strictly monotonic. Without this an attacker could
-        // present an older-timestamped header and rewind the trusting-period
+        // Time is bounded in both directions, because both directions are
+        // attacks on the same deadline.
+        //
+        // Backwards: an older-timestamped header rewinds the trusting-period
         // clock, keeping a stale client alive indefinitely.
         if header.time <= self.trusted.time {
             return Err(LightError::NonMonotonicTime {
                 got: header.time.0,
                 trusted: self.trusted.time.0,
+            });
+        }
+        // Forwards: a header dated far ahead parks the deadline in the future,
+        // so a client keeps trusting a chain that stopped long ago.
+        if header.time.0 > now.0.saturating_add(MAX_CLOCK_DRIFT_MS) {
+            return Err(LightError::FromTheFuture {
+                got: header.time.0,
+                now: now.0,
+                drift_ms: MAX_CLOCK_DRIFT_MS,
             });
         }
         Ok(())
@@ -1062,6 +1148,103 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(client.height(), Height::GENESIS, "and the client stays put");
+    }
+
+    #[test]
+    fn thirty_two_bytes_are_enough_to_bootstrap() {
+        // The QR-code path. Only `block_id` need be obtained honestly; the
+        // header and both validator sets can come from anyone, because the
+        // block identifier commits to all of them.
+        let (mut store, genesis) = genesis_chain();
+        let (block, _) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+        let block_id = block.header.id();
+
+        let client = LightClient::from_block_id(
+            chain(),
+            block_id,
+            block.header.clone(),
+            validators(),
+            validators(),
+        )
+        .expect("the header matches the identifier");
+        assert_eq!(client.height(), block.header.height);
+    }
+
+    #[test]
+    fn a_substituted_header_does_not_match_the_scanned_identifier() {
+        // A hostile server hands over a different block than the checkpoint
+        // names, with sets that are internally consistent with it.
+        let (mut store, genesis) = genesis_chain();
+        let (block, _) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        assert_eq!(
+            LightClient::from_block_id(
+                chain(),
+                genesis.header.id(),
+                block.header,
+                validators(),
+                validators(),
+            )
+            .err(),
+            Some(LightError::WrongBlock)
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_for_another_network_is_refused() {
+        let (_, genesis) = genesis_chain();
+        let other = ChainId::new("afrolink-testnet").expect("valid");
+        assert!(matches!(
+            LightClient::from_block_id(
+                other,
+                genesis.header.id(),
+                genesis.header.clone(),
+                validators(),
+                validators(),
+            ),
+            Err(LightError::WrongChain { .. })
+        ));
+    }
+
+    #[test]
+    fn a_header_dated_in_the_future_is_refused() {
+        // The mirror of the rewind attack, and the more dangerous one: a header
+        // dated next year parks the trusting-period deadline in the future, so
+        // a client keeps trusting a chain that stopped months ago.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+        let (mut block, commit) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        block.header.time = Timestamp::from_millis(now().0 + MAX_CLOCK_DRIFT_MS + 1);
+
+        let err = client
+            .update(block.header, &commit, validators(), validators(), now())
+            .expect_err("a header from the future must be refused");
+        assert!(
+            matches!(err, LightError::FromTheFuture { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            client.trusted_header(),
+            &genesis.header,
+            "and the client stays put"
+        );
+    }
+
+    #[test]
+    fn ordinary_clock_skew_is_tolerated() {
+        // The bound must not reject honest handsets whose clocks run fast.
+        let (mut store, genesis) = genesis_chain();
+        let mut client = LightClient::new(chain(), validators(), genesis.header.clone());
+        let (block, commit) = next_block(&mut store, &genesis, &[1, 2, 3, 4]);
+
+        // A phone whose clock lags a second behind the header it is offered.
+        let lagging = Timestamp::from_millis(block.header.time.0 - 1_000);
+        assert!(
+            client
+                .update(block.header, &commit, validators(), validators(), lagging)
+                .is_ok()
+        );
     }
 
     #[test]

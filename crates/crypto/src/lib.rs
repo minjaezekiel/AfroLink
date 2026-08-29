@@ -34,7 +34,7 @@ pub mod merkle;
 pub use address::Address;
 pub use hash::{Domain, Hash32};
 pub use keys::{PublicKey, SecretKey, Signature};
-pub use merkle::{MerkleProof, MerkleTree};
+pub use merkle::{ConsistencyProof, MerkleProof, MerkleTree};
 
 use thiserror::Error;
 
