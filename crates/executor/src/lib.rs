@@ -309,7 +309,16 @@ impl Executor {
         S: KeyValueStore,
     {
         match msg {
-            Message::Transfer { to, denom, amount } => {
+            Message::Transfer {
+                to,
+                denom,
+                amount,
+                // The protocol carries the reference and never reads it — it is
+                // the recipient's reconciliation data, not ours. Named here
+                // rather than wildcarded so that adding a field to `Transfer`
+                // has to be a deliberate decision at this call site.
+                reference: _,
+            } => {
                 Bank::new(store).transfer(&sender, to, denom, *amount)?;
                 ensure_account(store, to);
                 Ok(())
@@ -439,6 +448,19 @@ impl Executor {
 
             Message::RevokeContact { commitment } => {
                 Bindings::new(store).revoke(commitment, sender)?;
+                Ok(())
+            }
+
+            Message::ClearPrimaryAlias => {
+                // Cannot fail and needs no ownership check: it touches only the
+                // sender's own reverse entry. A privacy control that can be
+                // refused is not a privacy control.
+                Registry::new(store).clear_primary(&sender);
+                Ok(())
+            }
+
+            Message::ReleaseName { name } => {
+                Registry::new(store).release(name, sender, height)?;
                 Ok(())
             }
         }
@@ -690,6 +712,7 @@ mod tests {
             to: addr(2),
             denom: kes(),
             amount: Amount::from_afri(500),
+            reference: None,
         };
         let outcome = exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![transfer])]);
 
@@ -708,6 +731,7 @@ mod tests {
             to: addr(2),
             denom: kes(),
             amount: Amount::from_afri(500),
+            reference: None,
         }];
         let txs = vec![tx(1, 0, msgs.clone()), tx(3, 0, msgs)];
 
@@ -733,11 +757,13 @@ mod tests {
             to: addr(5),
             denom: kes(),
             amount: Amount::from_afri(5_000),
+            reference: None,
         }];
         let spend = vec![Message::Transfer {
             to: addr(2),
             denom: kes(),
             amount: Amount::from_afri(4_000),
+            reference: None,
         }];
 
         let exec = Executor::new(chain());
@@ -779,6 +805,7 @@ mod tests {
                 to: addr(2),
                 denom: kes(),
                 amount: Amount::from_afri(100),
+                reference: None,
             }],
         );
 
@@ -807,6 +834,7 @@ mod tests {
                 to: addr(2),
                 denom: kes(),
                 amount: Amount::from_afri(999_999),
+                reference: None,
             }],
         );
 
@@ -834,11 +862,13 @@ mod tests {
                     to: addr(2),
                     denom: kes(),
                     amount: Amount::from_afri(100),
+                    reference: None,
                 },
                 Message::Transfer {
                     to: addr(3),
                     denom: kes(),
                     amount: Amount::from_afri(999_999),
+                    reference: None,
                 },
             ],
         );
@@ -866,6 +896,7 @@ mod tests {
                     to: addr(2),
                     denom: kes(),
                     amount: Amount::from_afri(1),
+                    reference: None,
                 }],
             )],
         );
@@ -1030,6 +1061,7 @@ mod tests {
                 to: addr(2),
                 denom: kes(),
                 amount: Amount::from_afri(5),
+                reference: None,
             }],
         )];
         let (block, outcome) = exec.build_block(
@@ -1063,6 +1095,7 @@ mod tests {
                     to: addr(2),
                     denom: kes(),
                     amount: Amount::from_afri(1),
+                    reference: None,
                 }],
             )],
         );

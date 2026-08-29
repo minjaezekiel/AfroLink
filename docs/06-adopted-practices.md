@@ -30,7 +30,10 @@ cites a dozen influences in its docs and none of them are visible in the code.
 | `online_delete`-style bounded retention | Taken in principle | ADR-0006 §3 | **Open** — needs reference tracking first; GC over shared structure fails silently |
 | **History sharding** — volunteers each hold a range, so the network retains everything without every node doing so | Taken, but paid rather than volunteered | ADR-0006 §5, [04](04-earning-and-participation.md) | **Decided** |
 | **Clio** — a read-optimised server that does not join P2P | Taken as the "serving" role; the query protocol is already transport- and consensus-free, so a serving node is a `ChainView` without a validator | ADR-0006 §2, `crates/rpc` | **In code** (partial) |
-| Amendment voting — on-chain upgrade activation at a supermajority held over a period | Worth taking; we have no upgrade governance yet | — | **Open** (Phase 3) |
+| Amendment voting — on-chain upgrade activation at a supermajority held over a period | Taken, over a Polkadot-style on-chain WASM runtime | [ADR-0009](adr/0009-developer-payment-surface.md) §2 | **Open** (Phase 3) |
+| **Destination tags** — one machine-readable integer, so a single address serves millions of customers | Taken. A field on `Transfer`, not a convention inside `memo`, because free text gets mangled in transit | `crates/types/src/tx.rs`, `crates/pay/src/reference.rs` | **In code** |
+| **Pathfinding and auto-bridging** — pay in one currency, recipient receives another, routed through a neutral bridge asset | Taken, and it is the mechanism that removes the USD leg from intra-African settlement | [ADR-0009](adr/0009-developer-payment-surface.md) §3 | **Open** (Phase 4) |
+| Deterministic finality for payments, because a trader cannot reason about reorg probability | Reached independently; we target ~1s against XRPL's 3–5s | [ADR-0002](adr/0002-consensus.md) | **In code** |
 | Account reserves to prevent state bloat | **Rejected as specified.** A minimum balance to *exist* excludes exactly the users this chain is for. Partly answered instead by charging for the scarce *public good* — a short username, which expires and renews | [ADR-0005](adr/0005-african-first-design.md), `crates/alias/src/registry.rs` | **In code** (partial) / **Open** (Phase 2) |
 
 **The single most valuable thing XRPL taught us** is that full history at ~39 TB
@@ -51,6 +54,32 @@ be fine rather than pretending otherwise.
 
 ---
 
+## Ethereum — [ADR-0009](adr/0009-developer-payment-surface.md)
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **ERC-681 payment request URIs** — one string a merchant emits, any wallet understands | Taken as the `afri:` scheme. The integration is a string, never an SDK | `crates/pay/src/request.rs` | **In code** |
+| **x402 / HTTP 402** — a machine-checkable paywall with no account, card or subscription | Taken. We build a facilitator rather than a competing standard | [ADR-0009](adr/0009-developer-payment-surface.md) §1.2 | **Open** (Phase 2) |
+| ERC-20 — assets as contracts | **Not needed.** Assets are native ledger objects, so a stablecoin is not a contract someone might have written wrong | `crates/bank` | **In code** |
+| ERC-4337 / EIP-7702 account abstraction, to pay gas in something other than the native coin | **Not needed.** Fee abstraction is in the base protocol: any whitelisted denom, and a third party may pay | `crates/types/src/tx.rs` (`Fee`) | **In code** |
+| EIP-3009 / ERC-2612 gasless approvals | **Not needed** — same reason | — | **Rejected** |
+
+Ethereum's account-abstraction stack is fine engineering aimed at a problem we do
+not have, because layer one made a different choice. Recorded so nobody later
+mistakes the absence of ERC-4337 for a gap.
+
+---
+
+## Polkadot — [ADR-0009](adr/0009-developer-payment-surface.md)
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **Forkless runtime upgrades** — the runtime is on-chain WASM, swapped by governance | Taken. A flag-day upgrade stops every mobile-money agent in a corridor at once | [ADR-0009](adr/0009-developer-payment-surface.md) §2 | **Open** (Phase 3) |
+| **Pallets** — a runtime composed of modules owning their own namespace and invariants | Convergent: our `bank` / `alias` / `consensus` split is the same shape, reached independently | `crates/*` | **In code** |
+| Parachains and shared security | **Rejected.** Excellent for renting security to many chains; we are one chain, and the slot economy is a capital barrier of the kind ADR-0005 rejects | [ADR-0001](adr/0001-sovereign-rust-l1.md) | **Rejected** |
+
+---
+
 ## Pi Network — [ADR-0007](adr/0007-distribution-and-sybil-resistance.md)
 
 The only project to have run this project's premise at scale. It supplied more
@@ -59,6 +88,8 @@ adopted practice than any other single source, in both directions.
 | Practice | Decision | Where it lives | Status |
 |---|---|---|---|
 | **App-store onboarding instead of seed phrases** — the highest-leverage decision they made | Taken | [01](01-architecture.md), R10 | **Open** (Phase 4, wallet) |
+| **Human-readable addresses as the default** — send to a username, never see an address | Taken, with the anchor changed: Pi binds a name to a company-certified identity, we bind it to a key, and the answer arrives under a proof | `crates/alias`, [ADR-0008](adr/0008-human-readable-addressing.md) | **In code** |
+| A username namespace with no confusable rules and no on-chain commitment | **Rejected.** `@arnina` beside `@amina` is a live attack on a user base recruited for being non-technical | ADR-0008 §3 | **Rejected** |
 | **A bundled builder stack** (browser, wallet, app studio, domains) rather than asking developers to assemble one | Taken | [05](05-roadmap.md) Phase 3 | **Open** |
 | Zero-energy consensus is acceptable to users — 70M+ of them did not care | Confirms [ADR-0004](adr/0004-no-proof-of-work.md) from the demand side | — | **Decided** |
 | **Decentralisation published as a measurement, not a claim** | Taken, and it is why the module below exists | `crates/consensus/src/decentralization.rs` | **In code** |

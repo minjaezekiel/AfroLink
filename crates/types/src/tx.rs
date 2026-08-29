@@ -18,6 +18,7 @@
 use afrolink_alias::{ContactCommitment, Username};
 use afrolink_crypto::hash::{Domain, Hash32, hash};
 use afrolink_crypto::{Address, CryptoError, PublicKey, SecretKey, Signature};
+use afrolink_pay::PaymentReference;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exact};
 use afrolink_primitives::{Amount, ChainId, Denom, Height};
 use thiserror::Error;
@@ -135,6 +136,17 @@ pub enum Message {
         denom: Denom,
         /// Quantity moved.
         amount: Amount,
+        /// The recipient's own reconciliation reference, if they asked for one.
+        ///
+        /// XRPL's destination tag, and it earns its place as a field rather
+        /// than a convention inside `memo`: one exchange address serves
+        /// millions of customers, and a deposit with no machine-readable tag
+        /// belongs to nobody until a human intervenes. Free text gets
+        /// truncated, auto-corrected and pasted with a trailing space; a `u64`
+        /// does not.
+        ///
+        /// The protocol never reads it. It is data for the recipient's systems.
+        reference: Option<PaymentReference>,
     },
     /// Form a savings group (chama, susu, stokvel, tontine, equb, VSLA).
     CreateGroup {
@@ -187,8 +199,22 @@ pub enum Message {
         to: Address,
     },
     /// Choose which owned name wallets display for the sender's address.
+    ///
+    /// Opt-in disclosure: it lets anyone seeing the address discover the handle,
+    /// and so link that address's whole history to one name. A merchant wants
+    /// that; a person often does not.
     SetPrimaryAlias {
         /// The name to display.
+        name: Username,
+    },
+    /// Stop publishing a display name for the sender's address.
+    ///
+    /// The counterpart to [`Self::SetPrimaryAlias`]. A disclosure that cannot be
+    /// withdrawn is not a choice, so this takes no arguments and cannot fail.
+    ClearPrimaryAlias,
+    /// Give up a name entirely, freeing it and its skeleton.
+    ReleaseName {
+        /// The name to release.
         name: Username,
     },
     /// Bind a phone number or email to an account. Sender must be a licensed
@@ -287,7 +313,9 @@ impl TxBody {
                 | Message::AttestContact { .. }
                 | Message::RequestRebind { .. }
                 | Message::VetoRebind { .. }
-                | Message::RevokeContact { .. } => {}
+                | Message::RevokeContact { .. }
+                | Message::ClearPrimaryAlias
+                | Message::ReleaseName { .. } => {}
             }
         }
         Ok(())
@@ -381,11 +409,17 @@ impl Decode for Fee {
 impl Encode for Message {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Self::Transfer { to, denom, amount } => {
+            Self::Transfer {
+                to,
+                denom,
+                amount,
+                reference,
+            } => {
                 out.push(0);
                 to.encode(out);
                 denom.encode(out);
                 amount.encode(out);
+                reference.encode(out);
             }
             Self::CreateGroup {
                 name,
@@ -451,6 +485,11 @@ impl Encode for Message {
                 out.push(11);
                 commitment.encode(out);
             }
+            Self::ClearPrimaryAlias => out.push(12),
+            Self::ReleaseName { name } => {
+                out.push(13);
+                name.encode(out);
+            }
         }
     }
 }
@@ -462,6 +501,7 @@ impl Decode for Message {
                 to: Address::decode(r)?,
                 denom: Denom::decode(r)?,
                 amount: Amount::decode(r)?,
+                reference: Option::<PaymentReference>::decode(r)?,
             }),
             1 => Ok(Self::CreateGroup {
                 name: String::decode(r)?,
@@ -503,6 +543,10 @@ impl Decode for Message {
             }),
             11 => Ok(Self::RevokeContact {
                 commitment: ContactCommitment::decode(r)?,
+            }),
+            12 => Ok(Self::ClearPrimaryAlias),
+            13 => Ok(Self::ReleaseName {
+                name: Username::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,
@@ -584,6 +628,7 @@ mod tests {
                 to: Address::from_public_key(&key(2).public_key()),
                 denom: kes(),
                 amount: Amount::from_afri(500),
+                reference: None,
             }],
             memo: "school fees".to_owned(),
         }
@@ -661,6 +706,7 @@ mod tests {
             to: Address::from_public_key(&key(2).public_key()),
             denom: kes(),
             amount: Amount::from_afri(500_000),
+            reference: None,
         }];
         assert_eq!(
             tx.verify(&chain(), Height(10)),
@@ -676,6 +722,7 @@ mod tests {
             to: Address::from_public_key(&key(77).public_key()),
             denom: kes(),
             amount: Amount::from_afri(500),
+            reference: None,
         }];
         assert_eq!(
             tx.verify(&chain(), Height(10)),
@@ -718,8 +765,68 @@ mod tests {
             to: Address::from_public_key(&key(2).public_key()),
             denom: kes(),
             amount: Amount::ZERO,
+            reference: None,
         }];
         assert_eq!(body.validate_basic(), Err(TxError::ZeroAmount));
+    }
+
+    #[test]
+    fn a_payment_reference_survives_signing_and_the_wire() {
+        // An exchange credits a customer from this field. If it were lost or
+        // altered between the wallet and the ledger, the deposit would arrive
+        // belonging to nobody.
+        use afrolink_pay::PaymentReference;
+
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(2).public_key()),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+            reference: Some(PaymentReference(88_121)),
+        }];
+        let tx = body.sign(&sk);
+
+        let decoded = Transaction::from_bytes(&tx.to_bytes()).expect("decodes");
+        assert!(decoded.verify(&chain(), Height(10)).is_ok());
+        assert_eq!(
+            decoded.body.messages.first(),
+            Some(&Message::Transfer {
+                to: Address::from_public_key(&key(2).public_key()),
+                denom: kes(),
+                amount: Amount::from_afri(500),
+                reference: Some(PaymentReference(88_121)),
+            })
+        );
+    }
+
+    #[test]
+    fn tampering_with_a_payment_reference_invalidates_the_signature() {
+        // The reference is inside the signed document, so a relay cannot
+        // redirect a deposit to a different customer account on its way past.
+        use afrolink_pay::PaymentReference;
+
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(2).public_key()),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+            reference: Some(PaymentReference(88_121)),
+        }];
+        let mut tx = body.sign(&sk);
+
+        tx.body.messages = vec![Message::Transfer {
+            to: Address::from_public_key(&key(2).public_key()),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+            reference: Some(PaymentReference(99_999)),
+        }];
+
+        assert_eq!(
+            tx.verify(&chain(), Height(10)),
+            Err(TxError::InvalidSignature)
+        );
     }
 
     #[test]

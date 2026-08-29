@@ -250,6 +250,7 @@ mod tests {
                 to: addr(51),
                 denom: kes(),
                 amount: Amount::from_afri(amount),
+                reference: None,
             }],
             memo: String::new(),
         }

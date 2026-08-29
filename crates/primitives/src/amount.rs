@@ -120,6 +120,77 @@ impl Amount {
             op: "Amount::mul_ratio",
         })
     }
+
+    /// Parse a decimal string such as `"250.75"` into units.
+    ///
+    /// The exact inverse of [`Display`](core::fmt::Display), so an amount
+    /// written into a payment request parses back to the same value.
+    ///
+    /// Deliberately strict. Every rejected form below is one a spreadsheet, a
+    /// locale-aware formatter or a phone keyboard can produce, and a payment
+    /// amount that parses *approximately* is worse than one that fails: the
+    /// user finds out after the money has moved.
+    ///
+    /// * No thousands separators — `1,000` is one thousand in some locales and
+    ///   one in others.
+    /// * No sign, no exponent, no whitespace.
+    /// * At most [`AFRI_DECIMALS`] fractional digits. Truncating extra
+    ///   precision silently would round somebody's money away.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] if the text is not an exact decimal quantity,
+    /// or [`Error::Overflow`] if it does not fit.
+    pub fn from_decimal(s: &str) -> Result<Self> {
+        let invalid = || Error::Invalid {
+            what: "Amount::from_decimal",
+        };
+
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return Err(invalid());
+        }
+
+        let (whole_str, frac_str) = match s.split_once('.') {
+            Some((w, f)) => {
+                if f.contains('.') {
+                    return Err(invalid());
+                }
+                (w, f)
+            }
+            None => (s, ""),
+        };
+
+        // Require a digit on both sides of the point: ".5" and "5." are the
+        // shapes most likely to have lost a character in transit.
+        if whole_str.is_empty() || (s.contains('.') && frac_str.is_empty()) {
+            return Err(invalid());
+        }
+        let decimals = AFRI_DECIMALS as usize;
+        if frac_str.len() > decimals {
+            return Err(invalid());
+        }
+
+        let whole: u128 = whole_str.parse().map_err(|_| invalid())?;
+        let padded = format!("{frac_str:0<decimals$}");
+        let frac: u128 = if padded.is_empty() {
+            0
+        } else {
+            padded.parse().map_err(|_| invalid())?
+        };
+
+        whole
+            .checked_mul(SENTE_PER_AFRI)
+            .and_then(|units| units.checked_add(frac))
+            .map(Self)
+            .ok_or(Error::Overflow {
+                op: "Amount::from_decimal",
+            })
+    }
+
+    /// Render as a decimal string. The inverse of [`Self::from_decimal`].
+    #[must_use]
+    pub fn to_decimal(self) -> String {
+        self.to_string()
+    }
 }
 
 impl core::fmt::Display for Amount {
@@ -152,6 +223,8 @@ impl Decode for Amount {
 
 #[cfg(test)]
 mod tests {
+    // Decimal parsing is the boundary between a payment request and money, so
+    // it is tested against the shapes that actually arrive in the field.
     use super::*;
     use crate::codec::decode_exact;
 
@@ -190,5 +263,74 @@ mod tests {
     fn amount_round_trips_through_codec() {
         let a = Amount::from_afri(1_234);
         assert_eq!(decode_exact::<Amount>(&a.to_bytes()), Ok(a));
+    }
+
+    #[test]
+    fn decimal_text_round_trips() {
+        for amount in [
+            Amount::ZERO,
+            Amount::from_units(1),
+            Amount::from_afri(250),
+            Amount::from_units(250_750_000_000),
+            Amount::from_units(u64::MAX as u128),
+        ] {
+            assert_eq!(
+                Amount::from_decimal(&amount.to_decimal()),
+                Ok(amount),
+                "{amount} must survive a round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_amount_parses_to_the_right_units() {
+        assert_eq!(Amount::from_decimal("1"), Ok(Amount::from_afri(1)));
+        assert_eq!(Amount::from_decimal("1.0"), Ok(Amount::from_afri(1)));
+        assert_eq!(
+            Amount::from_decimal("0.000000001"),
+            Ok(Amount::from_units(1)),
+            "one sente is the smallest representable amount"
+        );
+        assert_eq!(
+            Amount::from_decimal("250.75"),
+            Ok(Amount::from_units(250_750_000_000))
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_lossy_amounts_are_refused() {
+        // Each of these is something a spreadsheet, a locale-aware formatter or
+        // a phone keyboard produces. Parsing them approximately would move the
+        // wrong amount of money and the user would find out afterwards.
+        for bad in [
+            "",
+            ".",
+            "1,000",
+            "1 000",
+            " 1",
+            "1 ",
+            "+1",
+            "-1",
+            "1e3",
+            "1.2.3",
+            ".5",
+            "5.",
+            "0.0000000001",
+            "abc",
+            "1.abc",
+        ] {
+            assert!(
+                Amount::from_decimal(bad).is_err(),
+                "{bad:?} must not parse as an amount"
+            );
+        }
+    }
+
+    #[test]
+    fn excess_precision_errors_rather_than_rounding() {
+        // Silently truncating would round somebody's money away without saying
+        // so, which is the one failure mode a payment amount must not have.
+        assert!(Amount::from_decimal("1.0000000001").is_err());
+        assert!(Amount::from_decimal("1.000000000").is_ok());
     }
 }

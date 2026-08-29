@@ -88,6 +88,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-pay"
+version = "0.1.0"
+dependencies = [
+ "afrolink-alias",
+ "afrolink-crypto",
+ "afrolink-primitives",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-primitives"
 version = "0.1.0"
 dependencies = [
@@ -143,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "afrolink-alias",
  "afrolink-crypto",
+ "afrolink-pay",
  "afrolink-primitives",
  "thiserror",
 ]

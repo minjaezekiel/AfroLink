@@ -31,13 +31,14 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
+| **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers. |
 | **Send to `@amina`, not to `afri1qzp8h4c…`** | Usernames, phone numbers and email addresses resolve to addresses — *with a proof*. An alias resolves; it never authorises, so a stolen SIM cannot touch the money. Raw addresses keep working for exchanges and existing tooling. |
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
 
 ## Status
 
-**Phase 1 in progress.** Twelve crates, **320 tests passing**. A working chain:
+**Phase 1 in progress.** Thirteen crates, **350 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -55,7 +56,8 @@ crates/
   light/        commit + state proof verification for wallets            12 tests ✅
   store/        durable storage, and the view that serves queries       26 tests ✅
   rpc/          proof-carrying query protocol (no networking)           14 tests ✅
-  alias/        usernames, phone/email bindings, SIM-swap defence        44 tests ✅
+  alias/        usernames, phone/email bindings, SIM-swap defence        50 tests ✅
+  pay/          afri: payment URIs, payment references                   16 tests ✅
 ```
 
 A node can now answer a wallet's question from disk with a proof, and every way
@@ -116,6 +118,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0006](docs/adr/0006-state-persistence-and-retention.md) | State persistence, drawn from XRPL's NodeStore and TRON's lite fullnode. |
 | [ADR-0007](docs/adr/0007-distribution-and-sybil-resistance.md) | What Pi Network's 70M-user experiment proved, and what it rules out. |
 | [ADR-0008](docs/adr/0008-human-readable-addressing.md) | Usernames, phone and email — and why an alias never authorises. |
+| [ADR-0009](docs/adr/0009-developer-payment-surface.md) | Accepting payment, building dApps, and what we take from Ethereum, Polkadot and XRPL. |
 
 ## Decisions taken
 

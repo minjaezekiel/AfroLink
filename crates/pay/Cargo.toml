@@ -1,18 +1,17 @@
 [package]
-name = "afrolink-types"
+name = "afrolink-pay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Accounts, group (chama/susu/stokvel) accounts, transactions and messages for AfroLink."
+description = "Payment requests, payment references and the afri: URI scheme — the surface a developer integrates against."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-alias.workspace = true
-afrolink-pay.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -209,6 +209,16 @@ impl<'a, S: KeyValueStore> Registry<'a, S> {
 
     /// Set the name wallets display for the caller's address.
     ///
+    /// **Opt-in, and worth understanding before opting in.** Forward lookup
+    /// (name → address) is what a payer needs. This is the *reverse* link, and
+    /// it is strictly a disclosure: it lets anyone who sees the address in a
+    /// transaction discover the handle, and therefore link every payment that
+    /// address ever makes to one name.
+    ///
+    /// A merchant wants exactly that. A person often does not, which is why it
+    /// is a separate action rather than a side effect of registering, and why
+    /// [`Self::clear_primary`] exists.
+    ///
     /// # Errors
     /// Returns the first [`RegistryError`] encountered.
     pub fn set_primary(
@@ -220,6 +230,46 @@ impl<'a, S: KeyValueStore> Registry<'a, S> {
         self.owned_by(name, caller, now)?;
         self.store
             .set_encoded(&StoreKey::alias_reverse(&caller), &name.as_str().to_owned());
+        Ok(())
+    }
+
+    /// Stop publishing a display name for the caller's address.
+    ///
+    /// Unconditional and always available: it touches only the caller's own
+    /// reverse entry, and a privacy control that can be refused is not a
+    /// privacy control. The name itself is untouched and keeps resolving
+    /// forward — you become unlisted, not unpayable.
+    ///
+    /// Returns whether an entry was actually removed.
+    ///
+    /// Note the limit honestly: this stops *future* lookups. It cannot unlink
+    /// what observers recorded while the entry was published, because the chain
+    /// is public and history does not move.
+    pub fn clear_primary(&mut self, caller: &Address) -> bool {
+        self.store.delete(&StoreKey::alias_reverse(caller))
+    }
+
+    /// Give up a name entirely, freeing it and its skeleton for others.
+    ///
+    /// For someone who wants no on-chain handle at all rather than merely an
+    /// unpublished one.
+    ///
+    /// # Errors
+    /// Returns the first [`RegistryError`] encountered.
+    pub fn release(
+        &mut self,
+        name: &Username,
+        caller: Address,
+        now: Height,
+    ) -> Result<(), RegistryError> {
+        self.owned_by(name, caller, now)?;
+
+        self.store.delete(&StoreKey::alias(name.as_str()));
+        self.store
+            .delete(&StoreKey::alias_skeleton(name.skeleton().as_str()));
+        if self.primary_name(&caller)?.as_deref() == Some(name.as_str()) {
+            self.store.delete(&StoreKey::alias_reverse(&caller));
+        }
         Ok(())
     }
 
@@ -473,6 +523,150 @@ mod tests {
         assert_eq!(
             registry.get(&name("amina")).unwrap().unwrap().owner,
             addr(2)
+        );
+    }
+
+    // -- Pseudonymity ------------------------------------------------------
+    //
+    // A username is a self-chosen handle pointing at an address. It is not an
+    // identity, and nothing in this crate ever asks who the holder is. These
+    // tests pin that down, because it is the kind of property that erodes
+    // silently when someone later adds a "convenient" field.
+
+    #[test]
+    fn a_name_record_says_nothing_about_who_holds_it() {
+        // The entire stored record is an address, two heights, and no third
+        // thing. There is nowhere for a legal name, a document or a country to
+        // be added without this test failing.
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("amina"), addr(1), Height(100))
+            .expect("registers");
+
+        let record = registry.get(&name("amina")).unwrap().unwrap();
+        assert_eq!(
+            record,
+            NameRecord {
+                owner: addr(1),
+                registered_at: Height(100),
+                expires_at: Height(100 + REGISTRATION_BLOCKS),
+            }
+        );
+    }
+
+    #[test]
+    fn registering_a_name_does_not_publish_a_reverse_link() {
+        // Forward lookup is what a payer needs. The reverse link is a
+        // disclosure, so it must never be a side effect of registering.
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("amina"), addr(1), Height(100))
+            .expect("registers");
+
+        assert_eq!(
+            registry.primary_name(&addr(1)).expect("reads"),
+            None,
+            "an address must stay unlisted until its holder chooses otherwise"
+        );
+    }
+
+    #[test]
+    fn a_holder_can_unlink_their_address_from_their_name() {
+        // Without this, opting in to a display name would be irreversible, and
+        // an irreversible disclosure is not a choice.
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("amina"), addr(1), Height(100))
+            .expect("registers");
+        registry
+            .set_primary(&name("amina"), addr(1), Height(100))
+            .expect("opts in");
+        assert_eq!(
+            registry.primary_name(&addr(1)).unwrap().as_deref(),
+            Some("amina")
+        );
+
+        assert!(registry.clear_primary(&addr(1)), "an entry was removed");
+        assert_eq!(registry.primary_name(&addr(1)).unwrap(), None);
+
+        // Unlisted, not unpayable: the name still resolves forward.
+        assert_eq!(
+            registry.get(&name("amina")).unwrap().unwrap().owner,
+            addr(1)
+        );
+    }
+
+    #[test]
+    fn one_person_can_hold_several_addresses_and_name_only_one() {
+        // The compartmentalisation property. A trader publishes @duka for the
+        // shop and keeps a separate unnamed address for everything else; the
+        // chain cannot associate them.
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("duka-la-amina"), addr(1), Height(100))
+            .expect("registers");
+        registry
+            .set_primary(&name("duka-la-amina"), addr(1), Height(100))
+            .expect("opts in");
+
+        assert_eq!(
+            registry.primary_name(&addr(2)).expect("reads"),
+            None,
+            "a second address must not inherit the first's name"
+        );
+    }
+
+    #[test]
+    fn a_released_name_leaves_nothing_behind() {
+        // For someone who wants no on-chain handle at all. The skeleton entry
+        // has to go too, or an abandoned name would keep blocking lookalikes
+        // forever and quietly shrink the namespace.
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("amina"), addr(1), Height(100))
+            .expect("registers");
+        registry
+            .set_primary(&name("amina"), addr(1), Height(100))
+            .expect("opts in");
+
+        registry
+            .release(&name("amina"), addr(1), Height(200))
+            .expect("releases");
+
+        assert_eq!(registry.get(&name("amina")).expect("reads"), None);
+        assert_eq!(registry.primary_name(&addr(1)).expect("reads"), None);
+
+        // And somebody else may now take it, or a name resembling it.
+        registry
+            .register(&name("arnina"), addr(2), Height(300))
+            .expect("the skeleton was freed too");
+    }
+
+    #[test]
+    fn a_stranger_cannot_release_or_unlist_someone_else() {
+        let mut store = MemoryStore::new();
+        let mut registry = Registry::new(&mut store);
+        registry
+            .register(&name("amina"), addr(1), Height(100))
+            .expect("registers");
+        registry
+            .set_primary(&name("amina"), addr(1), Height(100))
+            .expect("opts in");
+
+        assert_eq!(
+            registry.release(&name("amina"), addr(66), Height(200)),
+            Err(RegistryError::NotOwner("amina".to_owned()))
+        );
+        // clear_primary only ever touches the caller's own entry.
+        assert!(!registry.clear_primary(&addr(66)));
+        assert_eq!(
+            registry.primary_name(&addr(1)).unwrap().as_deref(),
+            Some("amina")
         );
     }
 

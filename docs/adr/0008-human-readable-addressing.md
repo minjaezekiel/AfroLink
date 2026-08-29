@@ -149,6 +149,83 @@ sender's first transaction do the recruiting. Recorded as **deferred, not
 unconsidered**. If it is built later it needs expiry, refund-to-sender, and a
 claim path that is not merely possession of the number.
 
+### 7. A username is a pseudonym, not an identity.
+
+The name exists to hide an address, not to reveal a person. Three properties,
+each with a test that fails if someone later erodes it:
+
+**Nothing in a name record identifies anyone.** A `NameRecord` is an owner
+address and two heights. There is no name field, no document, no country, no
+attestor — and `a_name_record_says_nothing_about_who_holds_it` asserts the whole
+record structurally, so a "convenient" identity field cannot be added quietly.
+Registration asks for a key and a fee. It does not ask who you are.
+
+**The reverse link is opt-in and reversible.** Forward lookup (name → address) is
+what a payer needs. Reverse lookup (address → name) is a *disclosure*: it lets
+anyone who sees the address in a transaction link that address's entire history
+to one handle. So registering publishes no reverse entry, `SetPrimaryAlias` is a
+separate deliberate act, and `ClearPrimaryAlias` withdraws it unconditionally —
+a disclosure that cannot be withdrawn is not a choice. `ReleaseName` goes
+further and removes the registration altogether.
+
+**Compartmentalisation works.** A holder may keep several addresses and name
+only one. A trader publishes `@duka-la-amina` for the stall and keeps a separate
+unnamed address for everything else; the chain cannot associate them, because
+there is nothing to associate them *with*.
+
+**The limits, stated rather than implied.** Clearing a display name stops future
+lookups; it cannot unlink what observers recorded while it was published, because
+the chain is public and history does not move. And a username used in trade is
+inherently linkable by ordinary observation — pay `@duka-la-amina` in person and
+you have learned who holds it. This design gives pseudonymity, which is what a
+public ledger can honestly offer. It does not give anonymity, and a system that
+claimed to would be lying to the people least able to check.
+
+Contact aliases carry this further: phone and email exist on chain only as
+commitments (§4), so even the identifier a person is findable by is not
+published.
+
+## How Pi Network does this, and where we differ
+
+Pi ships username payments today and calls them **Human-Readable Addresses**: a
+Pioneer sends Pi by typing a recipient's Pi username instead of a Stellar-style
+address. At 70M+ registrations it is the largest deployment of the idea in our
+market, so it is worth being precise about what it gets right and what it costs.
+
+**What Pi got right, and we copied:** a username is the default way to name a
+recipient, not an advanced feature; it is the *same* username across the app,
+the wallet and the browser, so a merchant verifies a payer without decoding
+anything; and the address never appears in normal use.
+
+**Where the designs diverge, and why:**
+
+| | Pi | AfroLink |
+|---|---|---|
+| Who owns the namespace | Pi Core Team | on-chain registry, first-come |
+| What makes a name yours | passing Pi's KYC — one username per verified human | holding a key |
+| Lookalike names | not prevented | ASCII-only + skeleton index |
+| Resolution is verifiable | no — the directory is the authority | yes — proved against a committed state root |
+| Losing the name | possible if KYC is revoked | only by not renewing |
+| Phone numbers | KYC input, held by Pi | never stored; commitment only |
+
+The substantive difference is the second row. Pi binds the name to a
+*verified identity* held by one company, which is coherent for their goal of one
+account per human — and it is the model
+[ADR-0007](0007-distribution-and-sybil-resistance.md) rejected, because it makes
+a corporate entity the gate on whether your balance exists. We bind the name to a
+key. Nobody can revoke it, and losing your identity documents cannot cost you
+your payment identity.
+
+The third and fourth rows are where we think Pi is simply exposed. A username
+directory that is not committed to state means a wallet has to trust whoever
+answers the lookup, and a namespace with no confusable rules means `@arnina`
+alongside `@amina` is a live attack against a user base explicitly recruited for
+being non-technical.
+
+**The better approach, stated as one sentence:** keep Pi's default — a name, not
+an address — and change what the name is anchored to, from an identity a company
+certifies to a key the user holds, with the answer arriving under a proof.
+
 ## Consequences
 
 **Good.** The interface becomes usable by the people the network is for. The

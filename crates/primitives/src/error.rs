@@ -36,4 +36,11 @@ pub enum Error {
         /// The operation that overflowed.
         op: &'static str,
     },
+
+    /// Input was not a well-formed value of the expected kind.
+    #[error("invalid input to {what}")]
+    Invalid {
+        /// The operation that rejected it.
+        what: &'static str,
+    },
 }

@@ -62,6 +62,9 @@ deterministic simulator in `crates/node/src/sim.rs`.
       surfaced by [06](06-adopted-practices.md))*
 - [ ] State-bloat pricing that is **not** XRPL-style account reserves — a
       minimum balance to exist excludes the users this chain is for
+- [ ] **x402 facilitator** — verify an `afri:` payment against an HTTP 402
+      challenge, so any online service can charge in AFRI or a stablecoin
+      *(ADR-0009; needs the RPC transport first)*
 - [ ] Explorer, faucet, monitoring
 
 **Exit criterion:** 20 geographically distributed validators; the chain survives
@@ -73,13 +76,15 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
 - [ ] **Fee abstraction** — pay gas in any whitelisted stablecoin *(R2)*
 - [x] **Human-readable addressing** — usernames, phone and email aliases with
       time-locked, vetoable rebinding *(ADR-0008, `crates/alias` 44 tests, plus 8 end-to-end)*
+- [x] **`afri:` payment request URIs and payment references** — a merchant emits
+      one string; any wallet understands it *(ADR-0009, `crates/pay`)*
 - [ ] Off-chain resolver service *(specified in [07](07-resolver-service.md))*
 - [ ] Social recovery; sponsored fees
 - [ ] Contract templates: savings, escrow, payroll, rotating savings (chama/susu)
 - [ ] SDKs: Rust, TypeScript, Kotlin, Flutter
-- [ ] **Upgrade governance** — XRPL-style amendment voting: on-chain activation
-      at a supermajority sustained over a period, not a flag day. We currently
-      have none, which [06](06-adopted-practices.md) surfaced
+- [ ] **Upgrade governance** — XRPL-style amendment voting over a Polkadot-style
+      on-chain WASM runtime: no flag day, because a flag day stops every agent in
+      a corridor at once *(ADR-0009 §2)*
 - [ ] Name the funding model for the public-goods side of the network.
       [ADR-0007](adr/0007-distribution-and-sybil-resistance.md) rules out Pi's
       answer (monetising users' attention) without yet naming ours
@@ -95,6 +100,10 @@ without talking to the core team.
 - [ ] Agent registry, bonding, liquidity mining, ratings
 - [ ] USSD gateway *(feature phones — R10)*
 - [ ] First mobile-money bridge (one corridor, licensed and bonded)
+- [ ] **Cross-currency payments with pathfinding** — send KES, receive NGN,
+      routed directly or bridged through AFRI. XRPL's mechanism applied to the
+      strategic gap in research §3.2: removing the USD leg. The largest single
+      engineering item on this roadmap *(ADR-0009 §3)*
 - [ ] IBC
 
 **Exit criterion:** **one real remittance corridor, end to end, under 1% total
