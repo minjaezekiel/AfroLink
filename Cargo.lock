@@ -59,6 +59,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-fuzz"
+version = "0.1.0"
+dependencies = [
+ "afrolink-alias",
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-light",
+ "afrolink-pay",
+ "afrolink-primitives",
+ "afrolink-state",
+ "afrolink-types",
+ "afrolink-witness",
+]
+
+[[package]]
 name = "afrolink-light"
 version = "0.1.0"
 dependencies = [

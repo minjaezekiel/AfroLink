@@ -361,9 +361,27 @@ impl Encode for ValidatorSet {
 }
 
 impl Decode for ValidatorSet {
+    /// Refuses a set that is not already in canonical order.
+    ///
+    /// [`ValidatorSet::new`] sorts by address, which is right for a caller
+    /// assembling a set and wrong for bytes off the wire: it would make every
+    /// permutation of the same membership a valid encoding of one value, and
+    /// the codec's rule is that there is exactly one.
+    ///
+    /// It matters most for genesis. A genesis file is the one input a node
+    /// ingests before it can check anything against a chain, and operators
+    /// publish its hash before launch. If the same set has `n!` encodings, that
+    /// published hash does not identify a unique file.
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
         let validators = Vec::<Validator>::decode(r)?;
-        Self::new(validators).map_err(|e| CodecError::Invalid(e.to_string()))
+        let offered: Vec<Address> = validators.iter().map(|v| v.address).collect();
+        let set = Self::new(validators).map_err(|e| CodecError::Invalid(e.to_string()))?;
+        if set.validators.iter().map(|v| v.address).ne(offered) {
+            return Err(CodecError::Invalid(
+                "validator set is not in canonical order".to_owned(),
+            ));
+        }
+        Ok(set)
     }
 }
 
@@ -382,6 +400,39 @@ mod tests {
 
     fn set_of(n: u8, power: u64) -> ValidatorSet {
         ValidatorSet::new((1..=n).map(|i| validator(i, power, "ke")).collect()).expect("valid set")
+    }
+
+    #[test]
+    fn a_permuted_validator_set_on_the_wire_is_refused_rather_than_sorted() {
+        // Found by the adversarial harness. `ValidatorSet::new` sorts by
+        // address — right for a caller assembling a set, wrong at the decode
+        // boundary, because it made every permutation of one membership a
+        // valid encoding of the same value.
+        //
+        // It matters most for genesis: operators publish the genesis file's
+        // hash before launch, and `n!` encodings means that hash identifies no
+        // unique file.
+        use afrolink_primitives::codec::decode_exact;
+
+        let canonical = set_of(4, 10);
+        let bytes = canonical.to_bytes();
+        assert_eq!(decode_exact::<ValidatorSet>(&bytes), Ok(canonical.clone()));
+
+        // Same membership, offered in a different order.
+        let mut shuffled: Vec<Validator> = canonical.validators().to_vec();
+        shuffled.reverse();
+        assert_ne!(
+            shuffled.first().map(|v| v.address),
+            canonical.validators().first().map(|v| v.address),
+            "the fixture must actually be reordered, or this proves nothing"
+        );
+        let mut permuted = Vec::new();
+        shuffled.encode(&mut permuted);
+
+        assert!(
+            decode_exact::<ValidatorSet>(&permuted).is_err(),
+            "a permuted validator set must not decode"
+        );
     }
 
     #[test]

@@ -226,15 +226,29 @@ impl Encode for Username {
 }
 
 impl Decode for Username {
-    /// Re-validates on the way in.
+    /// Re-validates on the way in, and refuses anything it would have to
+    /// *change* to accept.
     ///
     /// A username arrives inside a transaction from an untrusted peer, so the
     /// rules are enforced at the decode boundary rather than trusted to have
     /// been applied by whoever built the message. Without this, a hand-rolled
     /// transaction could carry a Cyrillic name straight past every check in
     /// this module.
+    ///
+    /// [`Username::new`] lowercases, which is right for a name a person typed
+    /// and wrong for bytes off the wire: it would make `aMina` and `amina` two
+    /// encodings of one value, and the codec's rule is that there is exactly
+    /// one. So decoding rejects a name that is not already canonical rather
+    /// than normalising it — the caller that built the message should have.
     fn decode(r: &mut Reader<'_>) -> core::result::Result<Self, CodecError> {
-        Self::new(&String::decode(r)?).map_err(|e| CodecError::Invalid(e.to_string()))
+        let raw = String::decode(r)?;
+        let name = Self::new(&raw).map_err(|e| CodecError::Invalid(e.to_string()))?;
+        if name.as_str() != raw {
+            return Err(CodecError::Invalid(
+                "username is not in canonical form".to_owned(),
+            ));
+        }
+        Ok(name)
     }
 }
 
@@ -258,6 +272,31 @@ mod tests {
         let lower = Username::new("amina").expect("valid");
         assert_eq!(upper, lower);
         assert_eq!(upper.as_str(), "amina");
+    }
+
+    #[test]
+    fn a_non_canonical_name_on_the_wire_is_refused_rather_than_normalised() {
+        // Found by the adversarial harness, which flipped one bit of 'a' into
+        // 'A'. `Username::new` lowercases — correct for a name a person typed,
+        // wrong for bytes off the wire, because it makes `aMina` and `amina`
+        // two encodings of one value. The codec's rule is that there is exactly
+        // one, so decoding must refuse what it would otherwise have to change.
+        let canonical = Username::new("amina").expect("valid").to_bytes();
+        assert_eq!(
+            decode_exact::<Username>(&canonical)
+                .as_ref()
+                .map(Username::as_str),
+            Ok("amina")
+        );
+
+        // The same name with one letter capitalised is a different byte string
+        // that used to decode to the same value.
+        let mut mixed = canonical.clone();
+        mixed[5] = b'A';
+        assert!(
+            decode_exact::<Username>(&mixed).is_err(),
+            "a non-canonical username must not decode"
+        );
     }
 
     #[test]

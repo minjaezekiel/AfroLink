@@ -1,15 +1,34 @@
 //! A deterministic in-process network simulator.
 //!
 //! Runs a whole validator set in one thread with no sockets and no clock, so a
-//! consensus scenario is reproducible exactly. Crashed nodes, partitions and
-//! message loss are expressed as delivery rules rather than as timing, which
-//! means these tests cannot be flaky.
+//! consensus scenario is reproducible exactly. Crashes, partitions, message loss
+//! and reordering are expressed as **delivery rules** rather than as timing,
+//! which is what makes these tests reproducible instead of flaky: a scenario is
+//! a pure function of its seed.
 //!
-//! This is the harness Phase 2's Byzantine testing will build on.
+//! # What an adversary controls here
+//!
+//! Everything a real one would, short of breaking cryptography:
+//!
+//! * [`Network::crash`] — a node stops sending and receiving.
+//! * [`Network::partition`] — the set splits, and messages do not cross.
+//! * [`Network::drop_rate`] — a share of messages are lost.
+//! * [`Network::reorder`] — delivery order is shuffled, so no test can pass by
+//!   accident of FIFO.
+//!
+//! The scheduler is the adversary: it decides who hears what, and in what order.
+//!
+//! # The invariant all of this exists to attack
+//!
+//! **Agreement.** No two nodes may commit different blocks at the same height.
+//! Liveness can be destroyed by any of the rules above and that is expected —
+//! a partitioned network should stall. Agreement may not be, under any of them,
+//! and [`Network::committed`] records every commit so a campaign can check it.
 
 use afrolink_crypto::SecretKey;
+use afrolink_crypto::hash::Hash32;
 use afrolink_executor::Block;
-use afrolink_primitives::{ChainId, Timestamp};
+use afrolink_primitives::{ChainId, Height, Timestamp};
 use afrolink_state::MemoryStore;
 use std::collections::BTreeSet;
 
@@ -22,6 +41,15 @@ pub struct Network {
     pub nodes: Vec<Node>,
     /// Indices of nodes that are offline; they neither send nor receive.
     pub crashed: BTreeSet<usize>,
+    /// One side of a network partition. Messages do not cross the boundary.
+    side_a: BTreeSet<usize>,
+    partitioned: bool,
+    /// Share of messages dropped, in hundredths. 0 delivers everything.
+    drop_pct: u64,
+    shuffle: bool,
+    rng: u64,
+    /// Every `(height, block_id)` any node has committed, in order.
+    committed: Vec<(usize, Height, Hash32)>,
     queue: Vec<(usize, Event)>,
     time: Timestamp,
 }
@@ -51,6 +79,12 @@ impl Network {
         Self {
             nodes,
             crashed: BTreeSet::new(),
+            side_a: BTreeSet::new(),
+            partitioned: false,
+            drop_pct: 0,
+            shuffle: false,
+            rng: 0x2545_F491_4F6C_DD1D,
+            committed: Vec::new(),
             queue: Vec::new(),
             time: Timestamp::from_millis(1_700_000_000_000),
         }
@@ -59,6 +93,92 @@ impl Network {
     /// Take a node offline. It stops sending and receiving.
     pub fn crash(&mut self, index: usize) {
         self.crashed.insert(index);
+    }
+
+    /// Bring a crashed node back. It has missed everything sent while down.
+    pub fn restart(&mut self, index: usize) {
+        self.crashed.remove(&index);
+    }
+
+    /// Split the network. Messages between the two sides are not delivered.
+    ///
+    /// Unlike a crash, both sides keep running and keep believing they may make
+    /// progress — which is what makes a partition the harder case.
+    pub fn partition(&mut self, side_a: &[usize]) {
+        self.side_a = side_a.iter().copied().collect();
+        self.partitioned = true;
+    }
+
+    /// Heal a partition.
+    pub fn heal(&mut self) {
+        self.partitioned = false;
+        self.side_a.clear();
+    }
+
+    /// Drop this percentage of messages.
+    pub fn drop_rate(&mut self, percent: u64) {
+        self.drop_pct = percent.min(100);
+    }
+
+    /// Shuffle delivery order.
+    ///
+    /// Worth turning on by default in any campaign: a consensus test that only
+    /// ever sees FIFO delivery is testing a network nobody has.
+    pub fn reorder(&mut self, on: bool) {
+        self.shuffle = on;
+    }
+
+    /// Seed the scheduler, so a campaign reproduces exactly from its seed.
+    pub fn seed(&mut self, seed: u64) {
+        self.rng = seed | 1;
+    }
+
+    /// Every commit any node has made: `(node, height, block)`.
+    #[must_use]
+    pub fn committed(&self) -> &[(usize, Height, Hash32)] {
+        &self.committed
+    }
+
+    /// The agreement invariant: no two nodes committed different blocks at one
+    /// height.
+    ///
+    /// Returns the offending height if it was ever violated. This is the
+    /// property that must survive every delivery rule in this module — liveness
+    /// may not, and is not expected to.
+    #[must_use]
+    pub fn agreement_violation(&self) -> Option<Height> {
+        for (i, (_, height, block)) in self.committed.iter().enumerate() {
+            for (_, other_height, other_block) in self.committed.iter().skip(i.saturating_add(1)) {
+                if height == other_height && block != other_block {
+                    return Some(*height);
+                }
+            }
+        }
+        None
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        // xorshift64*: tiny, deterministic, and adequate for scheduling.
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Whether a message from `from` reaches `to` under the current rules.
+    fn reaches(&mut self, from: usize, to: usize) -> bool {
+        if !self.is_live(to) || !self.is_live(from) {
+            return false;
+        }
+        if self.partitioned && self.side_a.contains(&from) != self.side_a.contains(&to) {
+            return false;
+        }
+        if self.drop_pct > 0 && self.next_rand() % 100 < self.drop_pct {
+            return false;
+        }
+        true
     }
 
     /// Whether a node is running.
@@ -89,7 +209,7 @@ impl Network {
                 .get_mut(i)
                 .map(|n| n.start_round(time))
                 .unwrap_or_default();
-            self.dispatch(actions);
+            self.dispatch(i, actions);
         }
     }
 
@@ -103,7 +223,21 @@ impl Network {
             if self.queue.is_empty() {
                 break;
             }
-            let batch = core::mem::take(&mut self.queue);
+            let mut batch = core::mem::take(&mut self.queue);
+            if self.shuffle {
+                // Fisher-Yates against the seeded scheduler. Without this the
+                // suite only ever tests FIFO delivery, which no real network
+                // provides.
+                for i in (1..batch.len()).rev() {
+                    let span = u64::try_from(i).unwrap_or(0).saturating_add(1);
+                    let j = self
+                        .next_rand()
+                        .checked_rem(span)
+                        .and_then(|v| usize::try_from(v).ok())
+                        .unwrap_or(0);
+                    batch.swap(i, j);
+                }
+            }
             for (target, event) in batch {
                 if !self.is_live(target) {
                     continue;
@@ -115,10 +249,12 @@ impl Network {
                     .unwrap_or_default();
                 for action in &actions {
                     if let Action::Committed(block, _) = action {
+                        self.committed
+                            .push((target, block.header.height, block.header.id()));
                         commits.push((target, (**block).clone()));
                     }
                 }
-                self.dispatch(actions);
+                self.dispatch(target, actions);
             }
         }
         commits
@@ -134,28 +270,45 @@ impl Network {
         self.run(max_steps)
     }
 
-    /// Turn a node's actions into messages for every live node.
+    /// Turn a node's actions into messages, subject to the delivery rules.
     ///
     /// Broadcasts are delivered to the sender too, so proposing and receiving
-    /// follow exactly the same code path.
-    fn dispatch(&mut self, actions: Vec<Action>) {
+    /// follow exactly the same code path — and a sender is never partitioned
+    /// from itself, however hostile the schedule.
+    fn dispatch(&mut self, from: usize, actions: Vec<Action>) {
         for action in actions {
             match action {
                 Action::BroadcastProposal(p) => {
                     for i in 0..self.nodes.len() {
-                        if self.is_live(i) {
+                        if i == from || self.reaches(from, i) {
                             self.queue.push((i, Event::Proposal(p.clone())));
                         }
                     }
                 }
                 Action::BroadcastVote(v) => {
                     for i in 0..self.nodes.len() {
-                        if self.is_live(i) {
+                        if i == from || self.reaches(from, i) {
                             self.queue.push((i, Event::Vote(v.clone())));
                         }
                     }
                 }
                 Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => {}
+            }
+        }
+    }
+
+    /// Inject a message as if a hostile peer had sent it.
+    ///
+    /// This is how a Byzantine validator is expressed: rather than modelling a
+    /// dishonest [`Node`], a test signs whatever votes it likes with a real key
+    /// and hands them straight to specific targets. That is strictly stronger,
+    /// because it is not limited to misbehaviour the honest state machine is
+    /// capable of expressing — an equivocator can send one vote to half the
+    /// network and a conflicting one to the other half.
+    pub fn inject(&mut self, targets: &[usize], event: Event) {
+        for &t in targets {
+            if self.is_live(t) {
+                self.queue.push((t, event.clone()));
             }
         }
     }

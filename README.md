@@ -39,7 +39,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 1 in progress.** Fourteen crates, **407 tests passing**. A working chain:
+**Phase 1 in progress.** Fifteen crates, **442 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -60,7 +60,23 @@ crates/
   alias/        usernames, phone/email bindings, SIM-swap defence        50 tests ✅
   pay/          afri: payment URIs, payment references                   16 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
+  fuzz/         deterministic adversarial-input harness (a test tool)      24 tests ✅
 ```
+
+Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
+Every case is a pure function of a `u64` seed, so a failure names the seed that
+produced it and reproduces forever. Two suites:
+
+* **~112 000 hostile byte strings** across 28 decoders, asserting that anything
+  which decodes re-encodes to *exactly* the bytes it came from. Two encodings of
+  one value is a chain split.
+* **A hostile scheduler** — partitions, packet loss, reordering and injected
+  equivocation — attacking one invariant: no two nodes commit different blocks at
+  the same height. `AFROLINK_CAMPAIGN=25 cargo test --release` runs ~1 300
+  independent schedules.
+
+It found five real defects on its first run. See
+[08-adversarial-testing.md](docs/08-adversarial-testing.md).
 
 A node can now answer a wallet's question from disk with a proof, and every way
 of lying about the answer is a named test. Next: an HTTP/gRPC transport around
@@ -113,6 +129,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [05 — Roadmap](docs/05-roadmap.md) | Phased plan, exit criteria, and the risks that actually matter. |
 | [06 — Adopted practices](docs/06-adopted-practices.md) | What each system we studied contributed, and where it lives in the code. |
 | [07 — Resolver service](docs/07-resolver-service.md) | How a phone number becomes a lookup, and the wallet screen that stops mistakes. |
+| [08 — Adversarial testing](docs/08-adversarial-testing.md) | The harness, the five defects it found, and what it does *not* prove. |
 | [ADR-0001](docs/adr/0001-sovereign-rust-l1.md) | Why a sovereign Rust L1, and why the alternatives were declined. |
 | [ADR-0002](docs/adr/0002-consensus.md) | Ubuntu-BFT: why boring consensus. |
 | [ADR-0003](docs/adr/0003-contract-vm.md) | CosmWasm (ink! went unmaintained in Jan 2026). |

@@ -226,7 +226,7 @@ mod tests {
         let log = log_with(20);
         let proof = log.prove_inclusion(7).expect("in range");
         let e = log.entry(7).expect("in range");
-        assert!(proof.verify(log.root(), e.leaf()).is_ok());
+        assert!(proof.verify(log.root(), e.leaf(), 7, 20).is_ok());
     }
 
     #[test]
@@ -264,7 +264,7 @@ mod tests {
 
         let later = log_with(400);
         let proof = later.prove_consistency(9).expect("in range");
-        assert!(proof.verify(remembered_root, later.root()).is_ok());
+        assert!(proof.verify(remembered_root, later.root(), 9, 400).is_ok());
     }
 
     #[test]
@@ -278,14 +278,14 @@ mod tests {
 
         let proof = forged.prove_consistency(9).expect("in range");
         assert!(
-            proof.verify(remembered_root, forged.root()).is_err(),
+            proof.verify(remembered_root, forged.root(), 9, 50).is_err(),
             "a rewritten log must fail against a root the wallet already holds"
         );
         assert!(
             honest
                 .prove_consistency(9)
                 .expect("in range")
-                .verify(remembered_root, honest.root())
+                .verify(remembered_root, honest.root(), 9, 50)
                 .is_ok()
         );
     }

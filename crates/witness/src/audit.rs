@@ -145,6 +145,10 @@ impl WitnessSet {
         // The proof must be against the tree the head committed to, at the
         // index claimed. Without both, a witness could prove membership in some
         // other tree of its own choosing.
+        // Checked here as well as inside `verify`, so the failure is reported as
+        // a size mismatch rather than as a generic bad proof. The check in the
+        // primitive is the backstop for callers that forget; this one is for
+        // whoever has to read the error.
         let total = u64::try_from(proof.total).unwrap_or(u64::MAX);
         let at = u64::try_from(proof.index).unwrap_or(u64::MAX);
         if total != sth.head.size || at != index {
@@ -153,8 +157,12 @@ impl WitnessSet {
                 expected: sth.head.size,
             });
         }
+        let at_index = usize::try_from(index).map_err(|_| WitnessError::IndexOutOfRange)?;
+        let at_total = usize::try_from(sth.head.size).map_err(|_| WitnessError::IndexOutOfRange)?;
+        // Position and tree size are passed explicitly: a proof's own `index`
+        // and `total` are prover-chosen and prove nothing on their own.
         proof
-            .verify(sth.head.root, entry.leaf())
+            .verify(sth.head.root, entry.leaf(), at_index, at_total)
             .map_err(|_| WitnessError::BadInclusionProof)?;
 
         Ok(Observation {
@@ -202,16 +210,18 @@ impl WitnessSet {
                 expected: remembered.size,
             });
         }
-        let old = u64::try_from(proof.old_size).unwrap_or(u64::MAX);
-        let new = u64::try_from(proof.new_size).unwrap_or(u64::MAX);
-        if old != remembered.size || new != sth.head.size {
+        let declared_old = u64::try_from(proof.old_size).unwrap_or(u64::MAX);
+        let declared_new = u64::try_from(proof.new_size).unwrap_or(u64::MAX);
+        if declared_old != remembered.size || declared_new != sth.head.size {
             return Err(WitnessError::SizeMismatch {
-                got: old,
+                got: declared_old,
                 expected: remembered.size,
             });
         }
+        let old = usize::try_from(remembered.size).map_err(|_| WitnessError::IndexOutOfRange)?;
+        let new = usize::try_from(sth.head.size).map_err(|_| WitnessError::IndexOutOfRange)?;
         proof
-            .verify(remembered.root, sth.head.root)
+            .verify(remembered.root, sth.head.root, old, new)
             .map_err(|_| WitnessError::BadConsistencyProof)
     }
 }

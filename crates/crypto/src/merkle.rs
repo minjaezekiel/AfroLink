@@ -257,11 +257,33 @@ impl MerkleProof {
         Ok(acc)
     }
 
-    /// Check that `leaf` is committed at [`Self::index`] under `root`.
+    /// Check that `leaf` is the leaf at `index` of a tree of exactly `total`
+    /// leaves whose root is `root`.
+    ///
+    /// # Why `index` and `total` are parameters, not just fields
+    ///
+    /// The sibling list does **not** determine the tree's size. A proof for
+    /// `(index 17, total 64)` replays the same left/right walk as
+    /// `(index 17, total 33)`, so the same siblings recompute the same root for
+    /// both — found by the adversarial harness, not by inspection.
+    ///
+    /// That is not a forgery: the leaf really is committed either way. But it
+    /// means the proof's own `index` and `total` are **attacker-chosen**, so a
+    /// caller that reads them off the proof learns nothing. RFC 6962 avoids this
+    /// by treating the leaf index and tree size as things the verifier already
+    /// knows — from a signed tree head, or from having asked for that index —
+    /// and this signature enforces that rather than trusting each call site to
+    /// remember.
     ///
     /// # Errors
-    /// Returns [`CryptoError::InvalidProof`] if the recomputed root differs.
-    pub fn verify(&self, root: Hash32, leaf: Hash32) -> Result<()> {
+    /// [`CryptoError::InvalidProof`] if the proof describes a different position
+    /// or tree size than the caller expected, or if the root does not match.
+    pub fn verify(&self, root: Hash32, leaf: Hash32, index: usize, total: usize) -> Result<()> {
+        if self.index != index || self.total != total {
+            return Err(CryptoError::InvalidProof(
+                "proof is for a different position or tree size",
+            ));
+        }
         if self.compute_root(leaf)? == root {
             Ok(())
         } else {
@@ -271,17 +293,36 @@ impl MerkleProof {
 }
 
 impl ConsistencyProof {
-    /// Check that `old_root` is a prefix of `new_root`.
+    /// Check that the tree of `old_size` leaves with `old_root` is a prefix of
+    /// the tree of `new_size` leaves with `new_root`.
     ///
     /// Both roots are supplied by the caller and both are *recomputed* from the
     /// proof. Reproducing only one would let a log rewrite history and hand over
     /// a matching root for the version it wanted believed.
     ///
+    /// The sizes are parameters for the same reason they are on
+    /// [`MerkleProof::verify`]: the node list does not determine them. A proof
+    /// spanning `9 → 40` replays identically at `9 → 39`, so a caller reading
+    /// `new_size` off the proof would be reading a number the prover chose. A
+    /// verifier learns the real sizes from a signed tree head and from what it
+    /// remembered last session.
+    ///
     /// # Errors
-    /// Returns [`CryptoError::InvalidProof`] if the sizes are inconsistent, the
-    /// node count does not match the tree shape, or either root fails to
-    /// reproduce.
-    pub fn verify(&self, old_root: Hash32, new_root: Hash32) -> Result<()> {
+    /// [`CryptoError::InvalidProof`] if the proof spans different sizes than the
+    /// caller expected, the node count does not match the tree shape, or either
+    /// root fails to reproduce.
+    pub fn verify(
+        &self,
+        old_root: Hash32,
+        new_root: Hash32,
+        old_size: usize,
+        new_size: usize,
+    ) -> Result<()> {
+        if self.old_size != old_size || self.new_size != new_size {
+            return Err(CryptoError::InvalidProof(
+                "proof spans a different pair of tree sizes",
+            ));
+        }
         if self.old_size > self.new_size {
             return Err(CryptoError::InvalidProof("old size exceeds new size"));
         }
@@ -392,7 +433,7 @@ mod tests {
             for i in 0..n {
                 let proof = t.prove(i).expect("index in range");
                 let leaf = leaf_hash(format!("tx-{i}").as_bytes());
-                assert!(proof.verify(root, leaf).is_ok(), "n={n} i={i}");
+                assert!(proof.verify(root, leaf, i, n).is_ok(), "n={n} i={i}");
             }
         }
     }
@@ -401,7 +442,7 @@ mod tests {
     fn a_wrong_leaf_does_not_verify() {
         let t = tree(8);
         let proof = t.prove(3).expect("index in range");
-        assert!(proof.verify(t.root(), leaf_hash(b"tx-9")).is_err());
+        assert!(proof.verify(t.root(), leaf_hash(b"tx-9"), 3, 8).is_err());
     }
 
     #[test]
@@ -431,7 +472,7 @@ mod tests {
         let t = tree(8);
         let mut proof = t.prove(0).expect("index in range");
         proof.siblings.pop();
-        assert!(proof.verify(t.root(), leaf_hash(b"tx-0")).is_err());
+        assert!(proof.verify(t.root(), leaf_hash(b"tx-0"), 0, 8).is_err());
     }
 
     #[test]
@@ -455,7 +496,9 @@ mod tests {
                 let old = tree(old_size);
                 let proof = new.prove_consistency(old_size).expect("size in range");
                 assert!(
-                    proof.verify(old.root(), new.root()).is_ok(),
+                    proof
+                        .verify(old.root(), new.root(), old_size, new_size)
+                        .is_ok(),
                     "old={old_size} new={new_size}"
                 );
             }
@@ -477,7 +520,7 @@ mod tests {
 
         let proof = rewritten.prove_consistency(6).expect("size in range");
         assert!(
-            proof.verify(old_root, rewritten.root()).is_err(),
+            proof.verify(old_root, rewritten.root(), 6, 16).is_err(),
             "a rewritten prefix must be unprovable"
         );
         // And the honest log still verifies, so the test is not passing by
@@ -486,7 +529,7 @@ mod tests {
             honest
                 .prove_consistency(6)
                 .expect("size in range")
-                .verify(old_root, honest.root())
+                .verify(old_root, honest.root(), 6, 16)
                 .is_ok()
         );
     }
@@ -500,7 +543,7 @@ mod tests {
         // Nor can it claim the old size was smaller than it was and pass off
         // the resulting proof as covering the client's actual position.
         let proof = truncated.prove_consistency(4).expect("size in range");
-        assert!(proof.verify(old_root, truncated.root()).is_err());
+        assert!(proof.verify(old_root, truncated.root(), 4, 7).is_err());
     }
 
     #[test]
@@ -511,7 +554,7 @@ mod tests {
         let mut proof = t.prove_consistency(8).expect("size in range");
         assert!(proof.nodes.is_empty());
         proof.nodes.push(Hash32::from_bytes([9u8; 32]));
-        assert!(proof.verify(t.root(), t.root()).is_err());
+        assert!(proof.verify(t.root(), t.root(), 8, 8).is_err());
     }
 
     #[test]
@@ -519,23 +562,23 @@ mod tests {
         let new = tree(13);
         let old = tree(5);
         let good = new.prove_consistency(5).expect("size in range");
-        assert!(good.verify(old.root(), new.root()).is_ok());
+        assert!(good.verify(old.root(), new.root(), 5, 13).is_ok());
 
         let mut extra = good.clone();
         extra.nodes.push(Hash32::from_bytes([1u8; 32]));
-        assert!(extra.verify(old.root(), new.root()).is_err());
+        assert!(extra.verify(old.root(), new.root(), 5, 13).is_err());
 
         let mut short = good;
         short.nodes.pop();
-        assert!(short.verify(old.root(), new.root()).is_err());
+        assert!(short.verify(old.root(), new.root(), 5, 13).is_err());
     }
 
     #[test]
     fn an_empty_log_is_a_prefix_of_every_log() {
         let new = tree(9);
         let proof = new.prove_consistency(0).expect("size in range");
-        assert!(proof.verify(empty_root(), new.root()).is_ok());
+        assert!(proof.verify(empty_root(), new.root(), 0, 9).is_ok());
         // But only against the real empty root.
-        assert!(proof.verify(Hash32::ZERO, new.root()).is_err());
+        assert!(proof.verify(Hash32::ZERO, new.root(), 0, 9).is_err());
     }
 }

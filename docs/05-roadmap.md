@@ -57,8 +57,11 @@ deterministic simulator in `crates/node/src/sim.rs`.
 ## Phase 2 — Multi-node testnet
 
 - [ ] libp2p networking, gossip, peer scoring
-- [~] Byzantine testing — equivocation and crash-fault cases covered by the
-      in-process simulator; partition and clock skew still to do
+- [x] Byzantine testing — partitions, packet loss, message reordering and
+      injected equivocation, all against the agreement invariant *([08](08-adversarial-testing.md))*
+- [ ] Model checking the round state machine (TLA+ / Stateright). The randomised
+      scheduler explores, it does not enumerate — a rare interleaving can sit
+      outside every seed tried
 - [ ] Staking and validator set changes — the headers already commit to set
       transitions, so light clients follow them safely once this lands *(ADR-0010)*
 - [ ] Slashing for double-sign and downtime, and enforcing the 21-day unbonding

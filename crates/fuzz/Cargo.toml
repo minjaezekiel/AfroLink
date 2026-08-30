@@ -1,0 +1,28 @@
+[package]
+name = "afrolink-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Deterministic adversarial-input harness. A test tool: nothing in the node depends on it."
+
+[dependencies]
+afrolink-primitives.workspace = true
+
+[dev-dependencies]
+afrolink-crypto.workspace = true
+afrolink-state.workspace = true
+afrolink-types.workspace = true
+afrolink-bank.workspace = true
+afrolink-executor.workspace = true
+afrolink-consensus.workspace = true
+afrolink-light.workspace = true
+afrolink-alias.workspace = true
+afrolink-pay.workspace = true
+afrolink-witness.workspace = true
+
+[lints]
+workspace = true
