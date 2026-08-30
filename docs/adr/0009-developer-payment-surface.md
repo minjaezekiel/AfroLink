@@ -178,7 +178,7 @@ security argument.
 |---|---|---|
 | 1 | `afri:` payment request URIs | `crates/pay/src/request.rs` — **built** |
 | 2 | Payment references on transfers | `crates/types`, `crates/pay` — **built** |
-| 3 | x402 facilitator, not a competing standard | Phase 2, after RPC transport |
+| 3 | x402 facilitator, not a competing standard | Phase 2; the RPC transport it waited on landed in [ADR-0013](0013-http-transport.md) |
 | 4 | No ERC-20 / ERC-4337 equivalent — native assets and fee abstraction already cover it | already built |
 | 5 | Forkless WASM runtime upgrades, activated by XRPL-style amendment voting | Phase 3 |
 | 6 | Cross-currency payments with pathfinding, AFRI as bridge asset | Phase 4 |

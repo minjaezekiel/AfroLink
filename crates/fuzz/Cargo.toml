@@ -24,6 +24,9 @@ afrolink-alias.workspace = true
 afrolink-pay.workspace = true
 afrolink-witness.workspace = true
 afrolink-staking.workspace = true
+# The HTTP parser is the first thing an anonymous peer reaches, before any
+# signature or proof check. That makes it fuzz-suite territory.
+afrolink-http.workspace = true
 
 [lints]
 workspace = true

@@ -40,10 +40,19 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Sixteen crates, **482 tests passing**. A working chain:
-four validators propose, vote and commit blocks; a light client verifies a
-payment holding nothing but a 32-byte header; the chain survives a restart; and
-a node answers queries with proofs. Still in-process — no sockets yet.
+**Phase 2 in progress.** Seventeen crates, **553 tests passing**. A working
+chain: four validators propose, vote and commit blocks; a light client verifies
+a payment holding nothing but a 32-byte header; the chain survives a restart;
+and a node **serves proofs over HTTP** to a wallet that trusts nothing about it.
+
+```bash
+curl 'localhost:8080/v1/accounts/afri1…/balance?denom=sov/ke/kes&format=json'
+```
+
+Nodes still cannot talk to *each other* — that is the peer-to-peer layer, and it
+is next. A one-node chain is not decentralised, and
+[ADR-0013](docs/adr/0013-http-transport.md) says why the client surface was
+built first anyway.
 
 ```
 crates/
@@ -52,22 +61,23 @@ crates/
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
   types/        accounts, group accounts, transactions, fee abstraction 33 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, blocks, genesis                         26 tests ✅
-  consensus/    validator sets, votes, rounds, decentralisation report   58 tests ✅
-  node/         consensus driver, proposals, deterministic simulator     10 tests ✅
+  executor/     block execution, blocks, genesis                         30 tests ✅
+  consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
+  node/         consensus driver, proposals, deterministic simulator     19 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
   store/        durable storage, and the view that serves queries       26 tests ✅
   rpc/          proof-carrying query protocol (no networking)           14 tests ✅
-  alias/        usernames, phone/email bindings, SIM-swap defence        50 tests ✅
-  pay/          afri: payment URIs, payment references                   16 tests ✅
+  alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
+  pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         deterministic adversarial-input harness (a test tool)      24 tests ✅
+  fuzz/         deterministic adversarial-input harness (a test tool)      31 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
+  http/         strict HTTP/1.1 transport around the query protocol         65 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
 Every case is a pure function of a `u64` seed, so a failure names the seed that
-produced it and reproduces forever. Two suites:
+produced it and reproduces forever. Three suites:
 
 * **~140 000 hostile byte strings** across 35 decoders, asserting that anything
   which decodes re-encodes to *exactly* the bytes it came from. Two encodings of
@@ -76,14 +86,20 @@ produced it and reproduces forever. Two suites:
   equivocation — attacking one invariant: no two nodes commit different blocks at
   the same height. `AFROLINK_CAMPAIGN=25 cargo test --release` runs ~1 300
   independent schedules.
+* **~110 000 malformed HTTP requests** against the transport, which is now the
+  first thing an anonymous peer reaches — asserting it never panics, never reads
+  one request two ways, and never lets what *follows* a request change where
+  that request ended. The last one is the property request smuggling violates.
 
-It found five real defects on its first run. See
+It found five real defects on its first run, and the same root cause has since
+turned up at a sixth place — every one of them a value that was not uniquely
+determined, made safe by a convention enforced somewhere else. See
 [08-adversarial-testing.md](docs/08-adversarial-testing.md).
 
-A node can now answer a wallet's question from disk with a proof, and every way
-of lying about the answer is a named test. Next: an HTTP/gRPC transport around
-the protocol, then libp2p to replace the in-process simulator with a real
-network.
+A wallet can now ask a node a question over a socket and catch it lying — every
+way of lying about the answer is a named test. Next: a mempool and transaction
+submission, so a wallet can *move* money as well as check it, then a
+peer-to-peer layer to replace the in-process simulator with a real network.
 See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
 
 ```bash

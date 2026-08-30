@@ -22,7 +22,8 @@ Derived from the requirements table in [00-research.md](00-research.md#7-design-
 ├──────────────────────────────────────────────────────────────────┤
 │  CONSENSUS       Ubuntu-BFT — Tendermint-class, PoS, ~1s final   │
 ├──────────────────────────────────────────────────────────────────┤
-│  NETWORK         libp2p gossip  ·  IBC  ·  PAPSS settlement leg  │
+│  NETWORK         client RPC (HTTP) ✅  ·  validator P2P  ·  IBC   │
+│                  PAPSS settlement leg                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -180,22 +181,23 @@ assumes the node's peers are hostile and its RPC provider is lying.
 
 ## 8. What is built today
 
-| Component | Status |
-|---|---|
-| Canonical codec | **done**, 21 tests |
-| Hashing, keys, addresses, bech32m, Merkle | **done**, 32 tests |
-| Sparse Merkle state + proofs | **done**, 18 tests |
-| Accounts, group accounts, transactions | **done**, 33 tests |
-| Bank: balances, supply invariant, issuance | **done**, 18 tests |
-| Deterministic block executor, blocks | **done**, 22 tests |
-| Genesis, with distribution limits enforced | **done** |
-| Ubuntu-BFT: validators, votes, round machine | **done**, 40 tests |
-| Consensus driver + deterministic simulator | **done**, 10 tests |
-| Commit certificates | **done**, 10 tests |
-| Light client (header + state proof verification) | **done**, 12 tests |
-| Durable storage: blocks, commits, content-addressed state | **done**, 17 tests |
-| RPC, CLI | next |
-| libp2p networking | not started |
-| CosmWasm integration | not started |
+This section used to restate the roadmap with its own test counts, and drifted
+out of date the moment either changed. It no longer does: the per-crate tally
+lives in [README](../README.md) and the sequencing in
+[05-roadmap.md](05-roadmap.md), each in exactly one place.
 
-241 tests passing. See [05-roadmap.md](05-roadmap.md) for sequencing.
+What is worth saying here, because it is architectural rather than a status:
+
+**Everything above the network line exists and is tested.** Codec, hashing,
+addresses, state and its proofs, transactions, the bank, the executor,
+Ubuntu-BFT, the light client, durable storage, staking and slashing, aliases,
+witness logs, and the query protocol.
+
+**The network line is half-drawn.** A client can reach a node over HTTP
+([ADR-0013](adr/0013-http-transport.md)); nodes cannot reach each other. The
+consequence is not a missing feature but a missing property: a one-node chain is
+not decentralised, whatever the consensus code can do. Multi-node behaviour is
+exercised by the deterministic simulator rather than by a network.
+
+**Nothing above the protocol-module line exists.** No contract VM, no
+governance, no bridges.

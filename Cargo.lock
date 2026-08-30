@@ -68,6 +68,7 @@ dependencies = [
  "afrolink-consensus",
  "afrolink-crypto",
  "afrolink-executor",
+ "afrolink-http",
  "afrolink-light",
  "afrolink-pay",
  "afrolink-primitives",
@@ -75,6 +76,24 @@ dependencies = [
  "afrolink-state",
  "afrolink-types",
  "afrolink-witness",
+]
+
+[[package]]
+name = "afrolink-http"
+version = "0.1.0"
+dependencies = [
+ "afrolink-alias",
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-executor",
+ "afrolink-light",
+ "afrolink-primitives",
+ "afrolink-rpc",
+ "afrolink-state",
+ "afrolink-store",
+ "hex",
+ "thiserror",
 ]
 
 [[package]]

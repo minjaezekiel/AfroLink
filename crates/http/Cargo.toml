@@ -1,0 +1,30 @@
+[package]
+name = "afrolink-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP/1.1 transport for the query protocol. A shell around crates/rpc that moves bytes and enforces limits, and can neither weaken a proof nor answer without one."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+afrolink-state.workspace = true
+afrolink-alias.workspace = true
+afrolink-rpc.workspace = true
+# Only for the JSON view: rendering a header and a commit needs their fields.
+# The binary path touches neither, and nothing here interprets consensus.
+afrolink-consensus.workspace = true
+afrolink-executor.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+afrolink-bank.workspace = true
+afrolink-store.workspace = true
+afrolink-light.workspace = true
+
+[lints]
+workspace = true

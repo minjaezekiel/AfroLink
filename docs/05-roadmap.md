@@ -46,17 +46,28 @@ the transaction path is not.)*
       *(`crates/rpc`, 14 tests)*
 - [x] Served from durable storage end to end *(`ChainStore` → `ServedChain` →
       light client, 5 tests)*
-- [ ] HTTP/gRPC transport around the protocol *(the part that needs an async
-      runtime and its own security review)*
+- [x] **HTTP transport around the protocol** — strict, hand-written, blocking,
+      no async runtime and no new dependency. Integrity stays in the proof, so
+      the transport is allowed to be untrusted *([ADR-0013](adr/0013-http-transport.md),
+      `crates/http` 65 tests, plus ~110 000 malformed requests in the fuzz suite)*
+- [ ] **Mempool and transaction submission** — the wallet can check its money
+      and cannot yet move it. Needs `Event::Transaction` and a queue the
+      proposer draws from; node work rather than transport work, and the next
+      item on this list
 - [ ] Emit the decentralisation report at startup and over RPC
 
 **Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and
 commit, agreeing on both the block and the resulting state root, verified by the
-deterministic simulator in `crates/node/src/sim.rs`.
+deterministic simulator in `crates/node/src/sim.rs`; and a wallet verifies a
+balance fetched over a real socket from a node it does not trust.
 
 ## Phase 2 — Multi-node testnet
 
-- [ ] libp2p networking, gossip, peer scoring
+- [ ] **Validator-to-validator networking** — a separate layer from the client
+      RPC above, as it is in CometBFT: a known, bounded, keyed validator set on
+      one side and anonymous strangers on the other are different threat models.
+      Authenticated handshake (an audited Noise implementation, never a
+      hand-rolled one), gossip, peer scoring
 - [x] Byzantine testing — partitions, packet loss, message reordering and
       injected equivocation, all against the agreement invariant *([08](08-adversarial-testing.md))*
 - [ ] Model checking the round state machine (TLA+ / Stateright). The randomised
@@ -78,8 +89,8 @@ deterministic simulator in `crates/node/src/sim.rs`.
 - [ ] Bisection helper for skipping sync — the protocol supports it; the retry
       loop that halves the gap on `InsufficientOverlap` is not written
 - [ ] **Witness log transport** — `crates/witness` is transport-free by design;
-      fetching signed tree heads and proofs rides on the same layer as the RPC
-      protocol *(ADR-0011)*
+      fetching signed tree heads and proofs is now a matter of adding routes to
+      `crates/http` *(ADR-0011)*
 - [ ] **Bitcoin anchoring of witness roots** — layer 2 of ADR-0011, and the only
       mechanism that removes the social assumption outright rather than
       narrowing it. Deliberately deferred: an anchor needs history worth forging
@@ -92,7 +103,7 @@ deterministic simulator in `crates/node/src/sim.rs`.
       minimum balance to exist excludes the users this chain is for
 - [ ] **x402 facilitator** — verify an `afri:` payment against an HTTP 402
       challenge, so any online service can charge in AFRI or a stablecoin
-      *(ADR-0009; needs the RPC transport first)*
+      *(ADR-0009; the RPC transport it was waiting on now exists)*
 - [ ] Explorer, faucet, monitoring
 
 **Exit criterion:** 20 geographically distributed validators; the chain survives

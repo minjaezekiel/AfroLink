@@ -225,7 +225,9 @@ Bitcoin's fee market simultaneously.
 
 **Deliberately not done.** No networking: a witness log is a data structure and a
 set of proofs, and how heads are fetched is the transport layer's problem, as it
-is for `crates/rpc`. No on-chain registration of witnesses — the bootstrap list
+is for `crates/rpc`. That layer now exists —
+[ADR-0013](0013-http-transport.md) — so serving heads and consistency proofs is
+a matter of adding routes rather than of designing anything. No on-chain registration of witnesses — the bootstrap list
 ships in the wallet binary, auditable by anyone who reads it, and putting it on
 chain would make the chain's own state load-bearing for bootstrapping the chain.
 The witness log is rebuilt per proof rather than kept incrementally; correct, and

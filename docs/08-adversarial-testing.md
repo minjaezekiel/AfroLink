@@ -1,18 +1,18 @@
-# 08 — Adversarial testing: what it is, and the five defects it found
+# 08 — Adversarial testing: what it is, and the defects it found
 
 ## What this is not
 
-It is not a load test. There are no sockets yet, so hammering the in-process
-simulator would measure the executor rather than the system, and any throughput
-number it produced would be marketing.
+It is not a load test. There are sockets now
+([ADR-0013](adr/0013-http-transport.md)), so hammering one is finally possible —
+and a throughput number from one process on one laptop would still be marketing.
 
-It also would not be a *security* test if there were. Throughput tells you
-nothing about whether a node can be **lied to**, and every security claim this
-project makes is about exactly that.
+It also would not be a *security* test. Throughput tells you nothing about
+whether a node can be **lied to**, and every security claim this project makes
+is about exactly that.
 
 ## What it is
 
-Two suites, both ordinary `cargo test`, both deterministic.
+Three suites, all ordinary `cargo test`, all deterministic.
 
 **Determinism is the design constraint.** Every case is a pure function of a
 `u64` seed, so a failing assertion names the seed that produced it and re-running
@@ -20,7 +20,7 @@ that seed reproduces it on any machine, forever. No corpus directory to lose, no
 "retry until it passes". That is also why the harness is hand-rolled rather than
 a `proptest` or `cargo-fuzz` dependency — the same reason the codec is not serde.
 
-### 1. `crates/fuzz` — bytes from a hostile peer
+### 1. `crates/fuzz/tests/codec.rs` — bytes from a hostile peer
 
 ~140 000 inputs across 35 decoders, plus ~45 000 forged proofs. Three properties:
 
@@ -38,7 +38,30 @@ poorly suited to.
 Panics need no assertion. A panic in a decoder *is* the failure, which is why the
 workspace denies `unwrap`/`expect`/`panic` outside tests.
 
-### 2. `crates/node/tests/adversarial.rs` — a hostile scheduler
+### 2. `crates/fuzz/tests/http.rs` — malformed requests
+
+Added with [ADR-0013](adr/0013-http-transport.md), because the HTTP parser is now
+the **first thing an anonymous peer reaches** — it runs before any signature,
+proof or quorum check, and a panic in it is a remote denial of service on a
+validator, reachable without a key.
+
+~110 000 inputs: mutated real requests, spliced pairs, and uniform noise. Three
+properties, the first two carried over from the codec suite:
+
+| Property | What it prevents |
+|---|---|
+| **Totality** — arbitrary bytes produce a request or an error | A crash reachable by anyone who can open a socket |
+| **Unique reading** — a parsed request, re-rendered and re-parsed, means the same thing | Two components disagreeing about what a request said |
+| **The boundary ignores what follows** — appending bytes changes neither the request nor where it ended | **Request smuggling.** This is the one that matters, and it is asserted separately because a canonicalising renderer can hide a first-wins mistake from a round trip and cannot hide a moved boundary |
+
+The parser is written to refuse rather than interpret — bare `LF`, folded
+headers, any `Transfer-Encoding`, repeated `Content-Length`, absolute-form
+targets. That is the codec's rule, *one reading per byte string*, applied to a
+much older and much messier format. `crates/http/tests/serving.rs` then checks
+the refusals survive contact with a real socket, a thread pool and a keep-alive
+connection, which is where a parser's guarantees usually leak.
+
+### 3. `crates/node/tests/adversarial.rs` — a hostile scheduler
 
 The scheduler is the adversary: it decides who hears what, and in what order.
 [`sim.rs`](../crates/node/src/sim.rs) gained partitions, packet loss, reordering
@@ -63,11 +86,14 @@ cargo test                                    # ~56s, default depth
 AFROLINK_CAMPAIGN=25 cargo test --release     # ~1 300 schedules, ~9s
 ```
 
-## The five defects
+## The defects
 
-All five were found on the first run, and all five share one root cause:
-**a value that is not uniquely determined**, made safe by a convention enforced
-somewhere else.
+Four the fuzzer found on its first run; two more turned up elsewhere and are
+recorded alongside them because **all six share one root cause**: a value that
+is not uniquely determined, made safe by a convention enforced somewhere else.
+
+That is the finding worth carrying forward — not any individual bug, but that
+the same shape keeps reappearing wherever untrusted input becomes a value.
 
 ### 1 & 2. Decoders that normalised instead of rejecting
 
@@ -118,7 +144,27 @@ trust the proof's own fields.
 **Fixed:** both `verify` methods now take the expected position and sizes as
 parameters, so no caller has to remember.
 
-### 5. Header time was bounded in one direction only
+### 5. The same defect again, at a new boundary
+
+Not a sixth defect so much as the first one turning up somewhere else, which is
+the more useful observation.
+
+`Username::new` lower-cases, which is right for a caller assembling a value and
+wrong at a decode boundary — exactly the finding above. When
+[ADR-0013](adr/0013-http-transport.md) added URLs, `/v1/names/AMINA` and
+`/v1/names/amina` became two spellings of one lookup: two cache entries, two log
+lines, and a wallet that could display `@AMINA` for a record reading `amina` — on
+the screen whose entire job is letting a user recognise who they are paying.
+
+**Fixed** the same way, in
+[`route.rs`](../crates/http/src/route.rs): the edge refuses any spelling the
+constructor would have to change.
+
+The lesson is that "normalise for constructors, refuse at boundaries" is not a
+property of the decoder. It is a property of *every* place untrusted input
+becomes a value, and each new boundary has to be checked against it.
+
+### 6. Header time was bounded in one direction only
 
 Found earlier, during [ADR-0011](adr/0011-objective-anchors.md), and recorded
 here because it is the same class. Monotonicity stopped an attacker *rewinding*
@@ -135,8 +181,14 @@ failed to falsify others; that is all a test can do.
 
 Named gaps, so they are not mistaken for coverage:
 
-- **No network.** Everything is in-process. Eclipse attacks, peer scoring,
-  resource exhaustion and DoS are untestable until libp2p lands.
+- ~~No network~~ — **partly closed.** The client transport exists and is
+  fuzzed; its limits (connection cap, slowloris timeout, body and header
+  bounds) are asserted over real sockets. What remains untestable is the
+  **peer** layer: eclipse attacks, peer scoring and gossip amplification need
+  validators that can talk to each other, which they still cannot.
+- **No load test, and still no throughput number.** The transport can now be
+  hammered, which makes it tempting. A number from one process on one machine
+  would measure this laptop.
 - ~~No staking or slashing~~ — **closed** by
   [ADR-0012](adr/0012-staking-and-slashing.md). Unbonding now locks real money,
   equivocation is slashed, and the staking types are in the fuzz suite. What is
@@ -152,7 +204,8 @@ Named gaps, so they are not mistaken for coverage:
 
 ## Where this goes
 
-Phase 2 adds libp2p, and with it the first testable network-level attacks. The
-harness is deliberately transport-free so it survives that transition: the
-delivery rules in `sim.rs` are the same abstraction a real network needs
-faults injected through.
+Phase 2 adds the validator-to-validator layer, and with it the network-level
+attacks that need peers rather than clients: eclipse, peer scoring, gossip
+amplification. The harness is deliberately transport-free so it survives that
+transition — the delivery rules in `sim.rs` are the same abstraction a real
+network needs faults injected through.
