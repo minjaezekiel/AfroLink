@@ -51,11 +51,13 @@
     )
 )]
 
+pub mod history;
 pub mod query;
 pub mod server;
 
+pub use history::{HistoryCursor, HistoryError};
 pub use query::{
-    History, HistoryEntry, MAX_HISTORY, ProvedTransaction, ProvedValue, Query, QueryError,
-    Response, SignedHeader, Status,
+    History, HistoryEntry, MAX_HISTORY, ProvedEffects, ProvedTransaction, ProvedValue, Query,
+    QueryError, Response, SignedHeader, Status,
 };
 pub use server::{ChainView, ReadOnly, Submit, SubmitError, answer};

@@ -43,11 +43,13 @@ use afrolink_alias::{BindError, Bindings, Registry, RegistryError};
 use afrolink_bank::{Bank, BankError};
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::{Domain, Hash32};
+use afrolink_crypto::merkle::MerkleTree;
+use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 use afrolink_primitives::{Amount, ChainId, Height, Timestamp};
 use afrolink_staking::{Staking, StakingError};
 use afrolink_state::{KeyValueStore, StateError, StoreKey};
 use afrolink_types::group::GroupError;
-use afrolink_types::{Account, GroupAccount, Message, Transaction, TxError};
+use afrolink_types::{Account, GroupAccount, Message, Transaction, TxError, TxPointer};
 use thiserror::Error;
 
 /// Name of the module account that collects fees before distribution.
@@ -105,15 +107,191 @@ pub enum ExecError {
     State(#[from] StateError),
 }
 
-/// The outcome of one transaction.
+/// Which subsystem refused a transaction, as a consensus-stable number.
+///
+/// **Deliberately coarse.** It names the component that said no, not the
+/// detail — so adding a variant to [`BankError`] or [`StakingError`] is an
+/// ordinary change rather than a consensus change. XRPL takes the same shape
+/// with its `tec`/`tem` result codes, and for the same reason: the code goes in
+/// a committed structure, the message does not
+/// ([09](../../../docs/09-what-xrpl-answers.md) §2.2).
+///
+/// A client that wants the detail asks a node, and can check the answer against
+/// the code it proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResultCode {
+    /// Applied.
+    Success,
+    /// Stateless verification failed: signature, chain, expiry, structure.
+    Transaction,
+    /// The nonce did not match the account's sequence.
+    Nonce,
+    /// The bank refused: insufficient funds, frozen, overflow.
+    Bank,
+    /// A group rule refused.
+    Group,
+    /// A staking rule refused.
+    Staking,
+    /// The account did not exist, or was the wrong kind.
+    Account,
+    /// The username registry refused.
+    Registry,
+    /// A contact binding refused.
+    Binding,
+    /// State was corrupt. Never a client's fault.
+    State,
+}
+
+impl ResultCode {
+    /// The wire value. Stable: these numbers are consensus.
+    #[must_use]
+    pub fn as_u16(self) -> u16 {
+        match self {
+            Self::Success => 0,
+            Self::Transaction => 1,
+            Self::Nonce => 2,
+            Self::Bank => 3,
+            Self::Group => 4,
+            Self::Staking => 5,
+            Self::Account => 6,
+            Self::Registry => 7,
+            Self::Binding => 8,
+            Self::State => 9,
+        }
+    }
+
+    /// Parse a wire value.
+    #[must_use]
+    pub fn from_u16(value: u16) -> Option<Self> {
+        Some(match value {
+            0 => Self::Success,
+            1 => Self::Transaction,
+            2 => Self::Nonce,
+            3 => Self::Bank,
+            4 => Self::Group,
+            5 => Self::Staking,
+            6 => Self::Account,
+            7 => Self::Registry,
+            8 => Self::Binding,
+            9 => Self::State,
+            _ => return None,
+        })
+    }
+
+    /// Whether the transaction applied.
+    #[must_use]
+    pub fn succeeded(self) -> bool {
+        matches!(self, Self::Success)
+    }
+}
+
+impl From<&ExecError> for ResultCode {
+    fn from(error: &ExecError) -> Self {
+        match error {
+            ExecError::Tx(_) => Self::Transaction,
+            ExecError::WrongNonce { .. } => Self::Nonce,
+            ExecError::Bank(_) => Self::Bank,
+            ExecError::Group(_) => Self::Group,
+            ExecError::Staking(_) => Self::Staking,
+            ExecError::NoSuchAccount
+            | ExecError::NotAGroup
+            | ExecError::NotAGroupMember
+            | ExecError::NoRotationRecipient => Self::Account,
+            ExecError::Registry(_) => Self::Registry,
+            ExecError::Bind(_) => Self::Binding,
+            ExecError::State(_) => Self::State,
+        }
+    }
+}
+
+/// One account whose history pointer a transaction moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchedAccount {
+    /// The account.
+    pub address: Address,
+    /// Its history pointer immediately **before** this transaction.
+    ///
+    /// `None` means this transaction is the first in that account's history.
+    pub previous: Option<TxPointer>,
+}
+
+impl Encode for TouchedAccount {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.address.encode(out);
+        self.previous.encode(out);
+    }
+}
+
+impl Decode for TouchedAccount {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            address: Address::decode(r)?,
+            previous: Option::<TxPointer>::decode(r)?,
+        })
+    }
+}
+
+/// What a block commits to about one transaction's execution.
+///
+/// This is the committed half of a [`TxOutcome`]: everything a client can be
+/// handed a proof of. It is separate from the outcome because [`ExecError`] is a
+/// rich local type whose variants change with the code, and a header must not.
+///
+/// # Why `touched` is here
+///
+/// Each entry is an account whose history pointer this transaction moved, and
+/// **what that pointer was before**. That is the backwards link
+/// [`Account::last_txn`] needs to be walkable: prove the account, follow its
+/// pointer to a transaction, prove that transaction's receipt, and read the
+/// previous pointer out of it.
+///
+/// The chain is what makes omission *detectable*. A node can decline to serve a
+/// link, but it cannot produce a receipt that names a different predecessor,
+/// because the receipt is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TxOutcome {
+pub struct TxReceipt {
     /// The transaction's identifier.
     pub tx_id: Hash32,
-    /// `Ok(())` if it applied, otherwise why it did not.
-    pub result: Result<(), ExecError>,
+    /// Whether it applied, and which subsystem refused if not.
+    pub code: ResultCode,
     /// Fee actually charged.
     pub fee_charged: Amount,
+    /// Accounts whose history pointer moved, and their previous pointers.
+    ///
+    /// Sorted by address, so one execution has one encoding.
+    pub touched: Vec<TouchedAccount>,
+}
+
+impl TxReceipt {
+    /// The previous history pointer this transaction recorded for `address`.
+    ///
+    /// `Ok(None)` means this transaction is the first in that account's
+    /// history — the end of the walk. `Err(())` means the account is not named
+    /// here at all, which is a broken chain rather than an ending.
+    ///
+    /// # Errors
+    /// Returns `Err(())` when the receipt does not mention `address`.
+    #[allow(
+        clippy::result_unit_err,
+        reason = "the caller only needs to know it broke"
+    )]
+    pub fn previous_for(&self, address: &Address) -> Result<Option<TxPointer>, ()> {
+        self.touched
+            .iter()
+            .find(|entry| entry.address == *address)
+            .map(|entry| entry.previous)
+            .ok_or(())
+    }
+}
+
+/// The outcome of one transaction: the committed receipt plus local detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxOutcome {
+    /// What the block commits to.
+    pub receipt: TxReceipt,
+    /// Why it failed, in full. Local only — never committed, never on the wire.
+    pub result: Result<(), ExecError>,
 }
 
 impl TxOutcome {
@@ -121,6 +299,31 @@ impl TxOutcome {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.result.is_ok()
+    }
+
+    /// The transaction's identifier.
+    #[must_use]
+    pub fn tx_id(&self) -> Hash32 {
+        self.receipt.tx_id
+    }
+
+    /// Fee actually charged.
+    #[must_use]
+    pub fn fee_charged(&self) -> Amount {
+        self.receipt.fee_charged
+    }
+
+    /// A rejected transaction that changed nothing at all.
+    fn rejected(tx_id: Hash32, error: ExecError) -> Self {
+        Self {
+            receipt: TxReceipt {
+                tx_id,
+                code: ResultCode::from(&error),
+                fee_charged: Amount::ZERO,
+                touched: Vec::new(),
+            },
+            result: Err(error),
+        }
     }
 }
 
@@ -138,6 +341,67 @@ impl BlockOutcome {
     #[must_use]
     pub fn succeeded(&self) -> usize {
         self.outcomes.iter().filter(|o| o.succeeded()).count()
+    }
+
+    /// Merkle root over the receipts, in execution order.
+    ///
+    /// Leaves are whole receipts rather than ids, because the point is to prove
+    /// what a transaction *did*, not merely that it ran. Kept as a second tree
+    /// beside `tx_root` rather than folded into it, so a client holding only a
+    /// transaction id can still prove inclusion without first obtaining the
+    /// receipt.
+    #[must_use]
+    pub fn outcome_root(&self) -> Hash32 {
+        MerkleTree::from_items(self.outcomes.iter().map(|o| o.receipt.to_bytes())).root()
+    }
+}
+
+impl Encode for ResultCode {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.as_u16().encode(out);
+    }
+}
+
+impl Decode for ResultCode {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let raw = u16::decode(r)?;
+        Self::from_u16(raw).ok_or(CodecError::UnknownDiscriminant {
+            tag: u8::try_from(raw).unwrap_or(u8::MAX),
+            type_name: "ResultCode",
+        })
+    }
+}
+
+impl Encode for TxReceipt {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.tx_id.encode(out);
+        self.code.encode(out);
+        self.fee_charged.encode(out);
+        self.touched.encode(out);
+    }
+}
+
+impl Decode for TxReceipt {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let receipt = Self {
+            tx_id: Hash32::decode(r)?,
+            code: ResultCode::decode(r)?,
+            fee_charged: Amount::decode(r)?,
+            touched: Vec::<TouchedAccount>::decode(r)?,
+        };
+        // One execution, one encoding. An unsorted or repeated `touched` list
+        // would be a second spelling of the same receipt, and the receipt is
+        // hashed into a header.
+        if !receipt
+            .touched
+            .windows(2)
+            .all(|w| w.first().map(|e| e.address) < w.get(1).map(|e| e.address))
+        {
+            return Err(CodecError::Invalid(
+                "receipt touched-list must be sorted and unique".to_owned(),
+            ));
+        }
+        Ok(receipt)
     }
 }
 
@@ -204,6 +468,7 @@ impl Executor {
             parent,
             tx_root,
             app_hash: outcome.app_hash,
+            outcome_root: outcome.outcome_root(),
             validators_hash: sets.current.hash(),
             next_validators_hash: sets.next.hash(),
         };
@@ -225,33 +490,22 @@ impl Executor {
 
         // Stateless checks first — these cost nothing and reject the cheap attacks.
         if let Err(e) = tx.verify(&self.chain_id, ctx.height) {
-            return TxOutcome {
-                tx_id,
-                result: Err(e.into()),
-                fee_charged: Amount::ZERO,
-            };
+            return TxOutcome::rejected(tx_id, e.into());
         }
 
         // Nonce check against committed state.
         let account = match load_account(store, &tx.body.sender) {
             Ok(a) => a,
-            Err(e) => {
-                return TxOutcome {
-                    tx_id,
-                    result: Err(e),
-                    fee_charged: Amount::ZERO,
-                };
-            }
+            Err(e) => return TxOutcome::rejected(tx_id, e),
         };
         if account.nonce != tx.body.nonce {
-            return TxOutcome {
+            return TxOutcome::rejected(
                 tx_id,
-                result: Err(ExecError::WrongNonce {
+                ExecError::WrongNonce {
                     expected: account.nonce,
                     got: tx.body.nonce,
-                }),
-                fee_charged: Amount::ZERO,
-            };
+                },
+            );
         }
 
         // Charge the fee against committed state. If the payer cannot cover it
@@ -266,11 +520,7 @@ impl Executor {
         if let Err(e) = fee_result
             && !tx.body.fee.amount.is_zero()
         {
-            return TxOutcome {
-                tx_id,
-                result: Err(e.into()),
-                fee_charged: Amount::ZERO,
-            };
+            return TxOutcome::rejected(tx_id, e.into());
         }
         let fee_charged = tx.body.fee.amount;
 
@@ -285,28 +535,59 @@ impl Executor {
             }
         }
 
-        match failure {
+        let (result, code) = match failure {
             None => {
                 *store = sandbox;
-                // The nonce advances on the committed store either way.
-                bump_nonce(store, &tx.body.sender);
-                TxOutcome {
-                    tx_id,
-                    result: Ok(()),
-                    fee_charged,
-                }
+                (Ok(()), ResultCode::Success)
             }
             Some(e) => {
                 // Sandbox dropped: no state change from the messages. The fee is
                 // still charged and the nonce still consumed, so a failing
                 // transaction cannot be replayed for free.
-                bump_nonce(store, &tx.body.sender);
-                TxOutcome {
-                    tx_id,
-                    result: Err(e),
-                    fee_charged,
-                }
+                let code = ResultCode::from(&e);
+                (Err(e), code)
             }
+        };
+
+        // The nonce advances on the committed store either way.
+        bump_nonce(store, &tx.body.sender);
+
+        // Whose history moved. A failed transaction still charged a fee and
+        // consumed a nonce, so the payer's history did move — but the intended
+        // recipient's did not, and filing it under them would let anyone write
+        // into a stranger's history for the price of a failure.
+        //
+        // It also matters for state: recording a pointer *creates* an account
+        // record. Restricting failures to the sender and the fee payer means a
+        // spammer cannot mint records for addresses it merely names.
+        let touched = if result.is_ok() {
+            tx.touched_addresses()
+        } else {
+            let mut minimal = vec![tx.body.sender, fee_payer];
+            minimal.sort_unstable();
+            minimal.dedup();
+            minimal
+        };
+        let pointer = TxPointer {
+            tx_id,
+            height: ctx.height,
+        };
+        let touched = touched
+            .into_iter()
+            .map(|address| TouchedAccount {
+                address,
+                previous: move_history_pointer(store, &address, pointer),
+            })
+            .collect();
+
+        TxOutcome {
+            receipt: TxReceipt {
+                tx_id,
+                code,
+                fee_charged,
+                touched,
+            },
+            result,
         }
     }
 
@@ -545,6 +826,29 @@ fn ensure_account<S: KeyValueStore>(store: &mut S, address: &Address) {
     if store.get(&key).is_none() {
         store.set_encoded(&key, &Account::individual(*address));
     }
+}
+
+/// Point an account's history at `pointer`, returning what it pointed at before.
+///
+/// Creates the account record if there was none — which is how a recipient who
+/// has never sent a transaction gets a history at all. XRPL does the same thing
+/// when a payment changes an AccountRoot's balance
+/// ([09](../../../docs/09-what-xrpl-answers.md) §2.1).
+fn move_history_pointer<S: KeyValueStore>(
+    store: &mut S,
+    address: &Address,
+    pointer: TxPointer,
+) -> Option<TxPointer> {
+    let key = StoreKey::account(address);
+    let mut account = store
+        .get_decoded::<Account>(&key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Account::individual(*address));
+    let previous = account.last_txn;
+    account.last_txn = Some(pointer);
+    store.set_encoded(&key, &account);
+    previous
 }
 
 fn bump_nonce<S: KeyValueStore>(store: &mut S, address: &Address) {
@@ -982,7 +1286,7 @@ mod tests {
             .view()
             .balance(&addr(1), &kes())
             .expect("reads");
-        let fee = outcome.outcomes[0].fee_charged;
+        let fee = outcome.outcomes[0].fee_charged();
 
         // The only movement is the fee. Nothing else left the account.
         assert_eq!(
@@ -1009,6 +1313,151 @@ mod tests {
         assert_eq!(
             bank.balance(&addr(2), &kes()).expect("read"),
             Amount::from_afri(10_500)
+        );
+    }
+
+    #[test]
+    fn a_transfer_moves_the_history_pointer_of_both_parties() {
+        // The head of the chain a wallet walks. Without this the recipient has
+        // no starting point at all, and their history is unreachable.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let transfer = Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(500),
+            reference: None,
+        };
+        let sent = tx(1, 0, vec![transfer]);
+        let outcome = exec.execute_block(&mut store, ctx(1), std::slice::from_ref(&sent));
+
+        let receipt = &outcome.outcomes[0].receipt;
+        assert!(receipt.code.succeeded());
+
+        for party in [addr(1), addr(2)] {
+            let account = load_account(&store, &party).expect("account exists");
+            assert_eq!(
+                account.last_txn,
+                Some(TxPointer {
+                    tx_id: sent.id(),
+                    height: Height(1),
+                }),
+                "the pointer must name this transaction"
+            );
+            assert_eq!(
+                receipt.previous_for(&party),
+                Ok(None),
+                "and the receipt must record that there was nothing before it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_history_pointer_chain_links_backwards_across_blocks() {
+        // Three payments, three blocks. Following the pointers must visit every
+        // one and then stop — which is what makes an omitted payment a broken
+        // link rather than an invisible gap.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let mut sent = Vec::new();
+
+        for nonce in 0..3u64 {
+            let transfer = Message::Transfer {
+                to: addr(2),
+                denom: kes(),
+                amount: Amount::from_afri(1),
+                reference: None,
+            };
+            let transaction = tx(1, nonce, vec![transfer]);
+            let outcome = exec.execute_block(
+                &mut store,
+                ctx(u64::try_from(sent.len()).expect("small") + 1),
+                std::slice::from_ref(&transaction),
+            );
+            assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+            sent.push((transaction, outcome.outcomes[0].receipt.clone()));
+        }
+
+        // Walk from the recipient's account backwards.
+        let mut pointer = load_account(&store, &addr(2))
+            .expect("account exists")
+            .last_txn;
+        let mut walked = Vec::new();
+        while let Some(current) = pointer {
+            let (transaction, receipt) = sent
+                .iter()
+                .find(|(t, _)| t.id() == current.tx_id)
+                .expect("the pointer must name a real transaction");
+            walked.push(transaction.id());
+            pointer = receipt
+                .previous_for(&addr(2))
+                .expect("the receipt must name this account");
+        }
+
+        assert_eq!(walked.len(), 3, "every payment is reachable");
+        let expected: Vec<_> = sent.iter().rev().map(|(t, _)| t.id()).collect();
+        assert_eq!(walked, expected, "newest first, and none skipped");
+    }
+
+    #[test]
+    fn a_failed_transaction_does_not_write_into_the_recipients_history() {
+        // Otherwise anyone could put entries in a stranger's history — and,
+        // worse, create an account record for them — by failing to pay them.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let beyond_means = Message::Transfer {
+            to: addr(9),
+            denom: kes(),
+            amount: Amount::from_afri(999_999_999),
+            reference: None,
+        };
+        let outcome = exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![beyond_means])]);
+
+        assert_eq!(outcome.succeeded(), 0);
+        let receipt = &outcome.outcomes[0].receipt;
+        assert_eq!(receipt.code, ResultCode::Bank);
+
+        let touched: Vec<_> = receipt.touched.iter().map(|t| t.address).collect();
+        assert!(
+            touched.contains(&addr(1)),
+            "the sender paid a fee and a nonce"
+        );
+        assert!(
+            !touched.contains(&addr(9)),
+            "the intended recipient must not be touched"
+        );
+        assert!(
+            load_account(&store, &addr(9))
+                .expect("read")
+                .last_txn
+                .is_none(),
+            "and no account record should have been minted for them"
+        );
+    }
+
+    #[test]
+    fn the_header_commits_to_what_happened_not_only_to_what_ran() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let transfer = Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(1),
+            reference: None,
+        };
+        let (block, outcome) = exec.build_block(
+            &mut store,
+            Height(1),
+            Timestamp::from_millis(1_700_000_001_000),
+            Hash32::ZERO,
+            vec![tx(1, 0, vec![transfer])],
+            ValidatorSets::unchanged(&validators()),
+        );
+
+        assert_eq!(block.header.outcome_root, outcome.outcome_root());
+        assert_ne!(
+            block.header.outcome_root, block.header.tx_root,
+            "two trees, not one"
         );
     }
 
@@ -1128,7 +1577,7 @@ mod tests {
 
         let outcome = exec.execute_block(&mut store, ctx(1), &[overspend]);
         assert!(!outcome.outcomes[0].succeeded());
-        assert_eq!(outcome.outcomes[0].fee_charged, Amount::from_units(1_000));
+        assert_eq!(outcome.outcomes[0].fee_charged(), Amount::from_units(1_000));
 
         let account = load_account(&store, &addr(1)).expect("loads");
         assert_eq!(

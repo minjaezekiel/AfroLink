@@ -211,6 +211,40 @@ impl Handle {
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
+
+    /// Turn this handle into a guard that stops the server when dropped.
+    ///
+    /// Worth having because of how [`Server::run`] is used: it is normally
+    /// spawned inside a `std::thread::scope`, and the scope does not exit until
+    /// the accept loop does. A caller that panics — a failed assertion, most
+    /// often — therefore never reaches its own `stop()` call, and the whole
+    /// thread hangs instead of reporting the failure.
+    ///
+    /// A guard runs during unwinding, so the failure surfaces as a failure.
+    #[must_use]
+    pub fn stop_on_drop(self) -> StopOnDrop {
+        StopOnDrop(self)
+    }
+}
+
+/// Stops a server when dropped, including while a panic unwinds.
+///
+/// See [`Handle::stop_on_drop`].
+#[derive(Debug)]
+pub struct StopOnDrop(Handle);
+
+impl StopOnDrop {
+    /// The handle underneath, for asking whether a stop has been requested.
+    #[must_use]
+    pub fn handle(&self) -> &Handle {
+        &self.0
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 /// A bound listener, ready to serve.

@@ -87,7 +87,7 @@ pub mod wire;
 use std::time::Duration;
 
 pub use route::{Format, Route};
-pub use server::{Handle, Server, respond};
+pub use server::{Handle, Server, StopOnDrop, respond};
 pub use wire::{HttpResponse, Method, Request, Status, WireError};
 
 /// Limits and timeouts for one server.

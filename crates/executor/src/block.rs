@@ -27,6 +27,18 @@ pub struct BlockHeader {
     pub tx_root: Hash32,
     /// State root *after* this block is applied.
     pub app_hash: Hash32,
+    /// Merkle root over the block's transaction receipts.
+    ///
+    /// `tx_root` says *what ran*; this says *what happened*. Without it a node
+    /// can claim a payment failed when it succeeded, and a phone holding only
+    /// headers has no way to check — the resulting state contradicts the lie,
+    /// but only to someone willing to diff two whole states.
+    ///
+    /// It is also what makes an account's history walkable backwards: a receipt
+    /// names the previous history pointer of every account the transaction
+    /// touched, so a committed receipt is a committed link
+    /// ([09](../../../docs/09-what-xrpl-answers.md) §2.1).
+    pub outcome_root: Hash32,
     /// Commitment to the validator set that signed **this** block.
     ///
     /// Lets a light client check that a set handed to it is the one the chain
@@ -162,6 +174,7 @@ impl Encode for BlockHeader {
         self.parent.encode(out);
         self.tx_root.encode(out);
         self.app_hash.encode(out);
+        self.outcome_root.encode(out);
         self.validators_hash.encode(out);
         self.next_validators_hash.encode(out);
     }
@@ -176,6 +189,7 @@ impl Decode for BlockHeader {
             parent: Hash32::decode(r)?,
             tx_root: Hash32::decode(r)?,
             app_hash: Hash32::decode(r)?,
+            outcome_root: Hash32::decode(r)?,
             validators_hash: Hash32::decode(r)?,
             next_validators_hash: Hash32::decode(r)?,
         })

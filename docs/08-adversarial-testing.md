@@ -22,7 +22,7 @@ a `proptest` or `cargo-fuzz` dependency — the same reason the codec is not ser
 
 ### 1. `crates/fuzz/tests/codec.rs` — bytes from a hostile peer
 
-~210 000 inputs across 53 decoder fixtures, plus ~45 000 forged proofs. Three
+~232 000 inputs across 58 decoder fixtures, plus ~45 000 forged proofs. Three
 properties:
 
 | Property | What it prevents |
@@ -66,6 +66,13 @@ The `Query` and `Response` types joined the codec suite at the same time as
 [ADR-0014](adr/0014-payment-history-and-the-mempool.md). They are the only
 encodings on this chain that cross a socket in **both** directions, and they had
 been outside it.
+
+`TxReceipt` joined with [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md),
+and is the sharpest instance of the canonicality rule yet: it is hashed into a
+block header, and its `touched` field is a *set* encoded as a list. A decoder
+that sorted it rather than refusing an out-of-order one would give two honest
+nodes two `outcome_root`s for the same execution — a chain split, arriving
+through a convenience.
 
 ### 3. `crates/node/tests/adversarial.rs` — a hostile scheduler
 

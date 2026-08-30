@@ -240,6 +240,10 @@ fn account_decoders_stay_canonical_under_attack() {
             kind: AccountKind::Individual {
                 public_key: Some(key(50).public_key()),
             },
+            last_txn: Some(afrolink_types::TxPointer {
+                tx_id: Hash32::from_bytes([9u8; 32]),
+                height: Height(77),
+            }),
         },
         ROUNDS,
     );
@@ -251,6 +255,9 @@ fn account_decoders_stay_canonical_under_attack() {
             address: addr(51),
             nonce: 0,
             kind: AccountKind::Individual { public_key: None },
+            // Both `Option` fields empty: the case where a decoder is most
+            // tempted to substitute a default for something nobody sent.
+            last_txn: None,
         },
         ROUNDS,
     );
@@ -262,6 +269,7 @@ fn account_decoders_stay_canonical_under_attack() {
             kind: AccountKind::Module {
                 name: "fee_pool".to_owned(),
             },
+            last_txn: None,
         },
         ROUNDS,
     );
@@ -554,6 +562,12 @@ impl afrolink_rpc::ChainView for Fixture {
         }
         Ok(None)
     }
+    fn receipts(
+        &self,
+        _height: Height,
+    ) -> Result<Option<Vec<afrolink_executor::TxReceipt>>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
     fn locate(&self, _id: &Hash32) -> Result<Option<(Height, u32)>, afrolink_rpc::QueryError> {
         Ok(None)
     }
@@ -565,4 +579,149 @@ impl afrolink_rpc::ChainView for Fixture {
     ) -> Result<Option<(Vec<afrolink_rpc::HistoryEntry>, bool)>, afrolink_rpc::QueryError> {
         Ok(Some((Vec::new(), false)))
     }
+}
+
+#[test]
+fn receipt_decoders_stay_canonical_under_attack() {
+    // `TxReceipt` is hashed into a block header, so two encodings of one
+    // receipt would be two `outcome_root`s for one execution — a chain split
+    // with extra steps. The `touched` list is the risk: it is a set, and a set
+    // encoded as a list has `n!` spellings unless the decoder refuses all but
+    // one ([ADR-0015](../../../docs/adr/0015-committed-outcomes-and-provable-history.md)).
+    use afrolink_executor::{ResultCode, TouchedAccount, TxReceipt};
+    use afrolink_types::TxPointer;
+
+    hammer::<ResultCode>("ResultCode/success", &ResultCode::Success, ROUNDS);
+    hammer::<ResultCode>("ResultCode/bank", &ResultCode::Bank, ROUNDS);
+    hammer::<TouchedAccount>(
+        "TouchedAccount/first",
+        &TouchedAccount {
+            address: addr(50),
+            previous: None,
+        },
+        ROUNDS,
+    );
+
+    let mut touched = vec![
+        TouchedAccount {
+            address: addr(50),
+            previous: Some(TxPointer {
+                tx_id: Hash32::from_bytes([1u8; 32]),
+                height: Height(9),
+            }),
+        },
+        TouchedAccount {
+            address: addr(60),
+            previous: None,
+        },
+        TouchedAccount {
+            address: addr(70),
+            previous: Some(TxPointer {
+                tx_id: Hash32::from_bytes([2u8; 32]),
+                height: Height(3),
+            }),
+        },
+    ];
+    touched.sort_by_key(|t| t.address);
+
+    hammer::<TxReceipt>(
+        "TxReceipt",
+        &TxReceipt {
+            tx_id: Hash32::from_bytes([7u8; 32]),
+            code: ResultCode::Success,
+            fee_charged: Amount::from_units(1_000),
+            touched,
+        },
+        ROUNDS,
+    );
+    hammer::<TxReceipt>(
+        "TxReceipt/empty",
+        &TxReceipt {
+            tx_id: Hash32::from_bytes([8u8; 32]),
+            code: ResultCode::Nonce,
+            fee_charged: Amount::ZERO,
+            touched: Vec::new(),
+        },
+        ROUNDS,
+    );
+}
+
+#[test]
+fn an_unsorted_touched_list_is_refused_rather_than_reordered() {
+    // The defect shape docs/08 records: a decoder that *normalises* turns one
+    // value into several encodings. Here it would put two roots in two honest
+    // nodes' headers for the same block.
+    use afrolink_executor::{ResultCode, TouchedAccount, TxReceipt};
+    use afrolink_primitives::codec::{Encode, decode_exact};
+
+    let ordered = TxReceipt {
+        tx_id: Hash32::from_bytes([7u8; 32]),
+        code: ResultCode::Success,
+        fee_charged: Amount::ZERO,
+        touched: vec![
+            TouchedAccount {
+                address: addr(1),
+                previous: None,
+            },
+            TouchedAccount {
+                address: addr(2),
+                previous: None,
+            },
+        ],
+    };
+    let (low, high) = if addr(1) < addr(2) {
+        (addr(1), addr(2))
+    } else {
+        (addr(2), addr(1))
+    };
+    let sorted = TxReceipt {
+        touched: vec![
+            TouchedAccount {
+                address: low,
+                previous: None,
+            },
+            TouchedAccount {
+                address: high,
+                previous: None,
+            },
+        ],
+        ..ordered.clone()
+    };
+    assert!(decode_exact::<TxReceipt>(&sorted.to_bytes()).is_ok());
+
+    let swapped = TxReceipt {
+        touched: vec![
+            TouchedAccount {
+                address: high,
+                previous: None,
+            },
+            TouchedAccount {
+                address: low,
+                previous: None,
+            },
+        ],
+        ..ordered.clone()
+    };
+    assert!(
+        decode_exact::<TxReceipt>(&swapped.to_bytes()).is_err(),
+        "a reordered touched list must be refused, not sorted"
+    );
+
+    let repeated = TxReceipt {
+        touched: vec![
+            TouchedAccount {
+                address: low,
+                previous: None,
+            },
+            TouchedAccount {
+                address: low,
+                previous: None,
+            },
+        ],
+        ..ordered
+    };
+    assert!(
+        decode_exact::<TxReceipt>(&repeated.to_bytes()).is_err(),
+        "one account must appear at most once"
+    );
 }

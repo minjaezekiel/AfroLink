@@ -51,7 +51,9 @@ use afrolink_consensus::Commit;
 use afrolink_crypto::Address;
 use afrolink_crypto::address::ADDRESS_LEN;
 use afrolink_crypto::hash::Hash32;
-use afrolink_executor::{Block, BlockContext, Executor, Genesis, GenesisError, GenesisLimits};
+use afrolink_executor::{
+    Block, BlockContext, Executor, Genesis, GenesisError, GenesisLimits, TxReceipt,
+};
 use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Encode, decode_exact};
 use afrolink_state::nodes::{Node, NodeSink, NodeSource, WriteStats, commit_tree, load_tree};
@@ -65,6 +67,11 @@ use thiserror::Error;
 const BLOCKS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("blocks");
 /// Commit certificates by height.
 const COMMITS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("commits");
+/// Execution receipts by height, in execution order.
+///
+/// The header commits to their Merkle root, so these are not merely a cache:
+/// without them a node cannot prove what a transaction *did*, only that it ran.
+const RECEIPTS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("receipts");
 /// Singleton values: genesis, latest height.
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 /// State tree nodes, keyed by their own hash (ADR-0006).
@@ -186,6 +193,7 @@ impl ChainStore {
             tx.open_table(COMMITS).map_err(db_err)?;
             tx.open_table(META).map_err(db_err)?;
             tx.open_table(NODES).map_err(db_err)?;
+            tx.open_table(RECEIPTS).map_err(db_err)?;
             tx.open_table(TX_LOCATION).map_err(db_err)?;
             tx.open_table(TX_BY_ADDRESS).map_err(db_err)?;
         }
@@ -234,8 +242,21 @@ impl ChainStore {
     ///
     /// # Errors
     /// Returns [`StoreError::Database`] on write failure.
-    pub fn put_block(&self, block: &Block, commit: &Commit) -> Result<()> {
+    pub fn put_block(&self, block: &Block, commit: &Commit, receipts: &[TxReceipt]) -> Result<()> {
         let height = block.header.height.0;
+        // A receipt list that does not match the block is worse than none: it
+        // would produce proofs against a root the header does not carry, and a
+        // client would blame its own wallet.
+        if receipts.len() != block.transactions.len() {
+            return Err(StoreError::Corrupt {
+                what: format!("block {height}"),
+                reason: format!(
+                    "{} transactions but {} receipts",
+                    block.transactions.len(),
+                    receipts.len()
+                ),
+            });
+        }
         let tx = self.db.begin_write().map_err(db_err)?;
         {
             let mut blocks = tx.open_table(BLOCKS).map_err(db_err)?;
@@ -246,6 +267,11 @@ impl ChainStore {
             let mut commits = tx.open_table(COMMITS).map_err(db_err)?;
             commits
                 .insert(height, commit.to_bytes().as_slice())
+                .map_err(db_err)?;
+
+            let mut receipt_table = tx.open_table(RECEIPTS).map_err(db_err)?;
+            receipt_table
+                .insert(height, receipts.to_vec().to_bytes().as_slice())
                 .map_err(db_err)?;
 
             let mut location = tx.open_table(TX_LOCATION).map_err(db_err)?;
@@ -333,6 +359,21 @@ impl ChainStore {
         decode_exact::<Commit>(raw.value())
             .map(Some)
             .map_err(|e| corrupt(&format!("commit {height}"), &e))
+    }
+
+    /// Execution receipts for a block, in execution order.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] if the stored bytes do not decode.
+    pub fn receipts(&self, height: Height) -> Result<Option<Vec<TxReceipt>>> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let table = tx.open_table(RECEIPTS).map_err(db_err)?;
+        let Some(raw) = table.get(height.0).map_err(db_err)? else {
+            return Ok(None);
+        };
+        decode_exact::<Vec<TxReceipt>>(raw.value())
+            .map(Some)
+            .map_err(|e| corrupt(&format!("receipts {height}"), &e))
     }
 
     /// Find a transaction by its id, with the block and position it sits at.
@@ -699,10 +740,10 @@ mod tests {
     }
 
     /// Build the next empty block over `state`, plus a quorum commit.
-    fn next_block(state: &mut MemoryStore, parent: &Block) -> (Block, Commit) {
+    fn next_block(state: &mut MemoryStore, parent: &Block) -> (Block, Commit, Vec<TxReceipt>) {
         let executor = Executor::new(chain());
         let height = parent.header.height.next();
-        let (block, _) = executor.build_block(
+        let (block, outcome) = executor.build_block(
             state,
             height,
             Timestamp::from_millis(1_700_000_001_000),
@@ -727,6 +768,7 @@ mod tests {
         (
             block.clone(),
             Commit::new(height, Round::ZERO, block_id, signatures),
+            outcome.outcomes.iter().map(|o| o.receipt.clone()).collect(),
         )
     }
 
@@ -742,8 +784,10 @@ mod tests {
             .apply(&mut state, GenesisLimits::devnet())
             .expect("applies");
         for _ in 0..n {
-            let (block, commit) = next_block(&mut state, &parent);
-            store.put_block(&block, &commit).expect("stores block");
+            let (block, commit, receipts) = next_block(&mut state, &parent);
+            store
+                .put_block(&block, &commit, &receipts)
+                .expect("stores block");
             parent = block;
         }
         (temp, state)
@@ -777,10 +821,10 @@ mod tests {
         state: &mut MemoryStore,
         parent: &Block,
         transactions: Vec<Transaction>,
-    ) -> (Block, Commit) {
+    ) -> (Block, Commit, Vec<TxReceipt>) {
         let executor = Executor::new(chain());
         let height = parent.header.height.next();
-        let (block, _) = executor.build_block(
+        let (block, outcome) = executor.build_block(
             state,
             height,
             Timestamp::from_millis(1_700_000_000_000 + height.0 * 1_000),
@@ -805,6 +849,7 @@ mod tests {
         (
             block.clone(),
             Commit::new(height, Round::ZERO, block_id, signatures),
+            outcome.outcomes.iter().map(|o| o.receipt.clone()).collect(),
         )
     }
 
@@ -819,13 +864,77 @@ mod tests {
         let parent = g
             .apply(&mut state, GenesisLimits::devnet())
             .expect("applies");
-        store
-            .put_block(&parent, &next_block(&mut state.clone(), &parent).1)
-            .ok();
+        let genesis_commit = next_block(&mut state.clone(), &parent).1;
+        store.put_block(&parent, &genesis_commit, &[]).ok();
 
-        let (block, commit) = block_with(&mut state, &parent, transactions);
-        store.put_block(&block, &commit).expect("stores block");
+        let (block, commit, receipts) = block_with(&mut state, &parent, transactions);
+        store
+            .put_block(&block, &commit, &receipts)
+            .expect("stores block");
         (temp, store)
+    }
+
+    #[test]
+    fn receipts_are_stored_with_their_block_and_survive_a_reopen() {
+        // The header commits to their root, so a node that has the block but
+        // lost the receipts cannot prove what any of it did.
+        let sent = payment(0, addr(60));
+        let temp = TempDb::new("receipts");
+        {
+            let store = ChainStore::open(temp.path()).expect("opens");
+            let g = genesis();
+            store.put_genesis(&g).expect("stores genesis");
+            let mut state = MemoryStore::new();
+            let parent = g
+                .apply(&mut state, GenesisLimits::devnet())
+                .expect("applies");
+            let (block, commit, receipts) = block_with(&mut state, &parent, vec![sent.clone()]);
+            assert_eq!(
+                block.header.outcome_root,
+                afrolink_crypto::merkle::MerkleTree::from_items(
+                    receipts.iter().map(Encode::to_bytes)
+                )
+                .root(),
+                "the header must commit to the receipts stored beside it"
+            );
+            store
+                .put_block(&block, &commit, &receipts)
+                .expect("stores block");
+        }
+
+        let reopened = ChainStore::open(temp.path()).expect("reopens");
+        let receipts = reopened
+            .receipts(Height(1))
+            .expect("reads")
+            .expect("stored");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].tx_id, sent.id());
+        assert!(receipts[0].code.succeeded());
+    }
+
+    #[test]
+    fn a_receipt_list_that_does_not_match_its_block_is_refused() {
+        // Worse than no receipts: it would produce proofs against a root the
+        // header does not carry, and a wallet would blame itself.
+        let temp = TempDb::new("mismatch");
+        let store = ChainStore::open(temp.path()).expect("opens");
+        let g = genesis();
+        store.put_genesis(&g).expect("stores genesis");
+        let mut state = MemoryStore::new();
+        let parent = g
+            .apply(&mut state, GenesisLimits::devnet())
+            .expect("applies");
+        let (block, commit, receipts) = block_with(&mut state, &parent, vec![payment(0, addr(60))]);
+
+        assert!(
+            store.put_block(&block, &commit, &[]).is_err(),
+            "a short receipt list must be refused"
+        );
+        let doubled: Vec<_> = receipts.iter().chain(receipts.iter()).cloned().collect();
+        assert!(
+            store.put_block(&block, &commit, &doubled).is_err(),
+            "a long receipt list must be refused"
+        );
     }
 
     #[test]
@@ -940,8 +1049,10 @@ mod tests {
             let parent = g
                 .apply(&mut state, GenesisLimits::devnet())
                 .expect("applies");
-            let (block, commit) = block_with(&mut state, &parent, vec![sent.clone()]);
-            store.put_block(&block, &commit).expect("stores block");
+            let (block, commit, receipts) = block_with(&mut state, &parent, vec![sent.clone()]);
+            store
+                .put_block(&block, &commit, &receipts)
+                .expect("stores block");
         }
 
         let reopened = ChainStore::open(temp.path()).expect("reopens");
@@ -1012,11 +1123,13 @@ mod tests {
         let parent = g
             .apply(&mut state, GenesisLimits::devnet())
             .expect("applies");
-        let (mut block, commit) = next_block(&mut state, &parent);
+        let (mut block, commit, receipts) = next_block(&mut state, &parent);
 
         // Claim a state root the transactions do not produce.
         block.header.app_hash = Hash32::ZERO;
-        store.put_block(&block, &commit).expect("stores block");
+        store
+            .put_block(&block, &commit, &receipts)
+            .expect("stores block");
 
         assert!(matches!(
             store.replay(GenesisLimits::devnet()),
@@ -1035,12 +1148,14 @@ mod tests {
         let parent = g
             .apply(&mut state, GenesisLimits::devnet())
             .expect("applies");
-        let (block, commit) = next_block(&mut state, &parent);
+        let (block, commit, receipts) = next_block(&mut state, &parent);
 
         // Store it as height 4, leaving 1..=3 missing.
         let mut orphan = block;
         orphan.header.height = Height(4);
-        store.put_block(&orphan, &commit).expect("stores block");
+        store
+            .put_block(&orphan, &commit, &receipts)
+            .expect("stores block");
 
         assert!(matches!(
             store.replay(GenesisLimits::devnet()),
@@ -1089,7 +1204,8 @@ mod tests {
         // Re-storing an older block must not rewind the recorded tip.
         let block = store.block(Height(1)).expect("reads").expect("exists");
         let commit = store.commit(Height(1)).expect("reads").expect("exists");
-        store.put_block(&block, &commit).expect("stores");
+        let receipts = store.receipts(Height(1)).expect("reads").expect("exists");
+        store.put_block(&block, &commit, &receipts).expect("stores");
         assert_eq!(
             store.height().expect("reads"),
             Height(2),

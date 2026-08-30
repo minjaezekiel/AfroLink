@@ -171,17 +171,13 @@ Index storage is unbounded and grows with history, alongside the retention work
 **Deliberately not done.** No fee-based replacement, no priority ordering — the
 selection is nonce-order, first come. No mempool gossip policy beyond
 "broadcast what was newly accepted". No WebSocket or subscription, so a wallet
-polls; that is fine at one-second blocks and is the next thing to want. No
-completeness proof for history. Putting the index into consensus state would give
-one, at the cost of unbounded state growth; XRPL's back-pointer chain gets the
-same guarantee without it, and is the route taken —
-[09](../09-what-xrpl-answers.md) §2.1.
+polls; that is fine at one-second blocks and is the next thing to want. ~~No completeness proof for history~~ — **built**, as
+[ADR-0015](0015-committed-outcomes-and-provable-history.md).
 
 ## Revisit if
 
-- ~~A node is caught omitting history entries~~ — **answered before it happened**:
-  [09](../09-what-xrpl-answers.md) §2.1 makes omission detectable rather than
-  invisible, and is scheduled rather than waiting for an incident
+- ~~A node is caught omitting history entries~~ — **answered before it happened**,
+  by [ADR-0015](0015-committed-outcomes-and-provable-history.md)
 - Mempool congestion becomes real, which is when fee replacement and priority
   ordering stop being premature
 - Index growth becomes the dominant storage cost, which is when it needs the

@@ -34,7 +34,7 @@ use afrolink_http::{Config, Server};
 use afrolink_light::LightClient;
 use afrolink_primitives::codec::{Encode, decode_exact};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Round, Timestamp};
-use afrolink_rpc::{ProvedValue, Query, ReadOnly, Response};
+use afrolink_rpc::{HistoryCursor, ProvedTransaction, ProvedValue, Query, ReadOnly, Response};
 use afrolink_state::MemoryStore;
 use afrolink_store::{ChainStore, ServedChain};
 
@@ -205,7 +205,7 @@ fn chain_on_disk(name: &str) -> (std::path::PathBuf, ChainStore, MemoryStore, Li
 
     let mut state = MemoryStore::new();
     let block = genesis.apply(&mut state, GenesisLimits::devnet()).unwrap();
-    store.put_block(&block, &commit_for(&block)).unwrap();
+    store.put_block(&block, &commit_for(&block), &[]).unwrap();
     store.persist_state(&state).unwrap();
 
     let client = LightClient::new(chain(), validators(), block.header.clone());
@@ -226,8 +226,10 @@ fn with_server<F: FnOnce(SocketAddr) + Send>(name: &str, config: Config, body: F
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
         body(addr);
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -247,6 +249,9 @@ fn a_wallet_verifies_a_balance_fetched_over_http() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let query = Query::Balance {
             address: account(50),
@@ -277,8 +282,6 @@ fn a_wallet_verifies_a_balance_fetched_over_http() {
             .verify_amount(&client, &query.store_key().unwrap())
             .unwrap();
         assert_eq!(balance, Amount::from_afri(2_500));
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -297,6 +300,9 @@ fn a_tampered_body_fails_verification_rather_than_being_believed() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let query = Query::Balance {
             address: account(50),
@@ -329,8 +335,6 @@ fn a_tampered_body_fails_verification_rather_than_being_believed() {
                 .is_err(),
             "an inflated balance must not verify"
         );
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -464,6 +468,9 @@ fn a_proved_absence_is_served_as_an_answer_rather_than_a_404() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let query = Query::Balance {
             address: account(77),
@@ -488,8 +495,6 @@ fn a_proved_absence_is_served_as_an_answer_rather_than_a_404() {
                 .unwrap(),
             Amount::ZERO
         );
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -681,6 +686,12 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
                 "/home/validator/secret/chain.redb is corrupt".into(),
             ))
         }
+        fn receipts(
+            &self,
+            _height: Height,
+        ) -> Result<Option<Vec<afrolink_executor::TxReceipt>>, afrolink_rpc::QueryError> {
+            Err(afrolink_rpc::QueryError::Backend("disk on fire".into()))
+        }
         fn locate(
             &self,
             _id: &afrolink_crypto::hash::Hash32,
@@ -705,6 +716,9 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let reply = get(addr, "/v1/status");
         assert_eq!(reply.status, 500);
@@ -715,8 +729,6 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
         // And a store that cannot be read is reported as unhealthy rather than
         // as a healthy node with no data.
         assert_eq!(get(addr, "/health").status, 503);
-
-        handle.stop();
     });
 }
 
@@ -730,6 +742,9 @@ fn stopping_the_server_actually_stops_it() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
         assert_eq!(get(addr, "/health").status, 200);
         handle.stop();
         assert!(handle.is_stopped());
@@ -795,7 +810,9 @@ fn chain_with_payment(
     assert_eq!(outcome.succeeded(), 1, "the fixture payment must apply");
 
     let commit = commit_for(&block);
-    store.put_block(&block, &commit).unwrap();
+    let receipts: Vec<afrolink_executor::TxReceipt> =
+        outcome.outcomes.iter().map(|o| o.receipt.clone()).collect();
+    store.put_block(&block, &commit, &receipts).unwrap();
     store.persist_state(&state).unwrap();
     client
         .update(
@@ -823,6 +840,9 @@ fn a_wallet_sees_a_payment_arrive_and_can_prove_it() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         // 1. The recipient asks what touched their account.
         let listing = get(
@@ -848,21 +868,26 @@ fn a_wallet_sees_a_payment_arrive_and_can_prove_it() {
         // Verified against the header the *wallet* holds, not the fixture's —
         // the client walked to it from genesis by checking commit signatures,
         // which is the only header it has any reason to believe.
-        let transaction = proved
+        let effects = proved
             .verify(client.trusted_header())
             .expect("inclusion must verify");
-        assert_eq!(transaction.id(), sent.id());
-        assert_eq!(transaction.body.sender, account(50));
+        assert_eq!(effects.transaction.id(), sent.id());
+        assert_eq!(effects.transaction.body.sender, account(50));
 
-        // 3. And the destination tag survived, which is what an exchange
+        // 3. The receipt is proved too, so "it worked" is not a claim.
+        assert!(
+            effects.receipt.code.succeeded(),
+            "the payment succeeded, and that is provable"
+        );
+
+        // 4. And the destination tag survived, which is what an exchange
         //    reconciles against.
-        let afrolink_types::Message::Transfer { reference, .. } = &transaction.body.messages[0]
+        let afrolink_types::Message::Transfer { reference, .. } =
+            &effects.transaction.body.messages[0]
         else {
             panic!("expected a transfer");
         };
         assert_eq!(*reference, Some(afrolink_pay::PaymentReference(880_123)));
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -878,19 +903,26 @@ fn a_substituted_transaction_fails_its_inclusion_proof() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let fetched = get(addr, &format!("/v1/transactions/{}", sent.id().to_hex()));
         let Response::Transaction(honest) = decode_exact::<Response>(&fetched.body).unwrap() else {
             panic!("expected a transaction response");
         };
 
-        // Rebuild the response with a different transaction and the real proof.
-        // The Merkle leaf is the transaction's own id, so this cannot survive.
+        // Rebuild the response with a different transaction and the real
+        // receipt. The Merkle leaf is the transaction's own id, so this cannot
+        // survive — and even if it could, the receipt names a different
+        // transaction, which is checked separately.
         let mut wire = vec![4u8]; // Response::Transaction
         honest.height().encode(&mut wire);
         honest.index_unverified().encode(&mut wire);
         1u32.encode(&mut wire);
         payment(9).encode(&mut wire);
+        Vec::<afrolink_crypto::hash::Hash32>::new().encode(&mut wire);
+        honest.receipt_unverified().encode(&mut wire);
         Vec::<afrolink_crypto::hash::Hash32>::new().encode(&mut wire);
 
         let forged = decode_exact::<Response>(&wire).unwrap();
@@ -901,8 +933,6 @@ fn a_substituted_transaction_fails_its_inclusion_proof() {
             forged.verify(&header).is_err(),
             "a substituted transaction must not verify"
         );
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -920,6 +950,9 @@ fn a_block_body_lets_a_client_check_it_received_all_of_it() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let fetched = get(addr, "/v1/blocks/1/transactions");
         assert_eq!(fetched.status, 200);
@@ -934,8 +967,6 @@ fn a_block_body_lets_a_client_check_it_received_all_of_it() {
             header.tx_root,
             "the body must reconstruct the root the header committed to"
         );
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -953,6 +984,9 @@ fn a_node_without_an_index_says_so_rather_than_reporting_no_payments() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
 
         let reply = get(
             addr,
@@ -964,8 +998,6 @@ fn a_node_without_an_index_says_so_rather_than_reporting_no_payments() {
             "{}",
             reply.text()
         );
-
-        handle.stop();
     });
 }
 
@@ -996,6 +1028,12 @@ impl afrolink_rpc::ChainView for Unindexed {
         &self,
         _height: Height,
     ) -> Result<Option<afrolink_executor::Block>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn receipts(
+        &self,
+        _height: Height,
+    ) -> Result<Option<Vec<afrolink_executor::TxReceipt>>, afrolink_rpc::QueryError> {
         Ok(None)
     }
     fn locate(
@@ -1077,6 +1115,7 @@ fn a_wallet_can_send_money_and_the_node_holds_it() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &node).unwrap());
+        let _stop = handle.clone().stop_on_drop();
 
         let sent = payment(0);
         let reply = post(addr, "/v1/transactions", &sent.to_bytes());
@@ -1092,8 +1131,6 @@ fn a_wallet_can_send_money_and_the_node_holds_it() {
         assert!(reply.text().contains("pending"), "{}", reply.text());
 
         assert!(node.lock().unwrap().is_pending(&sent.id()));
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -1110,6 +1147,7 @@ fn a_rejected_transaction_is_answered_with_a_reason_the_wallet_can_act_on() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &node).unwrap());
+        let _stop = handle.clone().stop_on_drop();
 
         // Signed for a different chain — the classic way a wallet pointed at
         // the wrong network loses money on other chains.
@@ -1128,8 +1166,6 @@ fn a_rejected_transaction_is_answered_with_a_reason_the_wallet_can_act_on() {
         assert_eq!(reply.status, 400, "{}", reply.text());
         assert!(reply.text().contains("chain"), "{}", reply.text());
         assert_eq!(node.lock().unwrap().pending(), 0);
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -1148,6 +1184,7 @@ fn a_transaction_with_trailing_bytes_is_refused() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| server.run(&view, &node).unwrap());
+        let _stop = handle.clone().stop_on_drop();
 
         let mut bytes = payment(0).to_bytes();
         bytes.push(0);
@@ -1156,8 +1193,6 @@ fn a_transaction_with_trailing_bytes_is_refused() {
         assert_eq!(reply.status, 400, "{}", reply.text());
         assert!(reply.text().contains("canonical"), "{}", reply.text());
         assert_eq!(node.lock().unwrap().pending(), 0);
-
-        handle.stop();
     });
 
     let _ = std::fs::remove_file(&path);
@@ -1180,4 +1215,277 @@ fn an_empty_submission_is_refused_before_it_reaches_the_node() {
         let reply = post(addr, "/v1/transactions", b"");
         assert_eq!(reply.status, 400, "{}", reply.text());
     });
+}
+
+// ---------------------------------------------------------------------------
+// The provable history chain
+// ---------------------------------------------------------------------------
+
+/// Genesis plus `count` blocks, each carrying one payment from 50 to 60.
+///
+/// Separate blocks on purpose: the walk crosses headers, which is where a
+/// wallet's work actually is.
+fn chain_with_payments(
+    name: &str,
+    count: u64,
+) -> (
+    std::path::PathBuf,
+    ChainStore,
+    MemoryStore,
+    Vec<afrolink_types::Transaction>,
+) {
+    use afrolink_executor::{Executor, ValidatorSets};
+
+    let (path, store, mut state, _client) = chain_on_disk(name);
+    let mut parent = store.block(Height::GENESIS).unwrap().unwrap();
+    let executor = Executor::new(chain());
+    let mut sent = Vec::new();
+
+    for nonce in 0..count {
+        let payment = payment(nonce);
+        let (block, outcome) = executor.build_block(
+            &mut state,
+            parent.header.height.next(),
+            Timestamp::from_millis(1_700_000_000_000 + (nonce + 1) * 1_000),
+            parent.header.id(),
+            vec![payment.clone()],
+            ValidatorSets::unchanged(&validators()),
+        );
+        assert_eq!(outcome.succeeded(), 1, "fixture payment {nonce} must apply");
+
+        let commit = commit_for(&block);
+        let receipts: Vec<afrolink_executor::TxReceipt> =
+            outcome.outcomes.iter().map(|o| o.receipt.clone()).collect();
+        store.put_block(&block, &commit, &receipts).unwrap();
+        sent.push(payment);
+        parent = block;
+    }
+    store.persist_state(&state).unwrap();
+
+    (path, store, state, sent)
+}
+
+/// Fetch a header and check its commit, the way a wallet would.
+fn verified_header(addr: SocketAddr, height: Height) -> afrolink_executor::BlockHeader {
+    let reply = get(addr, &format!("/v1/blocks/{}", height.0));
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let Response::Header(signed) = decode_exact::<Response>(&reply.body).unwrap() else {
+        panic!("expected a header response");
+    };
+    signed
+        .verify(&chain(), &validators())
+        .expect("the commit must carry a quorum");
+    signed.header
+}
+
+fn fetch_transaction(addr: SocketAddr, id: &afrolink_crypto::hash::Hash32) -> ProvedTransaction {
+    let reply = get(addr, &format!("/v1/transactions/{}", id.to_hex()));
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let Response::Transaction(proved) = decode_exact::<Response>(&reply.body).unwrap() else {
+        panic!("expected a transaction response");
+    };
+    *proved
+}
+
+#[test]
+fn a_wallet_walks_its_whole_history_and_knows_when_it_has_all_of_it() {
+    // The claim ADR-0014 could not make. Every link is committed: the account's
+    // pointer is in state, and each receipt is in `outcome_root`. Reaching the
+    // end means the history is complete, not merely that the server stopped.
+    let (path, store, state, sent) = chain_with_payments("walk", 3);
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
+
+        // The recipient's account record, proved against the tip.
+        let tip = verified_header(addr, Height(3));
+        let query = Query::Account {
+            address: account(60),
+        };
+        let reply = get(
+            addr,
+            &format!("/v1/accounts/{}", account(60).to_bech32().unwrap()),
+        );
+        let Response::Value(proved) = decode_exact::<Response>(&reply.body).unwrap() else {
+            panic!("expected a value response");
+        };
+        let client = afrolink_light::LightClient::new(chain(), validators(), tip.clone());
+        let bytes = proved
+            .verify(&client, &query.store_key().unwrap())
+            .unwrap()
+            .expect("the recipient has an account record");
+        let record = decode_exact::<afrolink_types::Account>(bytes).unwrap();
+
+        // Walk it.
+        let mut cursor = HistoryCursor::new(account(60), &record);
+        let mut walked = Vec::new();
+        while let Some(pointer) = cursor.next_pointer() {
+            let header = verified_header(addr, pointer.height);
+            let proved = fetch_transaction(addr, &pointer.tx_id);
+            let transaction = cursor.step(&proved, &header).expect("the chain must hold");
+            walked.push(transaction.id());
+        }
+
+        assert!(cursor.complete(), "the walk reached the end of the chain");
+        assert_eq!(cursor.seen(), 3);
+
+        // Newest first, and every payment accounted for.
+        let expected: Vec<_> = sent
+            .iter()
+            .rev()
+            .map(afrolink_types::Transaction::id)
+            .collect();
+        assert_eq!(walked, expected);
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_node_that_skips_a_payment_is_caught_rather_than_believed() {
+    // The attack ADR-0014 admitted it could not detect: hide one payment. With
+    // the chain committed, skipping a link means answering with a transaction
+    // the committed pointer did not name.
+    let (path, store, state, sent) = chain_with_payments("skip", 3);
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        // Stops the server even if an assertion below panics. Without it a
+        // failed test hangs in the scope's join rather than reporting.
+        let _stop = handle.clone().stop_on_drop();
+
+        let tip = verified_header(addr, Height(3));
+        let client = afrolink_light::LightClient::new(chain(), validators(), tip);
+        let query = Query::Account {
+            address: account(60),
+        };
+        let reply = get(
+            addr,
+            &format!("/v1/accounts/{}", account(60).to_bech32().unwrap()),
+        );
+        let Response::Value(proved) = decode_exact::<Response>(&reply.body).unwrap() else {
+            panic!("expected a value response");
+        };
+        let record = decode_exact::<afrolink_types::Account>(
+            proved
+                .verify(&client, &query.store_key().unwrap())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut cursor = HistoryCursor::new(account(60), &record);
+
+        // First step honestly, to reach the middle of the chain.
+        let pointer = cursor.next_pointer().unwrap();
+        let header = verified_header(addr, pointer.height);
+        cursor
+            .step(&fetch_transaction(addr, &pointer.tx_id), &header)
+            .unwrap();
+
+        // Now a hostile server skips the second payment and offers the first.
+        // Every proof it supplies is genuine — the transaction really is in its
+        // block. It is the *link* that fails.
+        let skipped_to = sent[0].id();
+        let pointer = cursor.next_pointer().unwrap();
+        assert_ne!(
+            pointer.tx_id, skipped_to,
+            "the fixture must actually skip one"
+        );
+
+        let substitute = fetch_transaction(addr, &skipped_to);
+        let substitute_header = verified_header(addr, Height(1));
+        let error = cursor.step(&substitute, &substitute_header).unwrap_err();
+
+        assert!(
+            matches!(error, afrolink_rpc::HistoryError::WrongHeight { .. }),
+            "a skipped link must not verify, got {error:?}"
+        );
+
+        // And the wallet knows it did not finish, which is the whole point: it
+        // shows an error rather than a short history.
+        assert!(!cursor.complete());
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_account_that_never_transacted_has_a_complete_empty_history() {
+    // A proved absence is a complete history of length zero. Distinguishing it
+    // from "the server declined" is the reason `complete()` exists.
+    let cursor = HistoryCursor::empty(account(77));
+    assert!(cursor.complete());
+    assert_eq!(cursor.seen(), 0);
+    assert_eq!(cursor.next_pointer(), None);
+}
+
+#[test]
+fn a_receipt_proves_a_failed_transaction_failed() {
+    // Without a committed outcome a node can claim your payment failed when it
+    // succeeded, or the reverse. The code is coarse on purpose — it names the
+    // subsystem that refused, not the detail — but it is committed.
+    use afrolink_executor::{Executor, ResultCode, ValidatorSets};
+
+    let (path, store, mut state, _client) = chain_on_disk("failed");
+    let genesis_block = store.block(Height::GENESIS).unwrap().unwrap();
+
+    // Account 60 has nothing, so its transfer cannot be funded.
+    let broke = afrolink_types::TxBody {
+        chain_id: chain(),
+        sender: account(60),
+        nonce: 0,
+        valid_until: Height(10_000),
+        fee: afrolink_types::Fee::new(Amount::ZERO, kes()),
+        messages: vec![afrolink_types::Message::Transfer {
+            to: account(50),
+            denom: kes(),
+            amount: Amount::from_afri(1_000_000),
+            reference: None,
+        }],
+        memo: String::new(),
+    }
+    .sign(&key(60));
+
+    let executor = Executor::new(chain());
+    let (block, outcome) = executor.build_block(
+        &mut state,
+        Height(1),
+        Timestamp::from_millis(1_700_000_001_000),
+        genesis_block.header.id(),
+        vec![broke.clone()],
+        ValidatorSets::unchanged(&validators()),
+    );
+    assert_eq!(outcome.succeeded(), 0, "the fixture payment must fail");
+
+    let receipt = &outcome.outcomes[0].receipt;
+    assert_eq!(receipt.code, ResultCode::Bank, "the bank refused it");
+    assert_eq!(
+        block.header.outcome_root,
+        outcome.outcome_root(),
+        "the header must commit to what happened, not only to what ran"
+    );
+
+    // A failed transfer moves the sender's history but not the recipient's:
+    // otherwise anyone could write into a stranger's history by failing to pay
+    // them.
+    let touched: Vec<_> = receipt.touched.iter().map(|t| t.address).collect();
+    assert!(touched.contains(&account(60)), "the sender paid a nonce");
+    assert!(
+        !touched.contains(&account(50)),
+        "a failed payment must not appear in the intended recipient's history"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }

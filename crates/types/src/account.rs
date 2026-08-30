@@ -7,7 +7,9 @@
 //! providers can read a contribution history without decoding somebody's bespoke
 //! contract storage.
 
+use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, PublicKey};
+use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 
 use crate::group::GroupAccount;
@@ -34,6 +36,19 @@ pub enum AccountKind {
     },
 }
 
+/// Where a transaction sits: its id, and the block that carried it.
+///
+/// The two travel together because either alone is useless — an id with no
+/// height means searching the chain, and a height with no id means trusting
+/// whoever answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxPointer {
+    /// The transaction's id.
+    pub tx_id: Hash32,
+    /// The block it was included in.
+    pub height: Height,
+}
+
 /// An account record as stored in state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -43,6 +58,21 @@ pub struct Account {
     pub nonce: u64,
     /// What kind of account this is.
     pub kind: AccountKind,
+    /// The last transaction to move this account's history pointer.
+    ///
+    /// **The head of a provable history chain.** This field is in state, so it
+    /// is committed to by `app_hash` and a client can prove it against a header
+    /// it trusts. That transaction's receipt names the account's *previous*
+    /// pointer, and so on backwards — an unbroken chain a server cannot open a
+    /// gap in, because a gap is a link that fails to verify.
+    ///
+    /// It is what turns the history index of
+    /// [ADR-0014](../../../docs/adr/0014-payment-history-and-the-mempool.md)
+    /// from a hint into something checkable. XRPL calls it `PreviousTxnID`
+    /// ([09](../../../docs/09-what-xrpl-answers.md) §2.1).
+    ///
+    /// `None` on an account that has never been party to a transaction.
+    pub last_txn: Option<TxPointer>,
 }
 
 impl Account {
@@ -53,6 +83,7 @@ impl Account {
             address,
             nonce: 0,
             kind: AccountKind::Individual { public_key: None },
+            last_txn: None,
         }
     }
 
@@ -65,6 +96,7 @@ impl Account {
             kind: AccountKind::Individual {
                 public_key: Some(public_key),
             },
+            last_txn: None,
         }
     }
 
@@ -75,6 +107,7 @@ impl Account {
             address,
             nonce: 0,
             kind: AccountKind::Group(Box::new(group)),
+            last_txn: None,
         }
     }
 
@@ -85,6 +118,7 @@ impl Account {
             address,
             nonce: 0,
             kind: AccountKind::Module { name: name.into() },
+            last_txn: None,
         }
     }
 
@@ -149,11 +183,28 @@ impl Decode for AccountKind {
     }
 }
 
+impl Encode for TxPointer {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.tx_id.encode(out);
+        self.height.encode(out);
+    }
+}
+
+impl Decode for TxPointer {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            tx_id: Hash32::decode(r)?,
+            height: Height::decode(r)?,
+        })
+    }
+}
+
 impl Encode for Account {
     fn encode(&self, out: &mut Vec<u8>) {
         self.address.encode(out);
         self.nonce.encode(out);
         self.kind.encode(out);
+        self.last_txn.encode(out);
     }
 }
 
@@ -163,6 +214,7 @@ impl Decode for Account {
             address: Address::decode(r)?,
             nonce: u64::decode(r)?,
             kind: AccountKind::decode(r)?,
+            last_txn: Option::<TxPointer>::decode(r)?,
         })
     }
 }

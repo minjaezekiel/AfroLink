@@ -5,7 +5,7 @@ use afrolink_consensus::{Commit, ValidatorSet};
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::merkle::{MerkleProof, leaf_hash};
-use afrolink_executor::{Block, BlockHeader};
+use afrolink_executor::{Block, BlockHeader, TxReceipt};
 use afrolink_light::{LightClient, LightError};
 use afrolink_primitives::codec::decode_exact;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
@@ -327,6 +327,22 @@ pub struct ProvedTransaction {
     total: u32,
     transaction: Transaction,
     siblings: Vec<Hash32>,
+    receipt: TxReceipt,
+    receipt_siblings: Vec<Hash32>,
+}
+
+/// What a verified [`ProvedTransaction`] yields: the transaction and what it did.
+///
+/// Both or neither. Returning them together is what stops a caller proving
+/// inclusion and then reading the receipt as though it had been proved too —
+/// the receipt is the half that carries the history links, so an unverified one
+/// is a chain an attacker chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvedEffects<'a> {
+    /// The transaction, proved against the header's `tx_root`.
+    pub transaction: &'a Transaction,
+    /// What it did, proved against the header's `outcome_root`.
+    pub receipt: &'a TxReceipt,
 }
 
 impl ProvedTransaction {
@@ -336,6 +352,8 @@ impl ProvedTransaction {
         total: u32,
         transaction: Transaction,
         siblings: Vec<Hash32>,
+        receipt: TxReceipt,
+        receipt_siblings: Vec<Hash32>,
     ) -> Self {
         Self {
             height,
@@ -343,6 +361,8 @@ impl ProvedTransaction {
             total,
             transaction,
             siblings,
+            receipt,
+            receipt_siblings,
         }
     }
 
@@ -369,24 +389,61 @@ impl ProvedTransaction {
     /// # Errors
     /// [`LightError::HeaderMismatch`] if the header is for another height, or
     /// [`LightError::BadProof`] if the proof does not reconstruct `tx_root`.
-    pub fn verify(&self, header: &BlockHeader) -> Result<&Transaction, LightError> {
+    pub fn verify(&self, header: &BlockHeader) -> Result<ProvedEffects<'_>, LightError> {
         if header.height != self.height {
             return Err(LightError::HeaderMismatch);
         }
-        let proof = MerkleProof {
-            index: self.index as usize,
-            total: self.total as usize,
-            siblings: self.siblings.clone(),
-        };
-        proof
-            .verify(
-                header.tx_root,
-                leaf_hash(self.transaction.id().as_bytes()),
-                self.index as usize,
-                self.total as usize,
-            )
-            .map_err(|_| LightError::BadProof)?;
-        Ok(&self.transaction)
+        let index = self.index as usize;
+        let total = self.total as usize;
+
+        self.check(
+            &self.siblings,
+            header.tx_root,
+            leaf_hash(self.transaction.id().as_bytes()),
+            index,
+            total,
+        )?;
+
+        // The two trees have the same leaves in the same order — one receipt per
+        // transaction, in execution order — so one position serves both. A
+        // receipt proved at a different index than its transaction would be a
+        // receipt for someone else's payment.
+        self.check(
+            &self.receipt_siblings,
+            header.outcome_root,
+            leaf_hash(&self.receipt.to_bytes()),
+            index,
+            total,
+        )?;
+
+        // The receipt must be about this transaction. Both proofs can succeed
+        // against a well-formed block while describing different rows if a
+        // server pairs them wrongly, and this is the check that catches it.
+        if self.receipt.tx_id != self.transaction.id() {
+            return Err(LightError::BadProof);
+        }
+
+        Ok(ProvedEffects {
+            transaction: &self.transaction,
+            receipt: &self.receipt,
+        })
+    }
+
+    fn check(
+        &self,
+        siblings: &[Hash32],
+        root: Hash32,
+        leaf: Hash32,
+        index: usize,
+        total: usize,
+    ) -> Result<(), LightError> {
+        MerkleProof {
+            index,
+            total,
+            siblings: siblings.to_vec(),
+        }
+        .verify(root, leaf, index, total)
+        .map_err(|_| LightError::BadProof)
     }
 
     /// Read the transaction without checking the proof.
@@ -395,6 +452,12 @@ impl ProvedTransaction {
     #[must_use]
     pub fn transaction_unverified(&self) -> &Transaction {
         &self.transaction
+    }
+
+    /// Read the receipt without checking the proof.
+    #[must_use]
+    pub fn receipt_unverified(&self) -> &TxReceipt {
+        &self.receipt
     }
 }
 
@@ -735,6 +798,8 @@ impl Encode for ProvedTransaction {
         self.total.encode(out);
         self.transaction.encode(out);
         self.siblings.encode(out);
+        self.receipt.encode(out);
+        self.receipt_siblings.encode(out);
     }
 }
 
@@ -746,6 +811,8 @@ impl Decode for ProvedTransaction {
             total: u32::decode(r)?,
             transaction: Transaction::decode(r)?,
             siblings: Vec::<Hash32>::decode(r)?,
+            receipt: TxReceipt::decode(r)?,
+            receipt_siblings: Vec::<Hash32>::decode(r)?,
         })
     }
 }

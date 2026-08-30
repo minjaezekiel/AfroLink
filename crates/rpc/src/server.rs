@@ -3,7 +3,8 @@
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::merkle::MerkleTree;
-use afrolink_executor::Block;
+use afrolink_executor::{Block, TxReceipt};
+use afrolink_primitives::codec::Encode;
 use afrolink_primitives::{ChainId, Height};
 use afrolink_state::{Proof, StoreKey};
 use afrolink_types::Transaction;
@@ -55,6 +56,15 @@ pub trait ChainView {
     /// # Errors
     /// Backend failures only; a pruned or future height is `Ok(None)`.
     fn block(&self, height: Height) -> Result<Option<Block>, QueryError>;
+
+    /// Execution receipts for a block, in execution order.
+    ///
+    /// Returns `Ok(None)` when this node does not keep them — the same
+    /// distinction as [`Self::history`]: not kept is not the same as empty.
+    ///
+    /// # Errors
+    /// Backend failures only.
+    fn receipts(&self, height: Height) -> Result<Option<Vec<TxReceipt>>, QueryError>;
 
     /// Where a transaction sits, as `(height, index)`.
     ///
@@ -193,12 +203,35 @@ pub fn answer<V: ChainView + ?Sized>(view: &V, query: &Query) -> Result<Response
                 .prove(index as usize)
                 .map_err(|e| QueryError::Backend(e.to_string()))?;
 
+            // The receipt is the half that carries the history links, so a node
+            // holding the block but not its receipts cannot answer this at all.
+            let receipts = view
+                .receipts(height)?
+                .ok_or(QueryError::NotIndexed("execution receipts"))?;
+            if receipts.len() != block.transactions.len() {
+                return Err(QueryError::Backend(format!(
+                    "block {height} has {} transactions and {} receipts",
+                    block.transactions.len(),
+                    receipts.len()
+                )));
+            }
+            let receipt = receipts
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| QueryError::Backend("receipt index out of range".into()))?;
+            let receipt_tree = MerkleTree::from_items(receipts.iter().map(Encode::to_bytes));
+            let receipt_proof = receipt_tree
+                .prove(index as usize)
+                .map_err(|e| QueryError::Backend(e.to_string()))?;
+
             Ok(Response::Transaction(Box::new(ProvedTransaction::new(
                 height,
                 index,
                 total,
                 transaction,
                 proof.siblings,
+                receipt,
+                receipt_proof.siblings,
             ))))
         }
         Query::History {
@@ -346,6 +379,12 @@ mod tests {
                 return Ok(None);
             }
             Ok(Some(self.block.clone()))
+        }
+
+        fn receipts(&self, _height: Height) -> Result<Option<Vec<TxReceipt>>, QueryError> {
+            // This fixture keeps no receipts, so `Query::Transaction` is
+            // unavailable on it — reported as such rather than as an empty list.
+            Ok(None)
         }
 
         fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>, QueryError> {

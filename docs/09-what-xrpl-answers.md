@@ -80,7 +80,7 @@ answers well, and it is the most valuable thing in this document.
 
 ## 2. What to take
 
-### 2.1 Provable history — the `PreviousTxnID` chain
+### 2.1 Provable history — the `PreviousTxnID` chain ✅ *built*
 
 **The problem.** [ADR-0014](adr/0014-payment-history-and-the-mempool.md) shipped
 a transaction index and was explicit that it is the first answer here that cannot
@@ -160,7 +160,7 @@ history is. Twelve years of production is a reasonable argument.
 committed structure for audit. The index answers instantly; the pointer chain is
 what you use when the answer matters.
 
-### 2.2 Commit execution outcomes — "your payment succeeded" as a proof
+### 2.2 Commit execution outcomes — "your payment succeeded" as a proof ✅ *built*
 
 Independently valuable, and a prerequisite for 2.1.
 
@@ -290,15 +290,16 @@ bootstrap set in [ADR-0011](adr/0011-objective-anchors.md).
 
 | # | Change | Cost | Why now |
 |---|---|---|---|
-| 1 | Commit `outcome_root` in the header | Consensus change; executor + light client | Unblocks 2, and makes "did it work?" provable on its own |
-| 2 | `last_txn` in the account record, previous pointers in outcomes | Consensus change; touch recipient records | **Closes ADR-0014's stated weakness** — history stops being a hint |
+| ~~1~~ | ~~Commit `outcome_root` in the header~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | |
+| ~~2~~ | ~~`last_txn` and previous pointers~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | ADR-0014's stated weakness is closed |
 | 3 | `RequireDestinationTag` account flag | Small; executor + account flags | Largest operational win per line of code |
 | 4 | Regular keys, master-key disable, signer lists | Large; new message types, account model | The real answer to recovery, and to §1 |
 | 5 | Fee escalation and a queue | Medium | When congestion is real, not before |
 | 6 | Retention with a named archive role | Large | When storage growth is measured, not assumed |
 
-1 and 2 are one project and should be done together: they change the header, so
-they are cheapest before there is a network carrying headers between machines.
+1 and 2 were one project and were done together, for the reason given: they
+change the header, so they were cheapest before a network carries headers
+between machines. 3 is next.
 
 ## Sources
 

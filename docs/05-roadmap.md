@@ -60,14 +60,13 @@ the transaction path is not.)*
 - [x] **Block size limits** — a consensus rule that was missing. Validators
       re-execute every proposal, so an unbounded block was unbounded work for
       the price of one message *(ADR-0014)*
-- [ ] **Committed execution outcomes** (`outcome_root` in the header) — today a
-      node can claim your transaction failed when it succeeded, and a phone
-      cannot check *([09](09-what-xrpl-answers.md) §2.2)*
-- [ ] **Provable history** — XRPL's `PreviousTxnID` chain: a committed
-      back-pointer per account, so a node omitting a payment from your history
-      produces a *broken chain* rather than an invisible gap. Closes the one
-      thing [ADR-0014](adr/0014-payment-history-and-the-mempool.md) could not
-      prove *([09](09-what-xrpl-answers.md) §2.1)*
+- [x] **Committed execution outcomes** — `outcome_root` in the header, so "your
+      payment succeeded" is a proof rather than a claim
+      *([ADR-0015](adr/0015-committed-outcomes-and-provable-history.md))*
+- [x] **Provable history** — a committed back-pointer per account, so a node
+      omitting a payment produces a *broken chain* rather than an invisible gap.
+      Closes the one thing [ADR-0014](adr/0014-payment-history-and-the-mempool.md)
+      could not prove *(ADR-0015)*
 - [ ] **`RequireDestinationTag`** as an enforced account flag — the largest
       operational win per line of code on this list *([09](09-what-xrpl-answers.md) §2.3)*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second

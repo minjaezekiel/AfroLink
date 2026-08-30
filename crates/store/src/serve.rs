@@ -12,7 +12,7 @@
 
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::Hash32;
-use afrolink_executor::Block;
+use afrolink_executor::{Block, TxReceipt};
 use afrolink_primitives::{ChainId, Height};
 use afrolink_rpc::{ChainView, HistoryEntry, QueryError, SignedHeader};
 use afrolink_state::{KeyValueStore, MemoryStore, Proof, StoreKey};
@@ -86,6 +86,10 @@ impl ChainView for ServedChain<'_> {
 
     fn block(&self, height: Height) -> Result<Option<Block>, QueryError> {
         self.store.block(height).map_err(|e| backend(&e))
+    }
+
+    fn receipts(&self, height: Height) -> Result<Option<Vec<TxReceipt>>, QueryError> {
+        self.store.receipts(height).map_err(|e| backend(&e))
     }
 
     fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>, QueryError> {
@@ -176,6 +180,11 @@ mod tests {
         Commit::new(block.header.height, Round::ZERO, block_id, signatures)
     }
 
+    /// The committed half of an execution — what a block's header commits to.
+    fn receipts(outcome: &afrolink_executor::BlockOutcome) -> Vec<TxReceipt> {
+        outcome.outcomes.iter().map(|o| o.receipt.clone()).collect()
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("afrolink-serve-{name}-{}.redb", std::process::id()));
@@ -208,11 +217,11 @@ mod tests {
         let mut state = MemoryStore::new();
         let genesis_block = genesis.apply(&mut state, GenesisLimits::devnet()).unwrap();
         store
-            .put_block(&genesis_block, &commit_for(&genesis_block))
+            .put_block(&genesis_block, &commit_for(&genesis_block), &[])
             .unwrap();
 
         let executor = Executor::new(chain());
-        let (tip, _) = executor.build_block(
+        let (tip, tip_outcome) = executor.build_block(
             &mut state,
             genesis_block.header.height.next(),
             Timestamp::from_millis(1_700_000_001_000),
@@ -221,7 +230,9 @@ mod tests {
             ValidatorSets::unchanged(&validators()),
         );
         let tip_commit = commit_for(&tip);
-        store.put_block(&tip, &tip_commit).unwrap();
+        store
+            .put_block(&tip, &tip_commit, &receipts(&tip_outcome))
+            .unwrap();
         store.persist_state(&state).unwrap();
 
         // The wallet starts at genesis — its only act of trust — and walks
@@ -376,7 +387,9 @@ mod tests {
         );
 
         let commit = commit_for(&block);
-        store.put_block(&block, &commit).unwrap();
+        store
+            .put_block(&block, &commit, &receipts(&outcome))
+            .unwrap();
         store.persist_state(state).unwrap();
         client
             .update(

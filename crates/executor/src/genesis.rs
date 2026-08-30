@@ -198,6 +198,10 @@ impl Genesis {
             parent: Hash32::ZERO,
             tx_root: Block::tx_root(&[]),
             app_hash: store.root(),
+            // Genesis runs no transactions, so it has no receipts. The empty
+            // Merkle root is a value, not a placeholder — a header must commit
+            // to "nothing happened" as definitely as to anything else.
+            outcome_root: afrolink_crypto::merkle::empty_root(),
             validators_hash,
             next_validators_hash: validators_hash,
         };
