@@ -105,7 +105,10 @@ against a node it does not trust. Every way of lying about the answer is a named
 test, and the one answer that *cannot* be proved says so in its own accessor's
 name ([ADR-0014](docs/adr/0014-payment-history-and-the-mempool.md)).
 Next: the peer-to-peer layer, to replace the in-process simulator with a real
-network. See **[docs/05-roadmap.md](docs/05-roadmap.md)**.
+network. See **[docs/05-roadmap.md](docs/05-roadmap.md)**, and
+**[docs/09](docs/09-what-xrpl-answers.md)** for what a fresh pass over the XRP
+Ledger says we should build next — including the one design that turns payment
+history from a hint a node could quietly truncate into something it cannot.
 
 ```bash
 cargo test --workspace
