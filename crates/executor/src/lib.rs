@@ -34,7 +34,9 @@
 pub mod block;
 pub mod genesis;
 
-pub use block::{Block, BlockContext, BlockHeader, ValidatorSets};
+pub use block::{
+    Block, BlockContext, BlockHeader, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSACTIONS, ValidatorSets,
+};
 pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
 
 use afrolink_alias::{BindError, Bindings, Registry, RegistryError};

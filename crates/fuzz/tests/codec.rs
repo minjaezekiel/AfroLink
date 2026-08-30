@@ -443,3 +443,126 @@ fn a_block_carrying_a_hostile_validator_set_still_decodes_canonically() {
     );
     hammer::<BlockHeader>("BlockHeader/committed-sets", &block.header, ROUNDS);
 }
+
+#[test]
+fn the_query_protocol_stays_canonical_under_attack() {
+    // These are the types a hostile *client* sends and a hostile *server*
+    // answers with — the only encodings on this chain that cross a socket in
+    // both directions. They were outside this suite until payment history
+    // added a reason to look.
+    use afrolink_rpc::{HistoryEntry, Query};
+
+    hammer::<Query>("Query/status", &Query::Status, ROUNDS);
+    hammer::<Query>(
+        "Query/header",
+        &Query::Header {
+            height: Height(4_711),
+        },
+        ROUNDS,
+    );
+    hammer::<Query>(
+        "Query/balance",
+        &Query::Balance {
+            address: addr(50),
+            denom: kes(),
+        },
+        ROUNDS,
+    );
+    hammer::<Query>(
+        "Query/transaction",
+        &Query::Transaction {
+            id: Hash32::from_bytes([3u8; 32]),
+        },
+        ROUNDS,
+    );
+    hammer::<Query>(
+        "Query/history",
+        &Query::History {
+            address: addr(50),
+            from: Height(9),
+            limit: 25,
+        },
+        ROUNDS,
+    );
+    hammer::<HistoryEntry>(
+        "HistoryEntry",
+        &HistoryEntry {
+            height: Height(12),
+            index: 3,
+            tx_id: Hash32::from_bytes([5u8; 32]),
+        },
+        ROUNDS,
+    );
+}
+
+#[test]
+fn a_history_answer_cannot_be_re_encoded_two_ways() {
+    // History is the one answer that carries no proof, so its *encoding* is the
+    // only thing keeping two clients from reading one reply differently.
+    use afrolink_rpc::{HistoryEntry, Query, Response, answer};
+
+    let (store, block) = genesis_block();
+    let view = Fixture { store, block };
+
+    let response = answer(
+        &view,
+        &Query::History {
+            address: addr(50),
+            from: Height::GENESIS,
+            limit: 10,
+        },
+    )
+    .expect("the fixture indexes history");
+    hammer::<Response>("Response/history", &response, ROUNDS);
+
+    // And an empty page, which is the shape a client sees most often.
+    let Response::History(history) = &response else {
+        panic!("expected a history response");
+    };
+    assert_eq!(history.entries_unverified(), &[] as &[HistoryEntry]);
+}
+
+/// The smallest `ChainView` that answers the history and block queries.
+struct Fixture {
+    store: MemoryStore,
+    block: Block,
+}
+
+impl afrolink_rpc::ChainView for Fixture {
+    fn chain_id(&self) -> &ChainId {
+        static ID: std::sync::OnceLock<ChainId> = std::sync::OnceLock::new();
+        ID.get_or_init(chain)
+    }
+    fn tip_height(&self) -> Result<Height, afrolink_rpc::QueryError> {
+        Ok(self.block.header.height)
+    }
+    fn signed_header(
+        &self,
+        _height: Height,
+    ) -> Result<Option<afrolink_rpc::SignedHeader>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn prove(
+        &self,
+        key: &afrolink_state::StoreKey,
+    ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
+        Ok(self.store.get_with_proof(key))
+    }
+    fn block(&self, height: Height) -> Result<Option<Block>, afrolink_rpc::QueryError> {
+        if height == self.block.header.height {
+            return Ok(Some(self.block.clone()));
+        }
+        Ok(None)
+    }
+    fn locate(&self, _id: &Hash32) -> Result<Option<(Height, u32)>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn history(
+        &self,
+        _address: &Address,
+        _from: Height,
+        _limit: usize,
+    ) -> Result<Option<(Vec<afrolink_rpc::HistoryEntry>, bool)>, afrolink_rpc::QueryError> {
+        Ok(Some((Vec::new(), false)))
+    }
+}

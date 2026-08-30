@@ -48,12 +48,15 @@ pub mod serve;
 pub use serve::ServedChain;
 
 use afrolink_consensus::Commit;
+use afrolink_crypto::Address;
+use afrolink_crypto::address::ADDRESS_LEN;
 use afrolink_crypto::hash::Hash32;
 use afrolink_executor::{Block, BlockContext, Executor, Genesis, GenesisError, GenesisLimits};
 use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Encode, decode_exact};
 use afrolink_state::nodes::{Node, NodeSink, NodeSource, WriteStats, commit_tree, load_tree};
 use afrolink_state::{KeyValueStore, MemoryStore};
+use afrolink_types::Transaction;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 use thiserror::Error;
@@ -66,6 +69,18 @@ const COMMITS: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("commits")
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 /// State tree nodes, keyed by their own hash (ADR-0006).
 const NODES: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("nodes");
+/// Where a transaction lives: its id to `(height, index)`.
+///
+/// Answers "look up this payment by its hash", which is the first thing anyone
+/// integrating a chain asks for.
+const TX_LOCATION: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("tx_location");
+/// A transaction's id, keyed by `address ‖ height ‖ index`, all big-endian.
+///
+/// Big-endian on purpose: redb orders `&[u8]` keys lexicographically, so a
+/// big-endian height makes byte order equal chronological order, and one range
+/// scan over an address prefix returns that account's history oldest-first with
+/// no sorting. Little-endian would interleave heights arbitrarily.
+const TX_BY_ADDRESS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("tx_by_address");
 
 const KEY_GENESIS: &str = "genesis";
 const KEY_HEIGHT: &str = "height";
@@ -122,6 +137,34 @@ fn corrupt(what: &str, e: &CodecError) -> StoreError {
     }
 }
 
+/// A page of an account's history: where each transaction is, and whether the
+/// scan stopped at the caller's limit rather than at the end.
+pub type HistoryPage = (Vec<(Height, u32, Hash32)>, bool);
+
+/// `height ‖ index`, big-endian: the value side of [`TX_LOCATION`].
+fn tx_location(height: u64, index: u32) -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[..8].copy_from_slice(&height.to_be_bytes());
+    key[8..].copy_from_slice(&index.to_be_bytes());
+    key
+}
+
+/// Width of a history key: an address, a height and a position.
+const HISTORY_KEY_LEN: usize = ADDRESS_LEN + 8 + 4;
+
+/// `address ‖ height ‖ index`, big-endian: the key side of [`TX_BY_ADDRESS`].
+///
+/// Fixed width at every position, so one address's keys form a contiguous range
+/// that no other address can fall inside. A variable-width prefix here would let
+/// one account's history bleed into another's on a range scan.
+fn history_key(address: &Address, height: u64, index: u32) -> [u8; HISTORY_KEY_LEN] {
+    let mut key = [0u8; HISTORY_KEY_LEN];
+    key[..ADDRESS_LEN].copy_from_slice(address.as_bytes());
+    key[ADDRESS_LEN..ADDRESS_LEN + 8].copy_from_slice(&height.to_be_bytes());
+    key[ADDRESS_LEN + 8..].copy_from_slice(&index.to_be_bytes());
+    key
+}
+
 /// Durable storage for blocks, commits and genesis.
 pub struct ChainStore {
     db: Database,
@@ -143,6 +186,8 @@ impl ChainStore {
             tx.open_table(COMMITS).map_err(db_err)?;
             tx.open_table(META).map_err(db_err)?;
             tx.open_table(NODES).map_err(db_err)?;
+            tx.open_table(TX_LOCATION).map_err(db_err)?;
+            tx.open_table(TX_BY_ADDRESS).map_err(db_err)?;
         }
         tx.commit().map_err(db_err)?;
         Ok(Self { db })
@@ -178,12 +223,14 @@ impl ChainStore {
             .map_err(|e| corrupt("genesis", &e))
     }
 
-    /// Store a block and its commit certificate atomically.
+    /// Store a block, its commit certificate and its history index, atomically.
     ///
-    /// Both land in one write transaction: a block whose certificate is missing
-    /// cannot be served to a light client, and a certificate without its block
-    /// proves nothing, so a partial write would leave the store unable to answer
-    /// for that height.
+    /// All of it lands in one write transaction: a block whose certificate is
+    /// missing cannot be served to a light client, and a certificate without its
+    /// block proves nothing, so a partial write would leave the store unable to
+    /// answer for that height. The index joins them for the same reason — a
+    /// block that is present but unindexed reads to a wallet as *"you received
+    /// nothing"*, which is the most damaging thing a partial write could say.
     ///
     /// # Errors
     /// Returns [`StoreError::Database`] on write failure.
@@ -200,6 +247,36 @@ impl ChainStore {
             commits
                 .insert(height, commit.to_bytes().as_slice())
                 .map_err(db_err)?;
+
+            let mut location = tx.open_table(TX_LOCATION).map_err(db_err)?;
+            let mut by_address = tx.open_table(TX_BY_ADDRESS).map_err(db_err)?;
+            for (index, transaction) in block.transactions.iter().enumerate() {
+                // A block cannot hold more transactions than a `u32` counts —
+                // `MAX_BLOCK_TRANSACTIONS` is four orders of magnitude below it
+                // — but the index key has a fixed width, so the conversion is
+                // checked rather than assumed.
+                let Ok(index) = u32::try_from(index) else {
+                    return Err(StoreError::Corrupt {
+                        what: format!("block {height}"),
+                        reason: "more transactions than a u32 can index".to_owned(),
+                    });
+                };
+                let id = transaction.id();
+                location
+                    .insert(
+                        id.as_bytes().as_slice(),
+                        tx_location(height, index).as_slice(),
+                    )
+                    .map_err(db_err)?;
+                for address in transaction.touched_addresses() {
+                    by_address
+                        .insert(
+                            history_key(&address, height, index).as_slice(),
+                            id.as_bytes().as_slice(),
+                        )
+                        .map_err(db_err)?;
+                }
+            }
 
             let mut meta = tx.open_table(META).map_err(db_err)?;
             let current = meta
@@ -256,6 +333,115 @@ impl ChainStore {
         decode_exact::<Commit>(raw.value())
             .map(Some)
             .map_err(|e| corrupt(&format!("commit {height}"), &e))
+    }
+
+    /// Find a transaction by its id, with the block and position it sits at.
+    ///
+    /// The position matters as much as the transaction: it is what an inclusion
+    /// proof against the header's `tx_root` is computed at, so returning one
+    /// without the other would hand a caller something it cannot verify.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] if the index or the block does not decode.
+    pub fn transaction(&self, id: &Hash32) -> Result<Option<(Height, u32, Transaction)>> {
+        let Some((height, index)) = self.locate(id)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.block(height)? else {
+            // The index named a block this store does not have. That is
+            // corruption, not absence: reporting "not found" would hide it.
+            return Err(StoreError::Corrupt {
+                what: format!("tx index for {id}"),
+                reason: format!("points at block {height}, which is missing"),
+            });
+        };
+        let Some(transaction) = block.transactions.get(index as usize).cloned() else {
+            return Err(StoreError::Corrupt {
+                what: format!("tx index for {id}"),
+                reason: format!("points at position {index} in block {height}, which is shorter"),
+            });
+        };
+        Ok(Some((height, index, transaction)))
+    }
+
+    /// Where a transaction lives, without loading its block.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] if the index entry is not 12 bytes.
+    pub fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let table = tx.open_table(TX_LOCATION).map_err(db_err)?;
+        let Some(raw) = table.get(id.as_bytes().as_slice()).map_err(db_err)? else {
+            return Ok(None);
+        };
+        let value = raw.value();
+        let (Some(height), Some(index)) = (
+            value.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()),
+            value.get(8..12).and_then(|b| <[u8; 4]>::try_from(b).ok()),
+        ) else {
+            return Err(StoreError::Corrupt {
+                what: format!("tx location for {id}"),
+                reason: format!("expected 12 bytes, found {}", value.len()),
+            });
+        };
+        Ok(Some((
+            Height(u64::from_be_bytes(height)),
+            u32::from_be_bytes(index),
+        )))
+    }
+
+    /// An account's transactions, oldest first, starting at `from`.
+    ///
+    /// Returns at most `limit` entries. The boolean is `true` when the scan
+    /// stopped because it hit `limit` rather than because it ran out — a caller
+    /// paging through history needs to tell those apart, and a bare list cannot
+    /// say which happened.
+    ///
+    /// **This is an index, not consensus state.** See
+    /// [`History`](afrolink_rpc::History) for what that means for a client that
+    /// does not trust this node.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] if an index entry is malformed.
+    pub fn history(&self, address: &Address, from: Height, limit: usize) -> Result<HistoryPage> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let table = tx.open_table(TX_BY_ADDRESS).map_err(db_err)?;
+
+        let start = history_key(address, from.0, 0);
+        let end = history_key(address, u64::MAX, u32::MAX);
+        let mut out = Vec::new();
+        let mut truncated = false;
+
+        for entry in table
+            .range(start.as_slice()..=end.as_slice())
+            .map_err(db_err)?
+        {
+            let (key, value) = entry.map_err(db_err)?;
+            if out.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let key = key.value();
+            let (Some(height), Some(index), Some(id)) = (
+                key.get(ADDRESS_LEN..ADDRESS_LEN + 8)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok()),
+                key.get(ADDRESS_LEN + 8..HISTORY_KEY_LEN)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok()),
+                <[u8; 32]>::try_from(value.value()).ok(),
+            ) else {
+                return Err(StoreError::Corrupt {
+                    what: format!("history index for {address}"),
+                    reason: "index entry has the wrong shape".to_owned(),
+                });
+            };
+            out.push((
+                Height(u64::from_be_bytes(height)),
+                u32::from_be_bytes(index),
+                Hash32::from_bytes(id),
+            ));
+        }
+
+        Ok((out, truncated))
     }
 
     /// Rebuild state by applying genesis and replaying every stored block.
@@ -440,6 +626,7 @@ mod tests {
     use afrolink_executor::{Allocation, ValidatorSets};
     use afrolink_primitives::{Amount, ChainId, Denom, Round, Timestamp};
     use afrolink_state::KeyValueStore;
+    use afrolink_types::Transaction;
     use std::path::PathBuf;
 
     /// A temporary database path that cleans itself up.
@@ -560,6 +747,209 @@ mod tests {
             parent = block;
         }
         (temp, state)
+    }
+
+    // -- The history index ---------------------------------------------------
+
+    /// A signed payment from account 50 to `to`, at `nonce`.
+    fn payment(nonce: u64, to: Address) -> Transaction {
+        use afrolink_types::{Fee, Message, TxBody};
+
+        TxBody {
+            chain_id: chain(),
+            sender: addr(50),
+            nonce,
+            valid_until: Height(10_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages: vec![Message::Transfer {
+                to,
+                denom: kes(),
+                amount: Amount::from_afri(1),
+                reference: None,
+            }],
+            memo: String::new(),
+        }
+        .sign(&key(50))
+    }
+
+    /// A block carrying `transactions`, with a quorum commit.
+    fn block_with(
+        state: &mut MemoryStore,
+        parent: &Block,
+        transactions: Vec<Transaction>,
+    ) -> (Block, Commit) {
+        let executor = Executor::new(chain());
+        let height = parent.header.height.next();
+        let (block, _) = executor.build_block(
+            state,
+            height,
+            Timestamp::from_millis(1_700_000_000_000 + height.0 * 1_000),
+            parent.header.id(),
+            transactions,
+            ValidatorSets::unchanged(&validators()),
+        );
+        let block_id = block.header.id();
+        let signatures = (1..=3u8)
+            .map(|s| {
+                Vote {
+                    chain_id: chain(),
+                    height,
+                    round: Round::ZERO,
+                    vote_type: VoteType::Precommit,
+                    block_id: Some(block_id),
+                    validator: addr(s),
+                }
+                .sign(&key(s))
+            })
+            .collect();
+        (
+            block.clone(),
+            Commit::new(height, Round::ZERO, block_id, signatures),
+        )
+    }
+
+    /// Genesis plus one block holding `transactions`.
+    fn indexed(tag: &str, transactions: Vec<Transaction>) -> (TempDb, ChainStore) {
+        let temp = TempDb::new(tag);
+        let store = ChainStore::open(temp.path()).expect("opens");
+        let g = genesis();
+        store.put_genesis(&g).expect("stores genesis");
+
+        let mut state = MemoryStore::new();
+        let parent = g
+            .apply(&mut state, GenesisLimits::devnet())
+            .expect("applies");
+        store
+            .put_block(&parent, &next_block(&mut state.clone(), &parent).1)
+            .ok();
+
+        let (block, commit) = block_with(&mut state, &parent, transactions);
+        store.put_block(&block, &commit).expect("stores block");
+        (temp, store)
+    }
+
+    #[test]
+    fn a_transaction_can_be_found_by_its_own_id() {
+        let sent = payment(0, addr(60));
+        let (_temp, store) = indexed("locate", vec![sent.clone()]);
+
+        let (height, index) = store.locate(&sent.id()).expect("reads").expect("indexed");
+        assert_eq!(height, Height(1));
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn an_unknown_id_is_absent_rather_than_an_error() {
+        let (_temp, store) = indexed("missing", Vec::new());
+        assert_eq!(
+            store.locate(&Hash32::from_bytes([9; 32])).expect("reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_payment_appears_in_the_recipients_history_too() {
+        // The whole point: the recipient did not send the transaction and has
+        // no way to know its id, so if the index filed it under the sender only,
+        // an incoming payment would be invisible.
+        let sent = payment(0, addr(60));
+        let (_temp, store) = indexed("recipient", vec![sent.clone()]);
+
+        let (entries, _) = store
+            .history(&addr(60), Height::GENESIS, 10)
+            .expect("reads");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, sent.id());
+
+        let (sender, _) = store
+            .history(&addr(50), Height::GENESIS, 10)
+            .expect("reads");
+        assert_eq!(sender.len(), 1, "the sender sees it as well");
+    }
+
+    #[test]
+    fn history_comes_back_oldest_first() {
+        // Byte order equals chronological order only because the key encodes
+        // height big-endian. Little-endian would interleave these arbitrarily.
+        let sent: Vec<Transaction> = (0..4).map(|n| payment(n, addr(60))).collect();
+        let (_temp, store) = indexed("ordered", sent.clone());
+
+        let (entries, truncated) = store
+            .history(&addr(50), Height::GENESIS, 100)
+            .expect("reads");
+
+        assert!(!truncated);
+        assert_eq!(entries.len(), 4);
+        let ids: Vec<Hash32> = entries.iter().map(|e| e.2).collect();
+        assert_eq!(ids, sent.iter().map(Transaction::id).collect::<Vec<_>>());
+        assert!(
+            entries
+                .windows(2)
+                .all(|w| (w[0].0, w[0].1) <= (w[1].0, w[1].1))
+        );
+    }
+
+    #[test]
+    fn a_truncated_page_says_so() {
+        // A caller that cannot tell "these are all" from "these are the first
+        // few" will silently drop the rest of a busy account's history.
+        let sent: Vec<Transaction> = (0..5).map(|n| payment(n, addr(60))).collect();
+        let (_temp, store) = indexed("paged", sent);
+
+        let (entries, truncated) = store.history(&addr(50), Height::GENESIS, 2).expect("reads");
+        assert_eq!(entries.len(), 2);
+        assert!(truncated, "the scan stopped at the limit, not at the end");
+    }
+
+    #[test]
+    fn one_accounts_history_cannot_bleed_into_another() {
+        // The index key is `address ‖ height ‖ index` with every part fixed
+        // width, so one address's range cannot contain another's. A
+        // variable-width prefix here is how that goes wrong.
+        let sent = payment(0, addr(60));
+        let (_temp, store) = indexed("isolated", vec![sent]);
+
+        let (stranger, _) = store
+            .history(&addr(77), Height::GENESIS, 10)
+            .expect("reads");
+        assert!(stranger.is_empty());
+    }
+
+    #[test]
+    fn history_can_resume_from_a_height() {
+        let sent: Vec<Transaction> = (0..3).map(|n| payment(n, addr(60))).collect();
+        let (_temp, store) = indexed("resume", sent);
+
+        // Everything is in block 1, so resuming at 2 finds nothing — and that
+        // is an empty page, not an error.
+        let (entries, _) = store.history(&addr(50), Height(2), 10).expect("reads");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn the_index_survives_a_reopen() {
+        // It is written in the block's own transaction, so it cannot be present
+        // in memory and absent on disk.
+        let sent = payment(0, addr(60));
+        let temp = TempDb::new("reopen-index");
+        {
+            let store = ChainStore::open(temp.path()).expect("opens");
+            let g = genesis();
+            store.put_genesis(&g).expect("stores genesis");
+            let mut state = MemoryStore::new();
+            let parent = g
+                .apply(&mut state, GenesisLimits::devnet())
+                .expect("applies");
+            let (block, commit) = block_with(&mut state, &parent, vec![sent.clone()]);
+            store.put_block(&block, &commit).expect("stores block");
+        }
+
+        let reopened = ChainStore::open(temp.path()).expect("reopens");
+        assert!(reopened.locate(&sent.id()).expect("reads").is_some());
+        let (entries, _) = reopened
+            .history(&addr(60), Height::GENESIS, 10)
+            .expect("reads");
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

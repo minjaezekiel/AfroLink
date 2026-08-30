@@ -11,6 +11,7 @@ description = "The proof-carrying query protocol: every state answer arrives wit
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
+afrolink-types.workspace = true
 afrolink-state.workspace = true
 afrolink-consensus.workspace = true
 afrolink-executor.workspace = true

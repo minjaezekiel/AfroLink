@@ -18,6 +18,7 @@ afrolink-types = { path = "crates/types" }
 afrolink-bank = { path = "crates/bank" }
 afrolink-executor = { path = "crates/executor" }
 afrolink-consensus = { path = "crates/consensus" }
+afrolink-node = { path = "crates/node" }
 afrolink-light = { path = "crates/light" }
 afrolink-store = { path = "crates/store" }
 afrolink-rpc = { path = "crates/rpc" }

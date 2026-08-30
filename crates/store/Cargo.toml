@@ -15,12 +15,14 @@ afrolink-state.workspace = true
 afrolink-consensus.workspace = true
 afrolink-executor.workspace = true
 afrolink-rpc.workspace = true
+# The history index files transactions by every address they touch, so the
+# store has to know what a transaction is.
+afrolink-types.workspace = true
 redb.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 afrolink-bank.workspace = true
-afrolink-types.workspace = true
 afrolink-light.workspace = true
 afrolink-alias.workspace = true
 

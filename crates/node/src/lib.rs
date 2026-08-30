@@ -31,10 +31,14 @@
     )
 )]
 
+pub mod mempool;
 pub mod proposal;
+pub mod service;
 pub mod sim;
 
+pub use mempool::{Mempool, MempoolLimits, Rejected};
 pub use proposal::{Proposal, SignedProposal};
+pub use service::SharedNode;
 
 use afrolink_consensus::{
     Commit, Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet, VoteType,
@@ -43,8 +47,8 @@ use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{Block, BlockContext, Executor, ValidatorSets};
 use afrolink_primitives::{ChainId, Height, Round, Timestamp};
-use afrolink_state::{KeyValueStore, MemoryStore};
-use afrolink_types::Transaction;
+use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
+use afrolink_types::{Account, Transaction};
 use std::collections::BTreeMap;
 
 /// Something that happened to the node.
@@ -54,6 +58,11 @@ pub enum Event {
     Proposal(Box<SignedProposal>),
     /// A vote arrived.
     Vote(Box<SignedVote>),
+    /// A transaction was submitted, by a client or a peer.
+    ///
+    /// Boxed like the others: an enum is as large as its widest variant, and
+    /// this one carries a whole signed transaction.
+    Transaction(Box<Transaction>),
     /// A step's timer expired.
     Timeout(Step),
 }
@@ -65,6 +74,12 @@ pub enum Action {
     BroadcastProposal(Box<SignedProposal>),
     /// Broadcast this vote to peers.
     BroadcastVote(Box<SignedVote>),
+    /// Relay this transaction to peers.
+    ///
+    /// Emitted only when the transaction was *newly* accepted, never when it
+    /// was already held. Re-broadcasting what we already had is how a gossip
+    /// network amplifies one submission into a storm.
+    BroadcastTransaction(Box<Transaction>),
     /// A block was committed. The height is final.
     ///
     /// Carries the commit certificate alongside the block: those precommit
@@ -73,6 +88,18 @@ pub enum Action {
     Committed(Box<Block>, Box<Commit>),
     /// Start a timer for this step.
     ScheduleTimeout(Step, Round),
+}
+
+/// An account's next expected nonce, or zero if it has never transacted.
+///
+/// A free function rather than a method so a selection closure can borrow the
+/// store without borrowing the whole node.
+fn next_nonce(store: &MemoryStore, address: &Address) -> u64 {
+    store
+        .get_decoded::<Account>(&StoreKey::account(address))
+        .ok()
+        .flatten()
+        .map_or(0, |account| account.nonce)
 }
 
 /// A validator node.
@@ -93,7 +120,12 @@ pub struct Node {
     precommits: BTreeMap<Round, VoteSet>,
 
     /// Transactions waiting to be proposed.
-    pub mempool: Vec<Transaction>,
+    ///
+    /// Private, and reachable only through [`Node::submit`], which validates.
+    /// It used to be a `pub Vec` that anyone could push to — harmless while the
+    /// only caller was a test in the same process, and a remote denial of
+    /// service the moment a socket exists.
+    mempool: Mempool,
     /// Blocks committed by this node, in order.
     pub committed: Vec<Block>,
     /// The certificate for the most recently committed block.
@@ -127,7 +159,7 @@ impl Node {
             proposals: BTreeMap::new(),
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
-            mempool: Vec::new(),
+            mempool: Mempool::new(MempoolLimits::default()),
             committed: Vec::new(),
             last_commit: None,
             decided: false,
@@ -152,6 +184,40 @@ impl Node {
         self.store.root()
     }
 
+    /// Offer a transaction to this node's mempool.
+    ///
+    /// The only way in. Validation happens here — signature, chain, expiry, and
+    /// the sender's committed nonce — so nothing unvalidated is ever held, and a
+    /// caller learns *why* a transaction was refused rather than only that it
+    /// was.
+    ///
+    /// Returns the accepted transaction so a caller can relay it without having
+    /// kept a copy.
+    ///
+    /// # Errors
+    /// Returns the [`Rejected`] reason.
+    pub fn submit(&mut self, transaction: Transaction) -> Result<Transaction, Rejected> {
+        let next = next_nonce(&self.store, &transaction.body.sender);
+        let echo = transaction.clone();
+        self.mempool
+            .insert(transaction, &self.chain_id, self.height, next)?;
+        Ok(echo)
+    }
+
+    /// How many transactions are waiting.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.mempool.len()
+    }
+
+    /// Whether a transaction is waiting, by id.
+    ///
+    /// What a wallet asks between submitting a payment and seeing it in a block.
+    #[must_use]
+    pub fn is_pending(&self, id: &Hash32) -> bool {
+        self.mempool.contains(id)
+    }
+
     /// Read-only access to state, for queries and proofs.
     #[must_use]
     pub fn store(&self) -> &MemoryStore {
@@ -172,7 +238,10 @@ impl Node {
         let mut actions = Vec::new();
 
         if self.is_proposer(round) {
-            let transactions = core::mem::take(&mut self.mempool);
+            // Selected, not drained. A round that does not commit is ordinary,
+            // and taking the transactions here would lose every one of them.
+            let store = &self.store;
+            let transactions = self.mempool.select(|address| next_nonce(store, address));
 
             // Re-propose a value that already has support rather than replacing
             // it, or the network may never converge.
@@ -227,6 +296,13 @@ impl Node {
         match event {
             Event::Proposal(p) => self.on_proposal(*p),
             Event::Vote(v) => self.on_vote(*v),
+            Event::Transaction(t) => match self.submit(*t) {
+                Ok(transaction) => vec![Action::BroadcastTransaction(Box::new(transaction))],
+                // A refused transaction is not an error the node acts on — the
+                // submitter is told through `submit`, and a peer that sent us
+                // junk gets nothing back to amplify.
+                Err(_) => Vec::new(),
+            },
             Event::Timeout(step) => self.on_timeout(step),
         }
     }
@@ -272,6 +348,13 @@ impl Node {
             || block.header.chain_id != self.chain_id
             || !block.tx_root_matches()
         {
+            return false;
+        }
+        // Before executing, not after. A proposer is *entitled* to propose, so
+        // no signature or stake check stops it making the whole network execute
+        // an arbitrarily large block — the size limit is the only thing that
+        // does, and it is worth nothing if the work happens first.
+        if !block.within_size_limits() {
             return false;
         }
         let mut trial = self.store.clone();
@@ -385,6 +468,12 @@ impl Node {
             },
             &block.transactions,
         );
+
+        // Everything in this block is spent, and anything that can no longer be
+        // included is dead weight. Both happen here, once, on the one path that
+        // is reached exactly when a height is final.
+        self.mempool.remove_committed(&block.transactions);
+        self.mempool.evict_expired(self.height.next());
 
         self.decided = true;
         self.committed.push(block.clone());

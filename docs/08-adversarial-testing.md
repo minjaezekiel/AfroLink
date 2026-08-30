@@ -22,7 +22,8 @@ a `proptest` or `cargo-fuzz` dependency — the same reason the codec is not ser
 
 ### 1. `crates/fuzz/tests/codec.rs` — bytes from a hostile peer
 
-~140 000 inputs across 35 decoders, plus ~45 000 forged proofs. Three properties:
+~210 000 inputs across 53 decoder fixtures, plus ~45 000 forged proofs. Three
+properties:
 
 | Property | What it prevents |
 |---|---|
@@ -60,6 +61,11 @@ targets. That is the codec's rule, *one reading per byte string*, applied to a
 much older and much messier format. `crates/http/tests/serving.rs` then checks
 the refusals survive contact with a real socket, a thread pool and a keep-alive
 connection, which is where a parser's guarantees usually leak.
+
+The `Query` and `Response` types joined the codec suite at the same time as
+[ADR-0014](adr/0014-payment-history-and-the-mempool.md). They are the only
+encodings on this chain that cross a socket in **both** directions, and they had
+been outside it.
 
 ### 3. `crates/node/tests/adversarial.rs` — a hostile scheduler
 
@@ -144,6 +150,15 @@ trust the proof's own fields.
 **Fixed:** both `verify` methods now take the expected position and sizes as
 parameters, so no caller has to remember.
 
+**The caller that was anticipated here has since arrived**, and the note held
+up. [`ProvedTransaction`](../crates/rpc/src/query.rs) serves exactly *"your
+payment is in block N"*. Inclusion is proved — the leaf is the transaction's own
+id, so a substitution fails — but the verifier knows only the root and the id,
+never the position, so `index` and `total` are still prover-chosen. That is
+stated in the type's own documentation rather than left for a caller to
+discover, and a client that needs the position verified fetches the block and
+recomputes the root itself.
+
 ### 5. The same defect again, at a new boundary
 
 Not a sixth defect so much as the first one turning up somewhere else, which is
@@ -201,6 +216,15 @@ Named gaps, so they are not mistaken for coverage:
 - **The executor is not fuzzed against semantic invariants** — supply
   conservation under arbitrary transaction sequences is the obvious next
   property, and it is not written yet.
+- **History cannot be verified at all**, by anyone. A node that omits an entry
+  is not caught by any test here, because there is nothing to catch it *with*:
+  the index is not consensus state and no header commits to it
+  ([ADR-0014](adr/0014-payment-history-and-the-mempool.md)). What is tested is
+  the weaker property that every entry is *checkable* — the id turns into an
+  inclusion proof, and a substituted transaction fails it.
+- **The mempool is not fuzzed.** Its limits are unit-tested and its insert path
+  runs full stateless verification, but nobody has thrown a hostile sequence of
+  submissions at it under the scheduler.
 
 ## Where this goes
 

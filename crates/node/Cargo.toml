@@ -15,6 +15,9 @@ afrolink-state.workspace = true
 afrolink-types.workspace = true
 afrolink-bank.workspace = true
 afrolink-executor.workspace = true
+# Protocol types only — `Submit`, so a transport can hand this node a
+# transaction. No networking and no runtime come with it. See src/service.rs.
+afrolink-rpc.workspace = true
 afrolink-consensus.workspace = true
 thiserror.workspace = true
 

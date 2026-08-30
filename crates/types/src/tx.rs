@@ -389,6 +389,70 @@ impl Transaction {
         hash(Domain::TxId, &self.to_bytes())
     }
 
+    /// Every address a node should file this transaction under.
+    ///
+    /// This is the input to a node's history index — the thing that turns
+    /// *"prove my balance"* into *"show me my payments"*. It is deliberately
+    /// **not** consensus state: an index is a node's private convenience, and
+    /// nothing in the protocol depends on two nodes agreeing about it.
+    ///
+    /// # Why the match is exhaustive
+    ///
+    /// A new [`Message`] variant that moves value must not silently become
+    /// invisible to the recipient's wallet. Writing this as an exhaustive match
+    /// rather than a set of `if let`s means adding a variant fails to compile
+    /// until someone decides who should see it.
+    ///
+    /// The sender is always included: they need their own history whether or not
+    /// a message names anyone else.
+    ///
+    /// Duplicates are removed, and the order is deterministic, so two nodes
+    /// building the same index write the same keys.
+    #[must_use]
+    pub fn touched_addresses(&self) -> Vec<Address> {
+        let mut out = vec![self.body.sender];
+
+        for message in &self.body.messages {
+            match message {
+                // Value moving to someone else — the case this index exists for.
+                Message::Transfer { to, .. } => out.push(*to),
+                Message::ContributeToGroup { group, .. } | Message::GroupPayout { group } => {
+                    out.push(*group);
+                }
+                // A member should see the group they were enrolled in, even
+                // though they did not send the transaction that did it.
+                Message::CreateGroup { members, .. } => {
+                    out.extend(members.iter().map(|m| m.address));
+                }
+                Message::TransferName { to, .. } => out.push(*to),
+                Message::AttestContact { address, .. } => out.push(*address),
+                Message::RequestRebind { new_address, .. } => out.push(*new_address),
+                // The offender belongs in the index: a slashing is the single
+                // most important thing that can happen to a validator's account,
+                // and they did not send the report.
+                Message::ReportEquivocation { evidence } => out.push(evidence.validator),
+
+                // Sender-only. Named individually rather than caught by a
+                // wildcard, so a future variant does not join them by accident.
+                Message::RegisterName { .. }
+                | Message::RenewName { .. }
+                | Message::SetPrimaryAlias { .. }
+                | Message::ClearPrimaryAlias
+                | Message::ReleaseName { .. }
+                | Message::VetoRebind { .. }
+                | Message::RevokeContact { .. }
+                | Message::Bond { .. }
+                | Message::AddStake { .. }
+                | Message::Unbond { .. }
+                | Message::WithdrawUnbonded => {}
+            }
+        }
+
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Full stateless verification.
     ///
     /// Checks, in order: structure, chain binding, expiry, that the declared key
@@ -855,6 +919,110 @@ mod tests {
             reference: None,
         }];
         assert_eq!(body.validate_basic(), Err(TxError::ZeroAmount));
+    }
+
+    #[test]
+    fn a_transfer_is_filed_under_both_parties() {
+        // The recipient did not send the transaction and cannot know its id, so
+        // an index that filed it under the sender alone would make every
+        // incoming payment invisible to the person receiving it.
+        let sent = payment(&key(1)).sign(&key(1));
+
+        let touched = sent.touched_addresses();
+        assert!(touched.contains(&addr(1)), "sender missing");
+        assert!(touched.contains(&addr(2)), "recipient missing");
+        assert_eq!(touched.len(), 2);
+    }
+
+    #[test]
+    fn a_sender_only_message_files_under_the_sender_alone() {
+        let renewed = with_messages(
+            1,
+            vec![Message::RenewName {
+                name: Username::new("amina").expect("valid"),
+            }],
+        );
+        assert_eq!(renewed.touched_addresses(), vec![addr(1)]);
+    }
+
+    #[test]
+    fn one_address_is_filed_once_however_many_times_it_appears() {
+        // Two payments to the same person in one transaction is one history
+        // entry for them, not two rows pointing at the same place.
+        let sent = with_messages(1, vec![transfer_to(addr(2), 1), transfer_to(addr(2), 2)]);
+        assert_eq!(sent.touched_addresses().len(), 2);
+    }
+
+    #[test]
+    fn paying_yourself_is_filed_once() {
+        let sent = with_messages(1, vec![transfer_to(addr(1), 1)]);
+        assert_eq!(sent.touched_addresses(), vec![addr(1)]);
+    }
+
+    #[test]
+    fn a_slashing_report_files_under_the_offender_too() {
+        // Being slashed is the most consequential thing that can happen to a
+        // validator's account, and someone else sent the transaction that did it.
+        let reported = with_messages(
+            1,
+            vec![Message::ReportEquivocation {
+                evidence: Box::new(equivocation(3)),
+            }],
+        );
+        assert!(
+            reported.touched_addresses().contains(&addr(3)),
+            "the reported validator must appear in its own history"
+        );
+    }
+
+    fn addr(seed: u8) -> Address {
+        Address::from_public_key(&key(seed).public_key())
+    }
+
+    fn transfer_to(to: Address, afri: u64) -> Message {
+        Message::Transfer {
+            to,
+            denom: kes(),
+            amount: Amount::from_afri(afri),
+            reference: None,
+        }
+    }
+
+    fn with_messages(sender: u8, messages: Vec<Message>) -> Transaction {
+        TxBody {
+            chain_id: chain(),
+            sender: addr(sender),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages,
+            memo: String::new(),
+        }
+        .sign(&key(sender))
+    }
+
+    /// Two conflicting precommits from one validator, at one height and round.
+    fn equivocation(seed: u8) -> Equivocation {
+        use afrolink_consensus::{Vote, VoteType};
+        use afrolink_primitives::Round;
+
+        let vote = |block: u8| {
+            Vote {
+                chain_id: chain(),
+                height: Height(7),
+                round: Round::ZERO,
+                vote_type: VoteType::Precommit,
+                block_id: Some(Hash32::from_bytes([block; 32])),
+                validator: addr(seed),
+            }
+            .sign(&key(seed))
+        };
+
+        Equivocation {
+            validator: addr(seed),
+            first: vote(1),
+            second: vote(2),
+        }
     }
 
     #[test]

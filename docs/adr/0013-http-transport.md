@@ -202,10 +202,10 @@ so the deterministic simulator is intact. The dependency count did not move.
 Privacy depends on a reverse proxy that is not in this repository. And
 thread-per-connection has a ceiling that a large deployment will eventually hit.
 
-**Deliberately not done.** **There is no way to submit a transaction.** A wallet
-can check its money and cannot yet move it, because submission needs a mempool
-and an `Event::Transaction` the node does not have — that is node work, not
-transport work, and it is the immediate next item rather than an omission.
+**Deliberately not done.** **There is no way to submit a transaction, and no way
+to see a payment arrive.** — both closed by
+[ADR-0014](0014-payment-history-and-the-mempool.md), which added a real mempool,
+`POST /v1/transactions`, block bodies, inclusion proofs and a history index.
 No TLS (see §2). No rate limiting per peer, which needs identity the transport
 does not have. No witness-log endpoints yet, though `crates/witness` is
 transport-free for exactly this reason and they ride on this layer when they

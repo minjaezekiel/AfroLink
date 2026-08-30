@@ -10,8 +10,11 @@
 //! isolation; keeping storage out of it means those tests cannot accidentally
 //! depend on a database being present.
 
+use afrolink_crypto::Address;
+use afrolink_crypto::hash::Hash32;
+use afrolink_executor::Block;
 use afrolink_primitives::{ChainId, Height};
-use afrolink_rpc::{ChainView, QueryError, SignedHeader};
+use afrolink_rpc::{ChainView, HistoryEntry, QueryError, SignedHeader};
 use afrolink_state::{KeyValueStore, MemoryStore, Proof, StoreKey};
 
 use crate::ChainStore;
@@ -79,6 +82,38 @@ impl ChainView for ServedChain<'_> {
 
     fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError> {
         Ok(self.state.get_with_proof(key))
+    }
+
+    fn block(&self, height: Height) -> Result<Option<Block>, QueryError> {
+        self.store.block(height).map_err(|e| backend(&e))
+    }
+
+    fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>, QueryError> {
+        self.store.locate(id).map_err(|e| backend(&e))
+    }
+
+    fn history(
+        &self,
+        address: &Address,
+        from: Height,
+        limit: usize,
+    ) -> Result<Option<(Vec<HistoryEntry>, bool)>, QueryError> {
+        // A `ChainStore` always indexes — the index is written in the same
+        // transaction as the block, so it cannot lag. A node role that
+        // deliberately does not index would return `Ok(None)` here instead.
+        let (rows, truncated) = self
+            .store
+            .history(address, from, limit)
+            .map_err(|e| backend(&e))?;
+        let entries = rows
+            .into_iter()
+            .map(|(height, index, tx_id)| HistoryEntry {
+                height,
+                index,
+                tx_id,
+            })
+            .collect();
+        Ok(Some((entries, truncated)))
     }
 }
 

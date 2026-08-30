@@ -134,6 +134,8 @@ impl Method {
 pub enum Status {
     /// The answer is in the body.
     Ok,
+    /// Held, but not yet in a block. The honest answer to a submission.
+    Accepted,
     /// There is deliberately no body — a CORS preflight.
     NoContent,
     /// The request was not well formed, or a parameter did not parse.
@@ -164,6 +166,7 @@ impl Status {
     pub fn code(self) -> u16 {
         match self {
             Self::Ok => 200,
+            Self::Accepted => 202,
             Self::NoContent => 204,
             Self::BadRequest => 400,
             Self::NotFound => 404,
@@ -183,6 +186,7 @@ impl Status {
     pub fn reason(self) -> &'static str {
         match self {
             Self::Ok => "OK",
+            Self::Accepted => "Accepted",
             Self::NoContent => "No Content",
             Self::BadRequest => "Bad Request",
             Self::NotFound => "Not Found",
@@ -207,6 +211,7 @@ impl Status {
         matches!(
             self,
             Self::Ok
+                | Self::Accepted
                 | Self::NoContent
                 | Self::NotFound
                 | Self::MethodNotAllowed

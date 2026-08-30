@@ -34,7 +34,7 @@ use afrolink_http::{Config, Server};
 use afrolink_light::LightClient;
 use afrolink_primitives::codec::{Encode, decode_exact};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Round, Timestamp};
-use afrolink_rpc::{ProvedValue, Query, Response};
+use afrolink_rpc::{ProvedValue, Query, ReadOnly, Response};
 use afrolink_state::MemoryStore;
 use afrolink_store::{ChainStore, ServedChain};
 
@@ -225,7 +225,7 @@ fn with_server<F: FnOnce(SocketAddr) + Send>(name: &str, config: Config, body: F
     let addr = server.local_addr();
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
         body(addr);
         handle.stop();
     });
@@ -246,7 +246,7 @@ fn a_wallet_verifies_a_balance_fetched_over_http() {
     let addr = server.local_addr();
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
 
         let query = Query::Balance {
             address: account(50),
@@ -296,7 +296,7 @@ fn a_tampered_body_fails_verification_rather_than_being_believed() {
     let addr = server.local_addr();
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
 
         let query = Query::Balance {
             address: account(50),
@@ -463,7 +463,7 @@ fn a_proved_absence_is_served_as_an_answer_rather_than_a_404() {
     let addr = server.local_addr();
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
 
         let query = Query::Balance {
             address: account(77),
@@ -673,6 +673,29 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
         ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
             Err(afrolink_rpc::QueryError::Backend("disk on fire".into()))
         }
+        fn block(
+            &self,
+            _height: Height,
+        ) -> Result<Option<afrolink_executor::Block>, afrolink_rpc::QueryError> {
+            Err(afrolink_rpc::QueryError::Backend(
+                "/home/validator/secret/chain.redb is corrupt".into(),
+            ))
+        }
+        fn locate(
+            &self,
+            _id: &afrolink_crypto::hash::Hash32,
+        ) -> Result<Option<(Height, u32)>, afrolink_rpc::QueryError> {
+            Ok(None)
+        }
+        fn history(
+            &self,
+            _address: &Address,
+            _from: Height,
+            _limit: usize,
+        ) -> Result<Option<(Vec<afrolink_rpc::HistoryEntry>, bool)>, afrolink_rpc::QueryError>
+        {
+            Ok(None)
+        }
     }
 
     let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
@@ -681,7 +704,7 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
     let view = Broken;
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
 
         let reply = get(addr, "/v1/status");
         assert_eq!(reply.status, 500);
@@ -706,7 +729,7 @@ fn stopping_the_server_actually_stops_it() {
     let addr = server.local_addr();
 
     std::thread::scope(|scope| {
-        scope.spawn(|| server.run(&view).unwrap());
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
         assert_eq!(get(addr, "/health").status, 200);
         handle.stop();
         assert!(handle.is_stopped());
@@ -716,4 +739,445 @@ fn stopping_the_server_actually_stops_it() {
     // did not wake `accept`, this test would hang rather than fail — which is
     // the honest signal for a shutdown that does not shut down.
     let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Payment history: block bodies, inclusion proofs, and the index
+// ---------------------------------------------------------------------------
+
+/// A signed payment from account 50 to account 60.
+fn payment(nonce: u64) -> afrolink_types::Transaction {
+    use afrolink_types::{Fee, Message, TxBody};
+
+    TxBody {
+        chain_id: chain(),
+        sender: account(50),
+        nonce,
+        valid_until: Height(10_000),
+        fee: Fee::new(Amount::from_units(1_000), kes()),
+        messages: vec![Message::Transfer {
+            to: account(60),
+            denom: kes(),
+            amount: Amount::from_afri(7),
+            reference: Some(afrolink_pay::PaymentReference(880_123)),
+        }],
+        memo: String::new(),
+    }
+    .sign(&key(50))
+}
+
+/// Genesis plus a block containing one payment, with a wallet advanced to it.
+fn chain_with_payment(
+    name: &str,
+) -> (
+    std::path::PathBuf,
+    ChainStore,
+    MemoryStore,
+    LightClient,
+    afrolink_executor::BlockHeader,
+    afrolink_types::Transaction,
+) {
+    use afrolink_executor::{Executor, ValidatorSets};
+
+    let (path, store, mut state, mut client) = chain_on_disk(name);
+    let genesis_block = store.block(Height::GENESIS).unwrap().unwrap();
+
+    let sent = payment(0);
+    let executor = Executor::new(chain());
+    let (block, outcome) = executor.build_block(
+        &mut state,
+        Height(1),
+        Timestamp::from_millis(1_700_000_001_000),
+        genesis_block.header.id(),
+        vec![sent.clone()],
+        ValidatorSets::unchanged(&validators()),
+    );
+    assert_eq!(outcome.succeeded(), 1, "the fixture payment must apply");
+
+    let commit = commit_for(&block);
+    store.put_block(&block, &commit).unwrap();
+    store.persist_state(&state).unwrap();
+    client
+        .update(
+            block.header.clone(),
+            &commit,
+            validators(),
+            validators(),
+            Timestamp::from_millis(1_700_000_100_000),
+        )
+        .unwrap();
+
+    (path, store, state, client, block.header, sent)
+}
+
+#[test]
+fn a_wallet_sees_a_payment_arrive_and_can_prove_it() {
+    // The claim this whole layer exists for. A recipient who never saw the
+    // transaction, does not know its id, and does not trust the node: finds it
+    // through the index, then proves it against a header it verified itself.
+    let (path, store, state, client, _header, sent) = chain_with_payment("history");
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+
+        // 1. The recipient asks what touched their account.
+        let listing = get(
+            addr,
+            &format!("/v1/accounts/{}/history", account(60).to_bech32().unwrap()),
+        );
+        assert_eq!(listing.status, 200);
+        let Response::History(history) = decode_exact::<Response>(&listing.body).unwrap() else {
+            panic!("expected a history response");
+        };
+        assert!(!history.truncated());
+        let entries = history.entries_unverified();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tx_id, sent.id());
+
+        // 2. That id is only a hint. The proof is what makes it true.
+        let fetched = get(addr, &format!("/v1/transactions/{}", sent.id().to_hex()));
+        assert_eq!(fetched.status, 200);
+        let Response::Transaction(proved) = decode_exact::<Response>(&fetched.body).unwrap() else {
+            panic!("expected a transaction response");
+        };
+
+        // Verified against the header the *wallet* holds, not the fixture's —
+        // the client walked to it from genesis by checking commit signatures,
+        // which is the only header it has any reason to believe.
+        let transaction = proved
+            .verify(client.trusted_header())
+            .expect("inclusion must verify");
+        assert_eq!(transaction.id(), sent.id());
+        assert_eq!(transaction.body.sender, account(50));
+
+        // 3. And the destination tag survived, which is what an exchange
+        //    reconciles against.
+        let afrolink_types::Message::Transfer { reference, .. } = &transaction.body.messages[0]
+        else {
+            panic!("expected a transfer");
+        };
+        assert_eq!(*reference, Some(afrolink_pay::PaymentReference(880_123)));
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_substituted_transaction_fails_its_inclusion_proof() {
+    let (path, store, state, _client, header, sent) = chain_with_payment("substitute");
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+
+        let fetched = get(addr, &format!("/v1/transactions/{}", sent.id().to_hex()));
+        let Response::Transaction(honest) = decode_exact::<Response>(&fetched.body).unwrap() else {
+            panic!("expected a transaction response");
+        };
+
+        // Rebuild the response with a different transaction and the real proof.
+        // The Merkle leaf is the transaction's own id, so this cannot survive.
+        let mut wire = vec![4u8]; // Response::Transaction
+        honest.height().encode(&mut wire);
+        honest.index_unverified().encode(&mut wire);
+        1u32.encode(&mut wire);
+        payment(9).encode(&mut wire);
+        Vec::<afrolink_crypto::hash::Hash32>::new().encode(&mut wire);
+
+        let forged = decode_exact::<Response>(&wire).unwrap();
+        let Response::Transaction(forged) = forged else {
+            panic!("expected a transaction response");
+        };
+        assert!(
+            forged.verify(&header).is_err(),
+            "a substituted transaction must not verify"
+        );
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_block_body_lets_a_client_check_it_received_all_of_it() {
+    // The difference between `Query::Block` and `Query::Transaction`: here the
+    // client recomputes the root itself, so a node cannot serve a subset.
+    let (path, store, state, _client, header, sent) = chain_with_payment("block-body");
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+
+        let fetched = get(addr, "/v1/blocks/1/transactions");
+        assert_eq!(fetched.status, 200);
+        let Response::Block(block) = decode_exact::<Response>(&fetched.body).unwrap() else {
+            panic!("expected a block response");
+        };
+
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].id(), sent.id());
+        assert_eq!(
+            afrolink_executor::Block::tx_root(&block.transactions),
+            header.tx_root,
+            "the body must reconstruct the root the header committed to"
+        );
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_node_without_an_index_says_so_rather_than_reporting_no_payments() {
+    // The distinction that matters: "I do not index history" and "you have
+    // received nothing" are different answers, and a wallet that cannot tell
+    // them apart will show a user an empty account.
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+    let view = Unindexed;
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+
+        let reply = get(
+            addr,
+            &format!("/v1/accounts/{}/history", account(60).to_bech32().unwrap()),
+        );
+        assert_eq!(reply.status, 501, "{}", reply.text());
+        assert!(
+            reply.text().contains("does not maintain"),
+            "{}",
+            reply.text()
+        );
+
+        handle.stop();
+    });
+}
+
+/// A node that answers reads but keeps no history index.
+struct Unindexed;
+
+impl afrolink_rpc::ChainView for Unindexed {
+    fn chain_id(&self) -> &ChainId {
+        static ID: std::sync::OnceLock<ChainId> = std::sync::OnceLock::new();
+        ID.get_or_init(chain)
+    }
+    fn tip_height(&self) -> Result<Height, afrolink_rpc::QueryError> {
+        Ok(Height::GENESIS)
+    }
+    fn signed_header(
+        &self,
+        _height: Height,
+    ) -> Result<Option<afrolink_rpc::SignedHeader>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn prove(
+        &self,
+        _key: &afrolink_state::StoreKey,
+    ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
+        Err(afrolink_rpc::QueryError::Backend("no state".into()))
+    }
+    fn block(
+        &self,
+        _height: Height,
+    ) -> Result<Option<afrolink_executor::Block>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn locate(
+        &self,
+        _id: &afrolink_crypto::hash::Hash32,
+    ) -> Result<Option<(Height, u32)>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+    fn history(
+        &self,
+        _address: &Address,
+        _from: Height,
+        _limit: usize,
+    ) -> Result<Option<(Vec<afrolink_rpc::HistoryEntry>, bool)>, afrolink_rpc::QueryError> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn an_unknown_transaction_id_is_a_404() {
+    with_server("unknown-tx", Config::default(), |addr| {
+        let reply = get(addr, &format!("/v1/transactions/{}", "ab".repeat(32)));
+        assert_eq!(reply.status, 404);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Submission
+// ---------------------------------------------------------------------------
+
+/// A node that accepts transactions, wired the way a real one would be.
+fn live_node() -> afrolink_node::SharedNode {
+    use afrolink_executor::{Genesis, GenesisLimits};
+
+    let genesis = Genesis {
+        chain_id: chain(),
+        genesis_time: Timestamp::from_millis(1_700_000_000_000),
+        validators: validators(),
+        issuers: vec![(kes(), Issuer::new(account(100)))],
+        allocations: vec![Allocation {
+            address: account(50),
+            denom: kes(),
+            amount: Amount::from_afri(2_500),
+        }],
+    };
+    let mut state = MemoryStore::new();
+    let block = genesis.apply(&mut state, GenesisLimits::devnet()).unwrap();
+    afrolink_node::SharedNode::new(afrolink_node::Node::new(
+        chain(),
+        key(1),
+        validators(),
+        state,
+        &block,
+    ))
+}
+
+fn post(addr: SocketAddr, target: &str, body: &[u8]) -> Reply {
+    let mut request = format!(
+        "POST {target} HTTP/1.1\r\nHost: n\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+
+    let mut conn = Conn::open(addr);
+    conn.writer.write_all(&request).unwrap();
+    conn.writer.flush().unwrap();
+    conn.recv()
+}
+
+#[test]
+fn a_wallet_can_send_money_and_the_node_holds_it() {
+    let (path, store, state, _client) = chain_on_disk("submit");
+    let view = ServedChain::new(chain(), &store, &state);
+    let node = live_node();
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &node).unwrap());
+
+        let sent = payment(0);
+        let reply = post(addr, "/v1/transactions", &sent.to_bytes());
+
+        // 202, not 200: the node holds it, no block contains it. A wallet that
+        // reads acceptance as settlement tells someone their money arrived.
+        assert_eq!(reply.status, 202, "{}", reply.text());
+        assert!(
+            reply.text().contains(&sent.id().to_hex()),
+            "{}",
+            reply.text()
+        );
+        assert!(reply.text().contains("pending"), "{}", reply.text());
+
+        assert!(node.lock().unwrap().is_pending(&sent.id()));
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_rejected_transaction_is_answered_with_a_reason_the_wallet_can_act_on() {
+    let (path, store, state, _client) = chain_on_disk("reject");
+    let view = ServedChain::new(chain(), &store, &state);
+    let node = live_node();
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &node).unwrap());
+
+        // Signed for a different chain — the classic way a wallet pointed at
+        // the wrong network loses money on other chains.
+        let wrong = afrolink_types::TxBody {
+            chain_id: ChainId::new("some-other-chain").unwrap(),
+            sender: account(50),
+            nonce: 0,
+            valid_until: Height(10_000),
+            fee: afrolink_types::Fee::new(Amount::from_units(1_000), kes()),
+            messages: vec![afrolink_types::Message::WithdrawUnbonded],
+            memo: String::new(),
+        }
+        .sign(&key(50));
+
+        let reply = post(addr, "/v1/transactions", &wrong.to_bytes());
+        assert_eq!(reply.status, 400, "{}", reply.text());
+        assert!(reply.text().contains("chain"), "{}", reply.text());
+        assert_eq!(node.lock().unwrap().pending(), 0);
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_transaction_with_trailing_bytes_is_refused() {
+    // Two encodings of one payment is the malleability the codec exists to
+    // prevent, and a submission endpoint is exactly where it would arrive.
+    let (path, store, state, _client) = chain_on_disk("trailing");
+    let view = ServedChain::new(chain(), &store, &state);
+    let node = live_node();
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &node).unwrap());
+
+        let mut bytes = payment(0).to_bytes();
+        bytes.push(0);
+        let reply = post(addr, "/v1/transactions", &bytes);
+
+        assert_eq!(reply.status, 400, "{}", reply.text());
+        assert!(reply.text().contains("canonical"), "{}", reply.text());
+        assert_eq!(node.lock().unwrap().pending(), 0);
+
+        handle.stop();
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_read_only_node_refuses_submissions_rather_than_dropping_them() {
+    // A serving node with no consensus role is a legitimate deployment. What it
+    // must not do is accept a payment and silently discard it.
+    with_server("readonly", Config::default(), |addr| {
+        let reply = post(addr, "/v1/transactions", &payment(0).to_bytes());
+        assert_eq!(reply.status, 501, "{}", reply.text());
+        assert!(reply.text().contains("validator"), "{}", reply.text());
+    });
+}
+
+#[test]
+fn an_empty_submission_is_refused_before_it_reaches_the_node() {
+    with_server("empty-submit", Config::default(), |addr| {
+        let reply = post(addr, "/v1/transactions", b"");
+        assert_eq!(reply.status, 400, "{}", reply.text());
+    });
 }

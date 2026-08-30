@@ -292,6 +292,17 @@ impl Network {
                         }
                     }
                 }
+                Action::BroadcastTransaction(t) => {
+                    // Gossiped like anything else, and subject to the same
+                    // delivery rules — so a partitioned node genuinely does not
+                    // learn about a payment, which is what makes the mempool
+                    // testable under the hostile scheduler.
+                    for i in 0..self.nodes.len() {
+                        if i != from && self.reaches(from, i) {
+                            self.queue.push((i, Event::Transaction(t.clone())));
+                        }
+                    }
+                }
                 Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => {}
             }
         }
@@ -424,7 +435,7 @@ mod tests {
         // The basic liveness and agreement claim.
         let mut net = network(4);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 100));
+            node.submit(payment(0, 100)).expect("a valid payment");
         }
         net.start_round();
         let commits = net.run(1_000);
@@ -448,7 +459,7 @@ mod tests {
         // Agreement on the block is not enough; they must agree on what it did.
         let mut net = network(4);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 250));
+            node.submit(payment(0, 250)).expect("a valid payment");
         }
         net.start_round();
         net.run(1_000);
@@ -461,7 +472,7 @@ mod tests {
     fn the_committed_transaction_actually_moved_money() {
         let mut net = network(4);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 400));
+            node.submit(payment(0, 400)).expect("a valid payment");
         }
         net.start_round();
         net.run(1_000);
@@ -481,7 +492,7 @@ mod tests {
         net.crash(3);
         for (i, node) in net.nodes.iter_mut().enumerate() {
             if i != 3 {
-                node.mempool.push(payment(0, 100));
+                node.submit(payment(0, 100)).expect("a valid payment");
             }
         }
         net.start_round();
@@ -512,7 +523,7 @@ mod tests {
         net.crash(2);
         net.crash(3);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 100));
+            node.submit(payment(0, 100)).expect("a valid payment");
         }
         net.start_round();
         let mut commits = net.run(1_000);
@@ -549,13 +560,13 @@ mod tests {
     fn consecutive_heights_chain_together() {
         let mut net = network(4);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 100));
+            node.submit(payment(0, 100)).expect("a valid payment");
         }
         net.start_round();
         net.run(1_000);
 
         for node in &mut net.nodes {
-            node.mempool.push(payment(1, 50));
+            node.submit(payment(1, 50)).expect("a valid payment");
         }
         net.start_round();
         let commits = net.run(1_000);
@@ -581,7 +592,7 @@ mod tests {
         // app_hash must be rejected, and the block must not commit.
         let mut net = network(4);
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 100));
+            node.submit(payment(0, 100)).expect("a valid payment");
         }
 
         // Find the proposer and let it build a proposal.
@@ -673,7 +684,7 @@ mod tests {
             afrolink_light::LightClient::new(chain(), validators.clone(), genesis.header);
 
         for node in &mut net.nodes {
-            node.mempool.push(payment(0, 750));
+            node.submit(payment(0, 750)).expect("a valid payment");
         }
         net.start_round();
         net.run(1_000);

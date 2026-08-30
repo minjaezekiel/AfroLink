@@ -1,9 +1,17 @@
 //! Answering queries: a pure function from a [`ChainView`] to a [`Response`].
 
+use afrolink_crypto::Address;
+use afrolink_crypto::hash::Hash32;
+use afrolink_crypto::merkle::MerkleTree;
+use afrolink_executor::Block;
 use afrolink_primitives::{ChainId, Height};
 use afrolink_state::{Proof, StoreKey};
+use afrolink_types::Transaction;
 
-use crate::query::{ProvedValue, Query, QueryError, Response, SignedHeader, Status};
+use crate::query::{
+    History, HistoryEntry, MAX_HISTORY, ProvedTransaction, ProvedValue, Query, QueryError,
+    Response, SignedHeader, Status,
+};
 
 /// What [`answer`] needs from a node.
 ///
@@ -41,6 +49,88 @@ pub trait ChainView {
     /// Backend failures only. An absent key is `Ok((None, proof))` — absence is
     /// proved, not reported.
     fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError>;
+
+    /// A whole block, if this node retains it.
+    ///
+    /// # Errors
+    /// Backend failures only; a pruned or future height is `Ok(None)`.
+    fn block(&self, height: Height) -> Result<Option<Block>, QueryError>;
+
+    /// Where a transaction sits, as `(height, index)`.
+    ///
+    /// # Errors
+    /// Backend failures only; an unknown id is `Ok(None)`.
+    fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>, QueryError>;
+
+    /// An account's transactions, oldest first, and whether the scan was
+    /// truncated by `limit`.
+    ///
+    /// Returns `Ok(None)` when this node **does not keep a history index** —
+    /// which is not the same as an account having no history, and must not be
+    /// collapsed into one. A node that answers "no payments" when it simply is
+    /// not indexing has told a wallet something false.
+    ///
+    /// # Errors
+    /// Backend failures only.
+    fn history(
+        &self,
+        address: &Address,
+        from: Height,
+        limit: usize,
+    ) -> Result<Option<(Vec<HistoryEntry>, bool)>, QueryError>;
+}
+
+/// Why a submitted transaction was not accepted.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The node looked at it and said no — bad signature, wrong nonce, full
+    /// mempool. The message is the submitter's own business and is safe to
+    /// echo: it describes the transaction they sent, not the node's internals.
+    #[error("{0}")]
+    Rejected(String),
+    /// This node does not accept transactions at all.
+    ///
+    /// A serving node with no consensus role is a legitimate deployment, and it
+    /// should say so rather than silently dropping a payment.
+    #[error("this node does not accept transactions")]
+    NotAccepting,
+    /// The node failed for its own reasons.
+    #[error("backend error: {0}")]
+    Backend(String),
+}
+
+/// A node that accepts transactions.
+///
+/// **Deliberately a separate trait from [`ChainView`].** That trait's own
+/// documentation says a query must not be able to reach a node's mempool, and
+/// the way to guarantee it is to make it unreachable — so the read path takes a
+/// `ChainView` and cannot see this, whatever a future caller does.
+///
+/// Takes `&self` rather than `&mut self`: a server shares one node across
+/// connection threads, so an implementor holds its own lock. Requiring `&mut`
+/// here would force the whole read path to serialise behind writes.
+pub trait Submit {
+    /// Offer a transaction to the node.
+    ///
+    /// Returns the transaction's id, which is what a wallet polls on.
+    ///
+    /// # Errors
+    /// [`SubmitError`] with a reason the submitter can act on.
+    fn submit(&self, transaction: Transaction) -> Result<Hash32, SubmitError>;
+}
+
+/// A node that refuses every submission.
+///
+/// For a read-only deployment — an explorer's backend, an archive — and for
+/// tests that have nothing to submit to. Explicit rather than implied: a server
+/// built with this one cannot silently look like it accepted a payment.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadOnly;
+
+impl Submit for ReadOnly {
+    fn submit(&self, _transaction: Transaction) -> Result<Hash32, SubmitError> {
+        Err(SubmitError::NotAccepting)
+    }
 }
 
 /// Answer one query.
@@ -65,6 +155,67 @@ pub fn answer<V: ChainView + ?Sized>(view: &V, query: &Query) -> Result<Response
                 .signed_header(*height)?
                 .ok_or(QueryError::NoSuchHeight(height.0))?;
             Ok(Response::Header(header))
+        }
+        Query::Block { height } => {
+            let block = view
+                .block(*height)?
+                .ok_or(QueryError::NoSuchHeight(height.0))?;
+            Ok(Response::Block(Box::new(block)))
+        }
+        Query::Transaction { id } => {
+            let (height, index) = view
+                .locate(id)?
+                .ok_or_else(|| QueryError::NoSuchTransaction(id.to_hex()))?;
+
+            // The index named a block. If the block is absent or shorter than
+            // the index claims, the store is inconsistent with itself —
+            // reporting "not found" would quietly hide that.
+            let block = view.block(height)?.ok_or_else(|| {
+                QueryError::Backend(format!("index points at missing block {height}"))
+            })?;
+            let transaction = block
+                .transactions
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    QueryError::Backend(format!("index points past the end of block {height}"))
+                })?;
+
+            let total = u32::try_from(block.transactions.len())
+                .map_err(|_| QueryError::Backend("block is longer than a u32".into()))?;
+            let tree = MerkleTree::from_items(
+                block
+                    .transactions
+                    .iter()
+                    .map(|t| t.id().as_bytes().to_vec()),
+            );
+            let proof = tree
+                .prove(index as usize)
+                .map_err(|e| QueryError::Backend(e.to_string()))?;
+
+            Ok(Response::Transaction(Box::new(ProvedTransaction::new(
+                height,
+                index,
+                total,
+                transaction,
+                proof.siblings,
+            ))))
+        }
+        Query::History {
+            address,
+            from,
+            limit,
+        } => {
+            // Cap here rather than trusting the caller: the request travelled
+            // over a network, and `limit` is the only field in it that costs
+            // the server real work.
+            let limit = (*limit).min(MAX_HISTORY) as usize;
+            let (entries, truncated) = view
+                .history(address, *from, limit)?
+                .ok_or(QueryError::NotIndexed("a transaction history index"))?;
+            Ok(Response::History(History::new(
+                *address, entries, truncated,
+            )))
         }
         _ => {
             let key = query
@@ -188,6 +339,35 @@ mod tests {
 
         fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError> {
             Ok(self.state.get_with_proof(key))
+        }
+
+        fn block(&self, height: Height) -> Result<Option<Block>, QueryError> {
+            if height != self.block.header.height {
+                return Ok(None);
+            }
+            Ok(Some(self.block.clone()))
+        }
+
+        fn locate(&self, id: &Hash32) -> Result<Option<(Height, u32)>, QueryError> {
+            Ok(self
+                .block
+                .transactions
+                .iter()
+                .position(|t| t.id() == *id)
+                .and_then(|i| u32::try_from(i).ok())
+                .map(|i| (self.block.header.height, i)))
+        }
+
+        fn history(
+            &self,
+            _address: &Address,
+            _from: Height,
+            _limit: usize,
+        ) -> Result<Option<(Vec<HistoryEntry>, bool)>, QueryError> {
+            // This fixture keeps no index, which is the case
+            // `a_node_without_an_index_says_so_rather_than_reporting_nothing`
+            // exists to pin down.
+            Ok(None)
         }
     }
 

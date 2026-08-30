@@ -193,11 +193,13 @@ addresses, state and its proofs, transactions, the bank, the executor,
 Ubuntu-BFT, the light client, durable storage, staking and slashing, aliases,
 witness logs, and the query protocol.
 
-**The network line is half-drawn.** A client can reach a node over HTTP
-([ADR-0013](adr/0013-http-transport.md)); nodes cannot reach each other. The
-consequence is not a missing feature but a missing property: a one-node chain is
-not decentralised, whatever the consensus code can do. Multi-node behaviour is
-exercised by the deterministic simulator rather than by a network.
+**The network line is half-drawn.** A client can reach a node over HTTP — send a
+payment, find it, prove it ([ADR-0013](adr/0013-http-transport.md),
+[ADR-0014](adr/0014-payment-history-and-the-mempool.md)) — but nodes cannot
+reach each other. The consequence is not a missing feature but a missing
+property: a one-node chain is not decentralised, whatever the consensus code can
+do. Multi-node behaviour is exercised by the deterministic simulator rather than
+by a network.
 
 **Nothing above the protocol-module line exists.** No contract VM, no
 governance, no bridges.

@@ -26,9 +26,10 @@ use std::collections::BTreeMap;
 
 use afrolink_alias::{ContactCommitment, Username};
 use afrolink_crypto::Address;
+use afrolink_crypto::hash::Hash32;
 use afrolink_primitives::codec::decode_exact;
 use afrolink_primitives::{Denom, Height};
-use afrolink_rpc::Query;
+use afrolink_rpc::{MAX_HISTORY, Query};
 
 use crate::wire::{Method, Request, Status};
 
@@ -44,6 +45,13 @@ pub enum Format {
 /// What a request resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
+    /// `POST /v1/transactions` — a canonically-encoded transaction to submit.
+    ///
+    /// The only route that *changes* anything, and it is deliberately the only
+    /// one: everything else on this server is a read. It is handled through a
+    /// separate trait from [`ChainView`](afrolink_rpc::ChainView), so the
+    /// guarantee that a query cannot reach a node's mempool stays structural.
+    Submit(Vec<u8>),
     /// `/` — the route table.
     Index,
     /// `/health` — liveness, answered from the store rather than from a
@@ -159,6 +167,54 @@ pub fn route(request: &Request) -> Result<Route, RouteError> {
             let commitment = parse_commitment(commitment)?;
             chain(request, Query::ResolveContact { commitment })
         }
+        ["v1", "blocks", height, "transactions"] => {
+            let height = height
+                .parse::<u64>()
+                .map_err(|_| bad("height must be a whole number"))?;
+            chain(
+                request,
+                Query::Block {
+                    height: Height(height),
+                },
+            )
+        }
+        ["v1", "transactions", id] => {
+            let id = parse_hash(id, "transaction id")?;
+            chain(request, Query::Transaction { id })
+        }
+        ["v1", "accounts", address, "history"] => {
+            let address = parse_address(address)?;
+            let from = match request.param("from") {
+                None => Height::GENESIS,
+                Some(raw) => Height(
+                    raw.parse::<u64>()
+                        .map_err(|_| bad("from must be a whole number"))?,
+                ),
+            };
+            let limit = match request.param("limit") {
+                None => MAX_HISTORY,
+                Some(raw) => raw
+                    .parse::<u32>()
+                    .map_err(|_| bad("limit must be a whole number"))?,
+            };
+            chain(
+                request,
+                Query::History {
+                    address,
+                    from,
+                    limit,
+                },
+            )
+        }
+        ["v1", "transactions"] => {
+            if request.method != Method::Post {
+                return Err(RouteError::MethodNotAllowed { allow: "POST" });
+            }
+            if request.body.is_empty() {
+                return Err(bad("a transaction body is required"));
+            }
+            Ok(Route::Submit(request.body.clone()))
+        }
         ["v1", "query"] => {
             if request.method != Method::Post {
                 return Err(RouteError::MethodNotAllowed { allow: "POST" });
@@ -216,19 +272,33 @@ fn parse_name(raw: &str) -> Result<Username, RouteError> {
     Ok(name)
 }
 
+/// A 32-byte hash, spelled as 64 lower-case hex characters.
+///
+/// Same strictness as a commitment, and for the same reason: two spellings of
+/// one transaction id are two cache keys and two log lines for one payment.
+fn parse_hash(text: &str, what: &str) -> Result<Hash32, RouteError> {
+    let bytes = parse_hash_bytes(text, what)?;
+    Ok(Hash32::from_bytes(bytes))
+}
+
+fn parse_hash_bytes(text: &str, what: &str) -> Result<[u8; 32], RouteError> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad(format!("{what} must be 64 hex characters")));
+    }
+    if text.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(bad(format!("{what} must be lower-case hex")));
+    }
+    let decoded = hex::decode(text).map_err(|_| bad(format!("{what} is not hex")))?;
+    <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| bad(format!("{what} is not 32 bytes")))
+}
+
 /// A contact commitment is 32 bytes, spelled as 64 lower-case hex characters.
 ///
 /// Upper case is refused rather than folded. Two spellings of one commitment
 /// would be two cache keys and two log lines for one lookup, and the codec's
 /// rule — one encoding per value — is worth keeping at the edge too.
 fn parse_commitment(text: &str) -> Result<ContactCommitment, RouteError> {
-    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(bad("commitment must be 64 hex characters"));
-    }
-    if text.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(bad("commitment must be lower-case hex"));
-    }
-    let bytes = hex::decode(text).map_err(|_| bad("commitment is not hex"))?;
+    let bytes = parse_hash_bytes(text, "commitment")?;
     decode_exact::<ContactCommitment>(&bytes).map_err(|_| bad("commitment is not 32 bytes"))
 }
 
@@ -277,6 +347,9 @@ pub fn is_routable(query: &Query) -> bool {
             | Query::ResolveName { .. }
             | Query::ResolveContact { .. }
             | Query::PrimaryAlias { .. }
+            | Query::Block { .. }
+            | Query::Transaction { .. }
+            | Query::History { .. }
     )
 }
 

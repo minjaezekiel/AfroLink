@@ -54,5 +54,8 @@
 pub mod query;
 pub mod server;
 
-pub use query::{ProvedValue, Query, QueryError, Response, SignedHeader, Status};
-pub use server::{ChainView, answer};
+pub use query::{
+    History, HistoryEntry, MAX_HISTORY, ProvedTransaction, ProvedValue, Query, QueryError,
+    Response, SignedHeader, Status,
+};
+pub use server::{ChainView, ReadOnly, Submit, SubmitError, answer};

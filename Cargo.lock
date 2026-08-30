@@ -72,6 +72,7 @@ dependencies = [
  "afrolink-light",
  "afrolink-pay",
  "afrolink-primitives",
+ "afrolink-rpc",
  "afrolink-staking",
  "afrolink-state",
  "afrolink-types",
@@ -88,10 +89,13 @@ dependencies = [
  "afrolink-crypto",
  "afrolink-executor",
  "afrolink-light",
+ "afrolink-node",
+ "afrolink-pay",
  "afrolink-primitives",
  "afrolink-rpc",
  "afrolink-state",
  "afrolink-store",
+ "afrolink-types",
  "hex",
  "thiserror",
 ]
@@ -120,6 +124,7 @@ dependencies = [
  "afrolink-executor",
  "afrolink-light",
  "afrolink-primitives",
+ "afrolink-rpc",
  "afrolink-state",
  "afrolink-types",
  "thiserror",
@@ -155,6 +160,7 @@ dependencies = [
  "afrolink-light",
  "afrolink-primitives",
  "afrolink-state",
+ "afrolink-types",
  "thiserror",
 ]
 

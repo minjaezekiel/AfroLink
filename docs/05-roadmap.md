@@ -50,16 +50,27 @@ the transaction path is not.)*
       no async runtime and no new dependency. Integrity stays in the proof, so
       the transport is allowed to be untrusted *([ADR-0013](adr/0013-http-transport.md),
       `crates/http` 65 tests, plus ~110 000 malformed requests in the fuzz suite)*
-- [ ] **Mempool and transaction submission** — the wallet can check its money
-      and cannot yet move it. Needs `Event::Transaction` and a queue the
-      proposer draws from; node work rather than transport work, and the next
-      item on this list
+- [x] **Mempool and transaction submission** — bounded, validated, per-sender
+      capped; `POST /v1/transactions` answers 202 with the id. Writing is a
+      different trait from reading, so a query still cannot reach the mempool
+      *([ADR-0014](adr/0014-payment-history-and-the-mempool.md))*
+- [x] **Payment history** — block bodies and a transaction index over RPC, with
+      Merkle inclusion proofs against `tx_root`. The index itself is a hint and
+      says so; the proof is what makes an entry true *(ADR-0014)*
+- [x] **Block size limits** — a consensus rule that was missing. Validators
+      re-execute every proposal, so an unbounded block was unbounded work for
+      the price of one message *(ADR-0014)*
+- [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
+      blocks and is the next thing to want
+- [ ] Fee-based replacement and priority ordering in the mempool — premature
+      until congestion is real; selection is nonce-order, first come
 - [ ] Emit the decentralisation report at startup and over RPC
 
 **Exit criterion:** ✅ *met and exceeded* — four validators propose, vote and
 commit, agreeing on both the block and the resulting state root, verified by the
-deterministic simulator in `crates/node/src/sim.rs`; and a wallet verifies a
-balance fetched over a real socket from a node it does not trust.
+deterministic simulator in `crates/node/src/sim.rs`; and a wallet sends a
+payment over a real socket, finds it in its history, and proves it against a
+header it verified itself, trusting nothing about the node in between.
 
 ## Phase 2 — Multi-node testnet
 
@@ -104,7 +115,8 @@ balance fetched over a real socket from a node it does not trust.
 - [ ] **x402 facilitator** — verify an `afri:` payment against an HTTP 402
       challenge, so any online service can charge in AFRI or a stablecoin
       *(ADR-0009; the RPC transport it was waiting on now exists)*
-- [ ] Explorer, faucet, monitoring
+- [ ] Explorer, faucet, monitoring — the block, transaction and history
+      endpoints they need now exist *(ADR-0014)*
 
 **Exit criterion:** 20 geographically distributed validators; the chain survives
 a partition and a deliberate 1/3-minus-one Byzantine coalition.

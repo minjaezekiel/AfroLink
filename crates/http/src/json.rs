@@ -37,9 +37,9 @@
 
 use afrolink_consensus::Commit;
 use afrolink_crypto::hash::Hash32;
-use afrolink_executor::BlockHeader;
+use afrolink_executor::{Block, BlockHeader};
 use afrolink_primitives::codec::Encode;
-use afrolink_rpc::{ProvedValue, Response, SignedHeader, Status};
+use afrolink_rpc::{History, ProvedTransaction, ProvedValue, Response, SignedHeader, Status};
 
 /// Escape and quote a string into `out`.
 ///
@@ -183,8 +183,95 @@ pub fn response(response: &Response) -> String {
             field_str("response", &hex::encode(response.to_bytes()), &mut out);
             close(&mut out);
         }
+        Response::Block(block) => write_block(block, &mut out),
+        Response::Transaction(proved) => write_proved_transaction(proved, &mut out),
+        Response::History(history) => write_history(history, &mut out),
     }
     out
+}
+
+/// A block: its header, and its transactions as ids plus canonical bytes.
+///
+/// Transactions are *not* expanded into fields. A client that wants to read one
+/// decodes the bytes with the same codec the chain uses; a JSON rendering of a
+/// transaction would be a second, laxer description of a signed object, and the
+/// two would drift.
+fn write_block(block: &Block, out: &mut String) {
+    out.push('{');
+    write_string("header", out);
+    out.push(':');
+    write_header(&block.header, out);
+    out.push(',');
+    field_num("transaction_count", block.transactions.len() as u64, out);
+    write_string("transactions", out);
+    out.push_str(":[");
+    for (i, transaction) in block.transactions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        field_str("id", &transaction.id().to_hex(), out);
+        field_str("bytes", &hex::encode(transaction.to_bytes()), out);
+        close(out);
+    }
+    out.push(']');
+    out.push('}');
+}
+
+fn write_proved_transaction(proved: &ProvedTransaction, out: &mut String) {
+    out.push('{');
+    field_num("height", proved.height().0, out);
+    // Advisory, and named so: the verifier knows the root and the id, not the
+    // position. See `ProvedTransaction`.
+    field_num(
+        "index_unverified",
+        u64::from(proved.index_unverified()),
+        out,
+    );
+    let transaction = proved.transaction_unverified();
+    field_str("id", &transaction.id().to_hex(), out);
+    field_str(
+        "transaction_unverified",
+        &hex::encode(transaction.to_bytes()),
+        out,
+    );
+    field_str("proof", &hex::encode(proved.to_bytes()), out);
+    close(out);
+}
+
+/// History, rendered so that a reader cannot mistake it for a proof.
+fn write_history(history: &History, out: &mut String) {
+    out.push('{');
+    field_str(
+        "address",
+        &history.address().to_bech32().unwrap_or_default(),
+        out,
+    );
+    field_str(
+        "note",
+        "an index, not a proof: this node can omit entries. Verify each id with          GET /v1/transactions/{id} against a header you trust",
+        out,
+    );
+    // A caller that ignores this and renders the list as complete silently
+    // truncates a busy account.
+    write_string("truncated", out);
+    out.push(':');
+    out.push_str(if history.truncated() { "true" } else { "false" });
+    out.push(',');
+    write_string("entries_unverified", out);
+    out.push_str(":[");
+    for (i, entry) in history.entries_unverified().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        field_num("height", entry.height.0, out);
+        field_num("index", u64::from(entry.index), out);
+        field_str("id", &entry.tx_id.to_hex(), out);
+        close(out);
+    }
+    out.push(']');
+    out.push('}');
 }
 
 /// The index served at `/`: what this node answers, and how.
@@ -236,6 +323,26 @@ pub fn index() -> String {
             "GET",
             "/v1/contacts/{commitment}",
             "which account a phone or email commitment points at",
+        ),
+        (
+            "GET",
+            "/v1/blocks/{height}/transactions",
+            "a whole block; recompute tx_root over it to verify completeness",
+        ),
+        (
+            "GET",
+            "/v1/transactions/{id}",
+            "one transaction, with an inclusion proof against its block's tx_root",
+        ),
+        (
+            "GET",
+            "/v1/accounts/{address}/history?from=&limit=",
+            "which transactions touched an account — an index, not a proof",
+        ),
+        (
+            "POST",
+            "/v1/transactions",
+            "a canonically-encoded Transaction to submit; answers 202 with its id",
         ),
         (
             "POST",

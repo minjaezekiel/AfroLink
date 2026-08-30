@@ -18,13 +18,18 @@ afrolink-rpc.workspace = true
 # The binary path touches neither, and nothing here interprets consensus.
 afrolink-consensus.workspace = true
 afrolink-executor.workspace = true
+afrolink-types.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
 afrolink-bank.workspace = true
+# The submission tests need a real node behind the endpoint; anything less
+# would be testing the trait rather than the path.
+afrolink-node.workspace = true
 afrolink-store.workspace = true
 afrolink-light.workspace = true
+afrolink-pay.workspace = true
 
 [lints]
 workspace = true

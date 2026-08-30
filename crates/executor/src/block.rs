@@ -90,6 +90,25 @@ pub struct BlockContext {
     pub time: Timestamp,
 }
 
+/// Most transactions a block may carry.
+///
+/// **A consensus rule, not a policy knob.** Every validator re-executes every
+/// proposal before voting on it, so without a bound a single proposer can make
+/// the whole network do unbounded work for the cost of one message. There is no
+/// signature or stake check that catches this, because the proposer is entitled
+/// to propose — the only defence is a limit both sides agree on.
+///
+/// At ~1s blocks this is roughly 10 000 transactions a second, which is far more
+/// than the network will see and far less than a machine can be made to choke on.
+pub const MAX_BLOCK_TRANSACTIONS: usize = 10_000;
+
+/// Largest encoded size of a block's transactions, in bytes.
+///
+/// A companion to [`MAX_BLOCK_TRANSACTIONS`], because the two bound different
+/// attacks: a count limit alone still admits ten thousand maximum-size
+/// transactions, and a byte limit alone still admits a million tiny ones.
+pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+
 /// A block: a header and the transactions it commits to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -100,6 +119,25 @@ pub struct Block {
 }
 
 impl Block {
+    /// Whether this block is within the size a validator will execute.
+    ///
+    /// Checked **before** execution, never after: the point is to refuse the
+    /// work, and a check that runs afterwards has already paid for it.
+    #[must_use]
+    pub fn within_size_limits(&self) -> bool {
+        if self.transactions.len() > MAX_BLOCK_TRANSACTIONS {
+            return false;
+        }
+        let mut bytes = 0usize;
+        for transaction in &self.transactions {
+            bytes = bytes.saturating_add(transaction.to_bytes().len());
+            if bytes > MAX_BLOCK_BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Compute the Merkle root over a transaction list.
     ///
     /// Leaves are transaction *ids*, so a light client can prove inclusion of a

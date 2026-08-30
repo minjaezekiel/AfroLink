@@ -37,8 +37,9 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use afrolink_primitives::codec::Encode;
-use afrolink_rpc::{ChainView, QueryError, answer};
+use afrolink_primitives::codec::{Encode, decode_exact};
+use afrolink_rpc::{ChainView, QueryError, Submit, SubmitError, answer};
+use afrolink_types::Transaction;
 
 use crate::route::{Format, Route, RouteError};
 use crate::wire::{HttpResponse, Request, Status, WireError, read_request, write_response};
@@ -49,13 +50,49 @@ use crate::{Config, json, route};
 /// # Panics
 /// Never. Every failure path produces a status code.
 #[must_use]
-pub fn respond<V: ChainView + ?Sized>(view: &V, request: &Request) -> HttpResponse {
+pub fn respond<V, S>(view: &V, submit: &S, request: &Request) -> HttpResponse
+where
+    V: ChainView + ?Sized,
+    S: Submit + ?Sized,
+{
     let route = match route::route(request) {
         Ok(route) => route,
         Err(error) => return from_route_error(&error),
     };
 
     match route {
+        Route::Submit(body) => {
+            // Canonical decoding, so a transaction with trailing bytes is
+            // refused here rather than becoming a second encoding of one
+            // payment further in.
+            let transaction = match decode_exact::<Transaction>(&body) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    return HttpResponse::error(
+                        Status::BadRequest,
+                        &format!("body is not a canonical Transaction: {error}"),
+                    );
+                }
+            };
+            match submit.submit(transaction) {
+                Ok(id) => HttpResponse::json(
+                    Status::Accepted,
+                    format!("{{\"status\":\"pending\",\"id\":\"{}\"}}", id.to_hex()),
+                ),
+                // 202 above, not 200: the node holds it, no block contains it
+                // yet, and a wallet that treats acceptance as settlement will
+                // tell someone their money arrived when it has not.
+                Err(SubmitError::Rejected(why)) => HttpResponse::error(Status::BadRequest, &why),
+                Err(SubmitError::NotAccepting) => HttpResponse::error(
+                    Status::NotImplemented,
+                    "this node does not accept transactions; send it to a validator",
+                ),
+                Err(SubmitError::Backend(_)) => HttpResponse::error(
+                    Status::InternalError,
+                    "the node could not accept the transaction",
+                ),
+            }
+        }
         Route::Preflight => HttpResponse {
             status: Status::NoContent,
             content_type: crate::wire::CONTENT_TYPE_JSON,
@@ -121,6 +158,17 @@ fn from_query_error(error: &QueryError) -> HttpResponse {
         QueryError::NoCommit(height) => HttpResponse::error(
             Status::Unavailable,
             &format!("height {height} has no commit stored yet"),
+        ),
+        QueryError::NoSuchTransaction(id) => HttpResponse::error(
+            Status::NotFound,
+            &format!("no transaction {id} on this node"),
+        ),
+        // 501, not 404 and not an empty list. "This node does not index history"
+        // and "you have no payments" are different answers, and a client that
+        // cannot tell them apart will show the wrong one to a user.
+        QueryError::NotIndexed(what) => HttpResponse::error(
+            Status::NotImplemented,
+            &format!("this node does not maintain {what}; ask a serving node"),
         ),
         // Deliberately not echoed. A backend message carries file paths and
         // database internals, and this endpoint answers strangers.
@@ -215,7 +263,11 @@ impl Server {
     ///
     /// # Errors
     /// Only a listener failure that is not recoverable by continuing.
-    pub fn run<V: ChainView + Sync + ?Sized>(&self, view: &V) -> std::io::Result<()> {
+    pub fn run<V, S>(&self, view: &V, submit: &S) -> std::io::Result<()>
+    where
+        V: ChainView + Sync + ?Sized,
+        S: Submit + Sync + ?Sized,
+    {
         let live = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
@@ -249,7 +301,7 @@ impl Server {
                 live.fetch_add(1, Ordering::SeqCst);
                 let live = &live;
                 scope.spawn(move || {
-                    serve_connection(stream, view, &self.config, &self.stop);
+                    serve_connection(stream, view, submit, &self.config, &self.stop);
                     live.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -270,12 +322,16 @@ fn refuse(stream: TcpStream, config: &Config) {
 }
 
 /// Read and answer requests on one connection until it ends.
-fn serve_connection<V: ChainView + ?Sized>(
+fn serve_connection<V, S>(
     stream: TcpStream,
     view: &V,
+    submit: &S,
     config: &Config,
     stop: &AtomicBool,
-) {
+) where
+    V: ChainView + ?Sized,
+    S: Submit + ?Sized,
+{
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(config.read_timeout));
     let _ = stream.set_write_timeout(Some(config.write_timeout));
@@ -293,7 +349,7 @@ fn serve_connection<V: ChainView + ?Sized>(
 
         let (response, keep_alive) = match read_request(&mut reader, config) {
             Ok(request) => {
-                let response = respond(view, &request);
+                let response = respond(view, submit, &request);
                 let keep = request.keep_alive && response.status.allows_keep_alive();
                 (response, keep)
             }
