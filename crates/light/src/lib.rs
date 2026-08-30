@@ -167,11 +167,9 @@ pub const TRUSTING_PERIOD_MS: u64 = UNBONDING_MS / 3 * 2;
 
 /// How long stake stays slashable after a validator begins exiting.
 ///
-/// 21 days, matching the Cosmos Hub. The number is not arbitrary: it must exceed
-/// the time it takes humans to notice an attack, agree it happened, and act —
-/// because after it elapses the offender's stake is beyond reach and forging old
-/// history becomes free.
-pub const UNBONDING_MS: u64 = 21 * 24 * 60 * 60 * 1_000;
+/// Defined in `afrolink_primitives` and re-exported, because `crates/staking`
+/// enforces the same number and the two must never drift.
+pub use afrolink_primitives::UNBONDING_MS;
 
 // The margin between the two is the whole mechanism: it leaves time to detect
 // misbehaviour and slash while the offender's stake is still bonded. If they

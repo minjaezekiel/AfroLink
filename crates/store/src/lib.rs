@@ -49,7 +49,7 @@ pub use serve::ServedChain;
 
 use afrolink_consensus::Commit;
 use afrolink_crypto::hash::Hash32;
-use afrolink_executor::{Block, Executor, Genesis, GenesisError, GenesisLimits};
+use afrolink_executor::{Block, BlockContext, Executor, Genesis, GenesisError, GenesisLimits};
 use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Encode, decode_exact};
 use afrolink_state::nodes::{Node, NodeSink, NodeSource, WriteStats, commit_tree, load_tree};
@@ -282,7 +282,14 @@ impl ChainStore {
         for h in 1..=tip_height.0 {
             let height = Height(h);
             let block = self.block(height)?.ok_or(StoreError::MissingBlock(h))?;
-            let outcome = executor.execute_block(&mut state, height, &block.transactions);
+            let outcome = executor.execute_block(
+                &mut state,
+                BlockContext {
+                    height,
+                    time: block.header.time,
+                },
+                &block.transactions,
+            );
 
             if outcome.app_hash != block.header.app_hash {
                 return Err(StoreError::StateDivergence {

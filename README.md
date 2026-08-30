@@ -36,10 +36,11 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Recovers from a QR code after six months offline** | Bootstrapping costs 32 scannable bytes, and returning costs forty remembered ones — checked against append-only witness logs in different jurisdictions, so no single party's word is load-bearing. Built for intermittent connectivity rather than apologising for it. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
+| **Misbehaviour costs money** | Equivocation is slashed 5% and jailed, reported permissionlessly by anyone who saw it. Slashing reaches stake that has *already begun unbonding* — otherwise unbonding in the same block would make the whole 21-day window worthless. |
 
 ## Status
 
-**Phase 1 in progress.** Fifteen crates, **442 tests passing**. A working chain:
+**Phase 2 in progress.** Sixteen crates, **482 tests passing**. A working chain:
 four validators propose, vote and commit blocks; a light client verifies a
 payment holding nothing but a 32-byte header; the chain survives a restart; and
 a node answers queries with proofs. Still in-process — no sockets yet.
@@ -61,13 +62,14 @@ crates/
   pay/          afri: payment URIs, payment references                   16 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
   fuzz/         deterministic adversarial-input harness (a test tool)      24 tests ✅
+  staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
 Every case is a pure function of a `u64` seed, so a failure names the seed that
 produced it and reproduces forever. Two suites:
 
-* **~112 000 hostile byte strings** across 28 decoders, asserting that anything
+* **~140 000 hostile byte strings** across 35 decoders, asserting that anything
   which decodes re-encodes to *exactly* the bytes it came from. Two encodings of
   one value is a chain split.
 * **A hostile scheduler** — partitions, packet loss, reordering and injected
@@ -141,6 +143,7 @@ The tests are written adversarially and named for the attack they prevent —
 | [ADR-0009](docs/adr/0009-developer-payment-surface.md) | Accepting payment, building dApps, and what we take from Ethereum, Polkadot and XRPL. |
 | [ADR-0010](docs/adr/0010-long-range-attacks.md) | Long-range attacks — the one thing proof of stake has to answer, and how. |
 | [ADR-0011](docs/adr/0011-objective-anchors.md) | Witness logs: a starting point a wallet can check, not one it is told. |
+| [ADR-0012](docs/adr/0012-staking-and-slashing.md) | Staking, unbonding and slashing — making the economic half of the argument real. |
 
 ## Decisions taken
 

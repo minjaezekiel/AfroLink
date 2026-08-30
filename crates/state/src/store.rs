@@ -64,6 +64,19 @@ pub enum Namespace {
     Contact = 0x0d,
     /// Registry of parties licensed to attest contact bindings.
     Attestor = 0x0e,
+    /// Stake on its way out, keyed by operator.
+    ///
+    /// Separate from [`Self::Validator`] because it answers a different
+    /// question: not "how much is at stake" but "how much is still slashable
+    /// while nobody is relying on it any more". See `crates/staking`.
+    Unbonding = 0x0f,
+    /// The set of every operator holding a bond.
+    ///
+    /// A single key rather than a scan, because the sparse Merkle store answers
+    /// point lookups with proofs and cannot be iterated. The active validator
+    /// set has to be derivable identically on every node, so the candidate list
+    /// has to be state rather than a traversal.
+    BondIndex = 0x10,
 }
 
 /// A namespaced state key.
@@ -153,6 +166,24 @@ impl StoreKey {
     #[must_use]
     pub fn attestor(address: &afrolink_crypto::Address) -> Self {
         Self::new(Namespace::Attestor, &[address.as_bytes()])
+    }
+
+    /// The key for an operator's bond.
+    #[must_use]
+    pub fn bond(operator: &afrolink_crypto::Address) -> Self {
+        Self::new(Namespace::Validator, &[operator.as_bytes()])
+    }
+
+    /// The key for an operator's unbonding queue.
+    #[must_use]
+    pub fn unbonding(operator: &afrolink_crypto::Address) -> Self {
+        Self::new(Namespace::Unbonding, &[operator.as_bytes()])
+    }
+
+    /// The key for the list of every bonded operator.
+    #[must_use]
+    pub fn bond_index() -> Self {
+        Self::new(Namespace::BondIndex, &[])
     }
 
     /// The raw key bytes.

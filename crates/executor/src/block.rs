@@ -75,6 +75,21 @@ impl<'a> ValidatorSets<'a> {
     }
 }
 
+/// The height and time a block is being executed at.
+///
+/// Bundled rather than passed as two arguments for the same reason as
+/// [`ValidatorSets`]: they are both scalars that a caller can silently swap, and
+/// the compiler will not notice. Staking needs both — height decides what a
+/// slash reaches, time decides when stake is released — so this is now the
+/// execution context rather than an incidental pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockContext {
+    /// Height being executed.
+    pub height: Height,
+    /// The block's consensus timestamp.
+    pub time: Timestamp,
+}
+
 /// A block: a header and the transactions it commits to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {

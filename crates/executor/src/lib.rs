@@ -34,7 +34,7 @@
 pub mod block;
 pub mod genesis;
 
-pub use block::{Block, BlockHeader, ValidatorSets};
+pub use block::{Block, BlockContext, BlockHeader, ValidatorSets};
 pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
 
 use afrolink_alias::{BindError, Bindings, Registry, RegistryError};
@@ -42,6 +42,7 @@ use afrolink_bank::{Bank, BankError};
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::{Domain, Hash32};
 use afrolink_primitives::{Amount, ChainId, Height, Timestamp};
+use afrolink_staking::{Staking, StakingError};
 use afrolink_state::{KeyValueStore, StateError, StoreKey};
 use afrolink_types::group::GroupError;
 use afrolink_types::{Account, GroupAccount, Message, Transaction, TxError};
@@ -76,6 +77,9 @@ pub enum ExecError {
     /// A group operation failed.
     #[error(transparent)]
     Group(#[from] GroupError),
+    /// A staking operation failed.
+    #[error(transparent)]
+    Staking(#[from] StakingError),
     /// The named account does not exist.
     #[error("account does not exist")]
     NoSuchAccount,
@@ -157,7 +161,7 @@ impl Executor {
     pub fn execute_block<S>(
         &self,
         store: &mut S,
-        height: Height,
+        ctx: BlockContext,
         transactions: &[Transaction],
     ) -> BlockOutcome
     where
@@ -165,7 +169,7 @@ impl Executor {
     {
         let mut outcomes = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            outcomes.push(self.execute_tx(store, height, tx));
+            outcomes.push(self.execute_tx(store, ctx, tx));
         }
         BlockOutcome {
             app_hash: store.root(),
@@ -190,7 +194,7 @@ impl Executor {
         S: KeyValueStore + Clone,
     {
         let tx_root = Block::tx_root(&transactions);
-        let outcome = self.execute_block(store, height, &transactions);
+        let outcome = self.execute_block(store, BlockContext { height, time }, &transactions);
         let header = BlockHeader {
             chain_id: self.chain_id.clone(),
             height,
@@ -211,14 +215,14 @@ impl Executor {
     }
 
     /// Apply one transaction, isolating its failure.
-    fn execute_tx<S>(&self, store: &mut S, height: Height, tx: &Transaction) -> TxOutcome
+    fn execute_tx<S>(&self, store: &mut S, ctx: BlockContext, tx: &Transaction) -> TxOutcome
     where
         S: KeyValueStore + Clone,
     {
         let tx_id = tx.id();
 
         // Stateless checks first — these cost nothing and reject the cheap attacks.
-        if let Err(e) = tx.verify(&self.chain_id, height) {
+        if let Err(e) = tx.verify(&self.chain_id, ctx.height) {
             return TxOutcome {
                 tx_id,
                 result: Err(e.into()),
@@ -273,7 +277,7 @@ impl Executor {
         let mut sandbox = store.clone();
         let mut failure = None;
         for msg in &tx.body.messages {
-            if let Err(e) = self.apply_message(&mut sandbox, height, tx.body.sender, msg) {
+            if let Err(e) = self.apply_message(&mut sandbox, ctx, tx.body.sender, msg) {
                 failure = Some(e);
                 break;
             }
@@ -307,7 +311,7 @@ impl Executor {
     fn apply_message<S>(
         &self,
         store: &mut S,
-        height: Height,
+        ctx: BlockContext,
         sender: Address,
         msg: &Message,
     ) -> Result<(), ExecError>
@@ -405,23 +409,23 @@ impl Executor {
             // Every arm below is a registry write. None of them move value, and
             // none of them can: an alias resolves, it never authorises.
             Message::RegisterName { name } => {
-                Registry::new(store).register(name, sender, height)?;
+                Registry::new(store).register(name, sender, ctx.height)?;
                 Ok(())
             }
 
             Message::RenewName { name } => {
-                Registry::new(store).renew(name, sender, height)?;
+                Registry::new(store).renew(name, sender, ctx.height)?;
                 Ok(())
             }
 
             Message::TransferName { name, to } => {
-                Registry::new(store).transfer(name, sender, *to, height)?;
+                Registry::new(store).transfer(name, sender, *to, ctx.height)?;
                 ensure_account(store, to);
                 Ok(())
             }
 
             Message::SetPrimaryAlias { name } => {
-                Registry::new(store).set_primary(name, sender, height)?;
+                Registry::new(store).set_primary(name, sender, ctx.height)?;
                 Ok(())
             }
 
@@ -431,7 +435,7 @@ impl Executor {
             } => {
                 // The sender is the attestor; the binding is checked against the
                 // attestor registry, so an ordinary account cannot bind anyone.
-                Bindings::new(store).attest(commitment, *address, sender, height)?;
+                Bindings::new(store).attest(commitment, *address, sender, ctx.height)?;
                 ensure_account(store, address);
                 Ok(())
             }
@@ -440,7 +444,12 @@ impl Executor {
                 commitment,
                 new_address,
             } => {
-                Bindings::new(store).request_rebind(commitment, *new_address, sender, height)?;
+                Bindings::new(store).request_rebind(
+                    commitment,
+                    *new_address,
+                    sender,
+                    ctx.height,
+                )?;
                 Ok(())
             }
 
@@ -466,7 +475,45 @@ impl Executor {
             }
 
             Message::ReleaseName { name } => {
-                Registry::new(store).release(name, sender, height)?;
+                Registry::new(store).release(name, sender, ctx.height)?;
+                Ok(())
+            }
+
+            Message::Bond {
+                public_key,
+                country,
+                amount,
+            } => {
+                Staking::new(store).bond(&sender, *public_key, *country, *amount)?;
+                Ok(())
+            }
+
+            Message::AddStake { amount } => {
+                Staking::new(store).add_stake(&sender, *amount)?;
+                Ok(())
+            }
+
+            Message::Unbond { amount } => {
+                // Both parts of the context matter here: the height is what a
+                // later slash measures the entry against, and the time is what
+                // decides when it may be withdrawn.
+                Staking::new(store).unbond(&sender, *amount, ctx.height, ctx.time)?;
+                Ok(())
+            }
+
+            Message::WithdrawUnbonded => {
+                Staking::new(store).withdraw(&sender, ctx.time)?;
+                Ok(())
+            }
+
+            Message::ReportEquivocation { evidence } => {
+                // Permissionless, and deliberately so: the evidence proves
+                // itself against the validator set, so there is nothing to gain
+                // by lying and no privileged reporter to capture. The reporter
+                // is not paid — see `Bank::slash_native` for why nobody should
+                // profit from a slash.
+                let set = Staking::new(store).active_set()?;
+                Staking::new(store).slash_equivocation(evidence, &set, ctx.height)?;
                 Ok(())
             }
         }
@@ -512,6 +559,18 @@ fn bump_nonce<S: KeyValueStore>(store: &mut S, address: &Address) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Execution context for a test block.
+    ///
+    /// Time is derived from height rather than pinned, because header times are
+    /// strictly monotonic on a real chain and a fixture that repeats one hides
+    /// bugs the light client depends on catching (ADR-0010).
+    fn ctx(height: u64) -> BlockContext {
+        BlockContext {
+            height: Height(height),
+            time: Timestamp::from_millis(1_700_000_000_000 + height * 1_000),
+        }
+    }
     use afrolink_bank::Issuer;
     use afrolink_crypto::SecretKey;
     use afrolink_primitives::Denom;
@@ -577,6 +636,215 @@ mod tests {
         .sign(&sk(sender))
     }
 
+    // -- Staking (ADR-0012) --------------------------------------------------
+
+    /// A store where accounts 1..=4 hold AFRI as well as the sovereign asset.
+    fn staked_store() -> MemoryStore {
+        let mut store = funded_store();
+        let mut bank = Bank::new(&mut store);
+        for i in 1..=4u8 {
+            bank.genesis_allocate(&addr(i), &Denom::native(), Amount::from_afri(100_000))
+                .expect("allocates");
+        }
+        store
+    }
+
+    fn staking_params() -> afrolink_staking::StakingParams {
+        afrolink_staking::StakingParams {
+            min_bond: Amount::from_afri(1_000),
+            ..afrolink_staking::StakingParams::default()
+        }
+    }
+
+    #[test]
+    fn a_bond_submitted_as_a_transaction_joins_the_validator_set() {
+        // The point of the module: who signs blocks is now decided by who has
+        // staked, through an ordinary transaction anyone can send.
+        let mut store = staked_store();
+        let exec = Executor::new(chain());
+
+        let bond = Message::Bond {
+            public_key: sk(1).public_key(),
+            country: afrolink_consensus::CountryCode::new("ke").expect("valid"),
+            amount: Amount::from_afri(50_000),
+        };
+        let outcome = exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![bond])]);
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+
+        let set = Staking::with_params(&mut store, staking_params())
+            .active_set()
+            .expect("set forms");
+        assert_eq!(set.validators().len(), 1);
+    }
+
+    #[test]
+    fn an_unbonding_transaction_does_not_release_funds_immediately() {
+        // The 21-day window has to survive the transaction path, not just the
+        // module API — the light client's trusting period is derived from it.
+        let mut store = staked_store();
+        let exec = Executor::new(chain());
+
+        let bond = Message::Bond {
+            public_key: sk(1).public_key(),
+            country: afrolink_consensus::CountryCode::new("ke").expect("valid"),
+            amount: Amount::from_afri(50_000),
+        };
+        exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![bond])]);
+
+        let after_bond = Bank::new(&mut store)
+            .balance(&addr(1), &Denom::native())
+            .expect("reads");
+
+        let out = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(
+                1,
+                1,
+                vec![Message::Unbond {
+                    amount: Amount::from_afri(50_000),
+                }],
+            )],
+        );
+        assert_eq!(out.succeeded(), 1, "{:?}", out.outcomes[0].result);
+
+        // Withdrawing in the very next block must fail: nothing has matured.
+        let early = exec.execute_block(
+            &mut store,
+            ctx(3),
+            &[tx(1, 2, vec![Message::WithdrawUnbonded])],
+        );
+        assert_eq!(early.succeeded(), 0, "funds released before the period");
+
+        assert_eq!(
+            Bank::new(&mut store)
+                .balance(&addr(1), &Denom::native())
+                .expect("reads"),
+            after_bond,
+            "the balance must not have moved"
+        );
+    }
+
+    #[test]
+    fn anyone_can_report_equivocation_and_the_offender_is_punished() {
+        // Permissionless reporting: the evidence proves itself, so there is no
+        // privileged reporter to capture and nothing to gain by lying.
+        use afrolink_consensus::{Equivocation, Vote, VoteType};
+
+        let mut store = staked_store();
+        let exec = Executor::new(chain());
+
+        for signer in 1..=2u8 {
+            let bond = Message::Bond {
+                public_key: sk(signer).public_key(),
+                country: afrolink_consensus::CountryCode::new("ke").expect("valid"),
+                amount: Amount::from_afri(50_000),
+            };
+            let r = exec.execute_block(
+                &mut store,
+                ctx(u64::from(signer)),
+                &[tx(signer, 0, vec![bond])],
+            );
+            assert_eq!(r.succeeded(), 1, "{:?}", r.outcomes[0].result);
+        }
+
+        let vote_for = |block: [u8; 32]| {
+            Vote {
+                chain_id: chain(),
+                height: Height(3),
+                round: afrolink_primitives::Round::ZERO,
+                vote_type: VoteType::Precommit,
+                block_id: Some(Hash32::from_bytes(block)),
+                validator: addr(1),
+            }
+            .sign(&sk(1))
+        };
+        let evidence = Equivocation {
+            validator: addr(1),
+            first: vote_for([0xAA; 32]),
+            second: vote_for([0xBB; 32]),
+        };
+
+        // Reported by account 3, who is not a validator and gains nothing.
+        let report = exec.execute_block(
+            &mut store,
+            ctx(4),
+            &[tx(
+                3,
+                0,
+                vec![Message::ReportEquivocation {
+                    evidence: Box::new(evidence),
+                }],
+            )],
+        );
+        assert_eq!(report.succeeded(), 1, "{:?}", report.outcomes[0].result);
+
+        let bond = Staking::new(&mut store)
+            .bond_of(&addr(1))
+            .expect("reads")
+            .expect("bonded");
+        assert!(bond.jailed, "the offender must be jailed");
+        assert_eq!(
+            bond.bonded,
+            Amount::from_afri(47_500),
+            "5% of the stake must be gone"
+        );
+    }
+
+    #[test]
+    fn an_accusation_submitted_as_a_transaction_destroys_nothing() {
+        use afrolink_consensus::{Equivocation, Vote, VoteType};
+
+        let mut store = staked_store();
+        let exec = Executor::new(chain());
+        let bond = Message::Bond {
+            public_key: sk(1).public_key(),
+            country: afrolink_consensus::CountryCode::new("ke").expect("valid"),
+            amount: Amount::from_afri(50_000),
+        };
+        exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![bond])]);
+
+        // Two votes signed by account 2, blamed on account 1.
+        let vote_for = |block: [u8; 32]| {
+            Vote {
+                chain_id: chain(),
+                height: Height(3),
+                round: afrolink_primitives::Round::ZERO,
+                vote_type: VoteType::Precommit,
+                block_id: Some(Hash32::from_bytes(block)),
+                validator: addr(2),
+            }
+            .sign(&sk(2))
+        };
+        let framed = Equivocation {
+            validator: addr(1),
+            first: vote_for([0xAA; 32]),
+            second: vote_for([0xBB; 32]),
+        };
+
+        let report = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(
+                3,
+                0,
+                vec![Message::ReportEquivocation {
+                    evidence: Box::new(framed),
+                }],
+            )],
+        );
+        assert_eq!(report.succeeded(), 0, "a framed accusation must be refused");
+        assert_eq!(
+            Staking::new(&mut store)
+                .bond_of(&addr(1))
+                .expect("reads")
+                .expect("bonded")
+                .bonded,
+            Amount::from_afri(50_000),
+            "an accusation must not move money"
+        );
+    }
+
     // -- Human-readable addressing (ADR-0008) --------------------------------
 
     #[test]
@@ -589,7 +857,7 @@ mod tests {
 
         let outcome = exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(1, 0, vec![Message::RegisterName { name: name.clone() }])],
         );
         assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
@@ -612,7 +880,7 @@ mod tests {
 
         let first = exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(
                 1,
                 0,
@@ -625,7 +893,7 @@ mod tests {
 
         let second = exec.execute_block(
             &mut store,
-            Height(2),
+            ctx(2),
             &[tx(
                 2,
                 0,
@@ -647,14 +915,14 @@ mod tests {
 
         exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(1, 0, vec![Message::RegisterName { name: name.clone() }])],
         );
 
         // Account 2 tries to hand account 1's name to itself.
         let theft = exec.execute_block(
             &mut store,
-            Height(2),
+            ctx(2),
             &[tx(
                 2,
                 0,
@@ -692,7 +960,7 @@ mod tests {
 
         let outcome = exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(
                 1,
                 0,
@@ -732,7 +1000,7 @@ mod tests {
             amount: Amount::from_afri(500),
             reference: None,
         };
-        let outcome = exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![transfer])]);
+        let outcome = exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![transfer])]);
 
         assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
         let bank = Bank::new(&mut store);
@@ -756,8 +1024,8 @@ mod tests {
         let mut a = funded_store();
         let mut b = funded_store();
         let exec = Executor::new(chain());
-        let ra = exec.execute_block(&mut a, Height(1), &txs);
-        let rb = exec.execute_block(&mut b, Height(1), &txs);
+        let ra = exec.execute_block(&mut a, ctx(1), &txs);
+        let rb = exec.execute_block(&mut b, ctx(1), &txs);
 
         assert_eq!(
             ra.app_hash, rb.app_hash,
@@ -789,12 +1057,12 @@ mod tests {
         let mut a = funded_store();
         let ordered = exec.execute_block(
             &mut a,
-            Height(1),
+            ctx(1),
             &[tx(1, 0, fund.clone()), tx(5, 0, spend.clone())],
         );
 
         let mut b = funded_store();
-        let reversed = exec.execute_block(&mut b, Height(1), &[tx(5, 0, spend), tx(1, 0, fund)]);
+        let reversed = exec.execute_block(&mut b, ctx(1), &[tx(5, 0, spend), tx(1, 0, fund)]);
 
         assert_eq!(
             ordered.succeeded(),
@@ -827,10 +1095,10 @@ mod tests {
             }],
         );
 
-        let first = exec.execute_block(&mut store, Height(1), std::slice::from_ref(&t));
+        let first = exec.execute_block(&mut store, ctx(1), std::slice::from_ref(&t));
         assert_eq!(first.succeeded(), 1);
 
-        let replay = exec.execute_block(&mut store, Height(2), &[t]);
+        let replay = exec.execute_block(&mut store, ctx(2), &[t]);
         assert!(matches!(
             replay.outcomes[0].result,
             Err(ExecError::WrongNonce {
@@ -856,7 +1124,7 @@ mod tests {
             }],
         );
 
-        let outcome = exec.execute_block(&mut store, Height(1), &[overspend]);
+        let outcome = exec.execute_block(&mut store, ctx(1), &[overspend]);
         assert!(!outcome.outcomes[0].succeeded());
         assert_eq!(outcome.outcomes[0].fee_charged, Amount::from_units(1_000));
 
@@ -890,7 +1158,7 @@ mod tests {
                 },
             ],
         );
-        exec.execute_block(&mut store, Height(1), &[t]);
+        exec.execute_block(&mut store, ctx(1), &[t]);
 
         let bank = Bank::new(&mut store);
         assert_eq!(
@@ -906,7 +1174,7 @@ mod tests {
         let exec = Executor::new(chain());
         exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(
                 1,
                 0,
@@ -960,7 +1228,7 @@ mod tests {
             &[addr(1).as_bytes().as_slice(), &0u64.to_le_bytes()].concat(),
         );
 
-        let r = exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![create])]);
+        let r = exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![create])]);
         assert_eq!(r.succeeded(), 1, "{:?}", r.outcomes[0].result);
 
         // Each member contributes 1,000 KES.
@@ -977,7 +1245,7 @@ mod tests {
                 )
             })
             .collect();
-        let r = exec.execute_block(&mut store, Height(2), &contributions);
+        let r = exec.execute_block(&mut store, ctx(2), &contributions);
         assert_eq!(r.succeeded(), 3, "{:?}", r.outcomes);
 
         {
@@ -992,7 +1260,7 @@ mod tests {
         // The pot rotates to the first member in the order.
         let r = exec.execute_block(
             &mut store,
-            Height(3),
+            ctx(3),
             &[tx(
                 2,
                 1,
@@ -1047,12 +1315,12 @@ mod tests {
             Domain::GroupAddress,
             &[addr(1).as_bytes().as_slice(), &0u64.to_le_bytes()].concat(),
         );
-        exec.execute_block(&mut store, Height(1), &[tx(1, 0, vec![create])]);
+        exec.execute_block(&mut store, ctx(1), &[tx(1, 0, vec![create])]);
 
         // Account 4 is not a member.
         let r = exec.execute_block(
             &mut store,
-            Height(2),
+            ctx(2),
             &[tx(
                 4,
                 0,
@@ -1106,7 +1374,7 @@ mod tests {
         let exec = Executor::new(ChainId::new("afrolink-9").expect("valid"));
         let r = exec.execute_block(
             &mut store,
-            Height(1),
+            ctx(1),
             &[tx(
                 1,
                 0,

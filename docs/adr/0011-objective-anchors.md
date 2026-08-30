@@ -54,6 +54,7 @@ protocol design escapes it.
 | **Work** — Bitcoin timestamping | A forged history cannot appear in old Bitcoin blocks | **Take, as layer 2.** The only one that removes subjectivity rather than softening it |
 | **Time** — VDF / sequential work | Forging a year needs a year of non-parallelisable compute | **No.** Degrades against hardware: a 10× faster evaluator forges a year in five weeks. New primitive, new node role, new incentive, and a guarantee that erodes with someone else's silicon budget |
 | **Erasure** — key-evolving signatures | Old keys physically cannot re-sign | **Still deferred**, per ADR-0010. Silent operational failure |
+| **Economic** — slashable stake | Forging recent history is punishable | **Now enforced**, per [ADR-0012](0012-staking-and-slashing.md) — it was a parameter when this was written |
 | **Statistics** — Ouroboros Genesis | Honest chain is denser | **Still admired, still unshipped** |
 | **Trust** — checkpoints | Someone tells you | What we had, and the thing to improve |
 

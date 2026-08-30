@@ -169,11 +169,12 @@ ADR-0011 narrows this assumption from "believe whoever supplied the checkpoint"
 to "believe that witnesses in several jurisdictions are not colluding", and
 specifies a Bitcoin anchor that would remove it outright.
 
-**Deliberately not done.** Validator set *changes* are committed to in headers
-but there is no mechanism to actually change the set yet — that is staking, and
-it is Phase 2. The commitments are in place so that when it lands, light clients
-already follow it safely. Slashing is likewise Phase 2, and until it exists the
-unbonding period is a documented parameter rather than an enforced one.
+**Deliberately not done — now done.** This ADR left validator set *changes* and
+slashing to Phase 2, so the unbonding period was a documented parameter rather
+than an enforced one. [ADR-0012](0012-staking-and-slashing.md) closes that:
+`UNBONDING_MS` now locks real money and equivocation costs its author 5%. The
+header commitments introduced here were built for exactly that moment, and
+light clients needed no change when it landed.
 
 ## Revisit if
 

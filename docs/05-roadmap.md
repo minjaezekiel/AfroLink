@@ -62,10 +62,19 @@ deterministic simulator in `crates/node/src/sim.rs`.
 - [ ] Model checking the round state machine (TLA+ / Stateright). The randomised
       scheduler explores, it does not enumerate — a rare interleaving can sit
       outside every seed tried
-- [ ] Staking and validator set changes — the headers already commit to set
-      transitions, so light clients follow them safely once this lands *(ADR-0010)*
-- [ ] Slashing for double-sign and downtime, and enforcing the 21-day unbonding
-      period the trusting period is derived from *(ADR-0010)*
+- [x] Staking and validator set changes — bonding, unbonding and set derivation
+      from stake. The headers already committed to set transitions, so light
+      clients needed no change *([ADR-0012](adr/0012-staking-and-slashing.md))*
+- [x] Slashing for double-sign, and enforcing the 21-day unbonding period the
+      trusting period is derived from. Slashing reaches stake that has already
+      begun unbonding, which is what makes the window worth anything
+      *([ADR-0012](adr/0012-staking-and-slashing.md))*
+- [ ] Downtime slashing — needs the per-block vote history a networked node has
+- [ ] Delegation — stake through another operator. Deliberately deferred:
+      reward accounting and slashing across delegators is the largest addition
+      to the staking surface *(ADR-0012)*
+- [ ] Epoch rotation — `active_set()` derives the set; nothing yet installs it
+      at a boundary. That is the node's job and arrives with networking
 - [ ] Bisection helper for skipping sync — the protocol supports it; the retry
       loop that halves the gap on `InsufficientOverlap` is not written
 - [ ] **Witness log transport** — `crates/witness` is transport-free by design;

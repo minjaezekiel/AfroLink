@@ -41,7 +41,7 @@ use afrolink_consensus::{
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
-use afrolink_executor::{Block, Executor, ValidatorSets};
+use afrolink_executor::{Block, BlockContext, Executor, ValidatorSets};
 use afrolink_primitives::{ChainId, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore};
 use afrolink_types::Transaction;
@@ -275,9 +275,14 @@ impl Node {
             return false;
         }
         let mut trial = self.store.clone();
-        let outcome = self
-            .executor
-            .execute_block(&mut trial, self.height, &block.transactions);
+        let outcome = self.executor.execute_block(
+            &mut trial,
+            BlockContext {
+                height: self.height,
+                time: block.header.time,
+            },
+            &block.transactions,
+        );
         outcome.app_hash == block.header.app_hash
     }
 
@@ -372,8 +377,14 @@ impl Node {
             .unwrap_or_default();
         let commit = Commit::new(self.height, round, block_id, signatures);
 
-        self.executor
-            .execute_block(&mut self.store, self.height, &block.transactions);
+        self.executor.execute_block(
+            &mut self.store,
+            BlockContext {
+                height: self.height,
+                time: block.header.time,
+            },
+            &block.transactions,
+        );
 
         self.decided = true;
         self.committed.push(block.clone());

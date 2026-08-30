@@ -341,6 +341,24 @@ impl Decode for Vote {
     }
 }
 
+impl Encode for Equivocation {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.validator.encode(out);
+        self.first.encode(out);
+        self.second.encode(out);
+    }
+}
+
+impl Decode for Equivocation {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            validator: Address::decode(r)?,
+            first: SignedVote::decode(r)?,
+            second: SignedVote::decode(r)?,
+        })
+    }
+}
+
 impl Encode for SignedVote {
     fn encode(&self, out: &mut Vec<u8>) {
         self.vote.encode(out);

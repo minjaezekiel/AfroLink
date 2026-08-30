@@ -296,6 +296,74 @@ fn state_proof_decoders_stay_canonical_under_attack() {
 }
 
 #[test]
+fn staking_decoders_stay_canonical_under_attack() {
+    // These decide who signs blocks and whose money is destroyed, so a decoder
+    // that accepts two forms of one value here is as serious as it gets.
+    use afrolink_consensus::Equivocation;
+    use afrolink_staking::{Bond, Unbonding};
+
+    hammer::<Bond>(
+        "Bond",
+        &Bond::new(
+            addr(1),
+            key(1).public_key(),
+            CountryCode::new("ke").expect("valid"),
+            Amount::from_afri(50_000),
+        ),
+        ROUNDS,
+    );
+    hammer::<Unbonding>(
+        "Unbonding",
+        &Unbonding {
+            amount: Amount::from_afri(1_000),
+            started_at: Height(42),
+            completes_at: Timestamp::from_millis(1_700_000_000_000),
+        },
+        ROUNDS,
+    );
+    hammer::<Equivocation>(
+        "Equivocation",
+        &Equivocation {
+            validator: addr(1),
+            first: vote().sign(&key(1)),
+            second: Vote {
+                block_id: Some(Hash32::from_bytes([9u8; 32])),
+                ..vote()
+            }
+            .sign(&key(1)),
+        },
+        ROUNDS,
+    );
+
+    // And the transaction messages that reach them.
+    for (label, msg) in [
+        (
+            "Message::Bond",
+            Message::Bond {
+                public_key: key(1).public_key(),
+                country: CountryCode::new("ke").expect("valid"),
+                amount: Amount::from_afri(50_000),
+            },
+        ),
+        (
+            "Message::Unbond",
+            Message::Unbond {
+                amount: Amount::from_afri(1_000),
+            },
+        ),
+        (
+            "Message::AddStake",
+            Message::AddStake {
+                amount: Amount::from_afri(1_000),
+            },
+        ),
+        ("Message::WithdrawUnbonded", Message::WithdrawUnbonded),
+    ] {
+        hammer::<Message>(label, &msg, ROUNDS);
+    }
+}
+
+#[test]
 fn witness_decoders_stay_canonical_under_attack() {
     let head = TreeHead {
         log: LogId::from_public_key(&key(200).public_key()),

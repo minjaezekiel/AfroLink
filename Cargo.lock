@@ -53,6 +53,7 @@ dependencies = [
  "afrolink-consensus",
  "afrolink-crypto",
  "afrolink-primitives",
+ "afrolink-staking",
  "afrolink-state",
  "afrolink-types",
  "thiserror",
@@ -70,6 +71,7 @@ dependencies = [
  "afrolink-light",
  "afrolink-pay",
  "afrolink-primitives",
+ "afrolink-staking",
  "afrolink-state",
  "afrolink-types",
  "afrolink-witness",
@@ -138,6 +140,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "afrolink-staking"
+version = "0.1.0"
+dependencies = [
+ "afrolink-bank",
+ "afrolink-consensus",
+ "afrolink-crypto",
+ "afrolink-primitives",
+ "afrolink-state",
+ "thiserror",
+]
+
+[[package]]
 name = "afrolink-state"
 version = "0.1.0"
 dependencies = [
@@ -169,6 +183,7 @@ name = "afrolink-types"
 version = "0.1.0"
 dependencies = [
  "afrolink-alias",
+ "afrolink-consensus",
  "afrolink-crypto",
  "afrolink-pay",
  "afrolink-primitives",

@@ -13,6 +13,7 @@ afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-alias.workspace = true
 afrolink-pay.workspace = true
+afrolink-consensus.workspace = true
 thiserror.workspace = true
 
 [lints]

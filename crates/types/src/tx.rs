@@ -16,6 +16,7 @@
 //! signature can never be presented as a consensus vote.
 
 use afrolink_alias::{ContactCommitment, Username};
+use afrolink_consensus::{CountryCode, Equivocation};
 use afrolink_crypto::hash::{Domain, Hash32, hash};
 use afrolink_crypto::{Address, CryptoError, PublicKey, SecretKey, Signature};
 use afrolink_pay::PaymentReference;
@@ -245,6 +246,47 @@ pub enum Message {
         /// The contact to unbind.
         commitment: ContactCommitment,
     },
+
+    /// Lock AFRI and register as a validator candidate.
+    Bond {
+        /// The consensus key this operator will sign blocks with.
+        ///
+        /// Deliberately not the sender's key: the consensus key lives on a
+        /// machine that is online continuously, and the account holding the
+        /// money should not have to be.
+        public_key: PublicKey,
+        /// Where the operator is, for the concentration limits in ADR-0007.
+        country: CountryCode,
+        /// How much to lock.
+        amount: Amount,
+    },
+    /// Add to an existing bond.
+    AddStake {
+        /// How much more to lock.
+        amount: Amount,
+    },
+    /// Begin withdrawing stake.
+    ///
+    /// The stake leaves the active set at once and stays slashable for the
+    /// unbonding period — see `crates/staking`.
+    Unbond {
+        /// How much to queue for withdrawal.
+        amount: Amount,
+    },
+    /// Collect every unbonding entry whose period has elapsed.
+    WithdrawUnbonded,
+    /// Submit proof that a validator signed two conflicting votes.
+    ///
+    /// Permissionless on purpose: anyone who observes the two signatures can
+    /// report them. The evidence proves itself, so there is nothing to gain by
+    /// lying and no privileged reporter to capture.
+    ///
+    /// Boxed because two signed votes are far larger than any other message,
+    /// and an enum is as big as its largest variant.
+    ReportEquivocation {
+        /// The two conflicting votes.
+        evidence: Box<Equivocation>,
+    },
 }
 
 /// The signed portion of a transaction.
@@ -297,14 +339,21 @@ impl TxBody {
         }
         for msg in &self.messages {
             match msg {
-                Message::Transfer { amount, .. } | Message::ContributeToGroup { amount, .. } => {
+                Message::Transfer { amount, .. }
+                | Message::ContributeToGroup { amount, .. }
+                | Message::Bond { amount, .. }
+                | Message::AddStake { amount }
+                | Message::Unbond { amount } => {
                     if amount.is_zero() {
                         return Err(TxError::ZeroAmount);
                     }
                 }
-                // Alias messages move no value, so there is nothing here to
-                // check beyond what their own types already enforce on decode.
-                Message::CreateGroup { .. }
+                // These move no value, or carry evidence that proves itself,
+                // so there is nothing here to check beyond what their own types
+                // already enforce on decode.
+                Message::WithdrawUnbonded
+                | Message::ReportEquivocation { .. }
+                | Message::CreateGroup { .. }
                 | Message::GroupPayout { .. }
                 | Message::RegisterName { .. }
                 | Message::RenewName { .. }
@@ -490,6 +539,29 @@ impl Encode for Message {
                 out.push(13);
                 name.encode(out);
             }
+            Self::Bond {
+                public_key,
+                country,
+                amount,
+            } => {
+                out.push(14);
+                public_key.encode(out);
+                country.encode(out);
+                amount.encode(out);
+            }
+            Self::AddStake { amount } => {
+                out.push(15);
+                amount.encode(out);
+            }
+            Self::Unbond { amount } => {
+                out.push(16);
+                amount.encode(out);
+            }
+            Self::WithdrawUnbonded => out.push(17),
+            Self::ReportEquivocation { evidence } => {
+                out.push(18);
+                evidence.encode(out);
+            }
         }
     }
 }
@@ -547,6 +619,21 @@ impl Decode for Message {
             12 => Ok(Self::ClearPrimaryAlias),
             13 => Ok(Self::ReleaseName {
                 name: Username::decode(r)?,
+            }),
+            14 => Ok(Self::Bond {
+                public_key: PublicKey::decode(r)?,
+                country: CountryCode::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            15 => Ok(Self::AddStake {
+                amount: Amount::decode(r)?,
+            }),
+            16 => Ok(Self::Unbond {
+                amount: Amount::decode(r)?,
+            }),
+            17 => Ok(Self::WithdrawUnbonded),
+            18 => Ok(Self::ReportEquivocation {
+                evidence: Box::new(Equivocation::decode(r)?),
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

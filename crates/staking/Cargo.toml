@@ -1,22 +1,19 @@
 [package]
-name = "afrolink-executor"
+name = "afrolink-staking"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Deterministic block execution: applies transactions to state and commits an app hash."
+description = "Bonding, unbonding and slashing — the economic half of the security argument the light client already assumes."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-state.workspace = true
-afrolink-types.workspace = true
 afrolink-bank.workspace = true
-afrolink-alias.workspace = true
 afrolink-consensus.workspace = true
-afrolink-staking.workspace = true
 thiserror.workspace = true
 
 [lints]

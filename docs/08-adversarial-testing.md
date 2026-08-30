@@ -22,7 +22,7 @@ a `proptest` or `cargo-fuzz` dependency — the same reason the codec is not ser
 
 ### 1. `crates/fuzz` — bytes from a hostile peer
 
-~112 000 inputs across 28 decoders, plus ~45 000 forged proofs. Three properties:
+~140 000 inputs across 35 decoders, plus ~45 000 forged proofs. Three properties:
 
 | Property | What it prevents |
 |---|---|
@@ -137,8 +137,11 @@ Named gaps, so they are not mistaken for coverage:
 
 - **No network.** Everything is in-process. Eclipse attacks, peer scoring,
   resource exhaustion and DoS are untestable until libp2p lands.
-- **No staking or slashing**, so the *economic* half of the long-range defence is
-  a documented parameter rather than an enforced one.
+- ~~No staking or slashing~~ — **closed** by
+  [ADR-0012](adr/0012-staking-and-slashing.md). Unbonding now locks real money,
+  equivocation is slashed, and the staking types are in the fuzz suite. What is
+  still untested is the *economics*: whether 5% and 21 days are the right
+  numbers is a question about operator behaviour, not about code.
 - **The scheduler explores randomly, not exhaustively.** It is not a model
   checker, and a rare interleaving may sit outside any seed tried. TLA+ or Stateright
   over the round state machine would be the honest next step.

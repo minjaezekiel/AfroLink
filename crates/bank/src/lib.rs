@@ -399,6 +399,49 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         Ok(())
     }
 
+    /// Destroy native coin held by the staking module, lowering supply.
+    ///
+    /// The counterpart to [`Self::emit_native`], and the only path that reduces
+    /// AFRI supply. [`Self::burn`] deliberately refuses the native coin: burning
+    /// there is an *issuer* power over a sovereign stablecoin, and no issuer may
+    /// ever touch AFRI.
+    ///
+    /// Slashed stake is destroyed rather than redistributed. Paying it to
+    /// anybody — a treasury, the reporter, the remaining validators — creates a
+    /// party that profits from slashing, and therefore a party with a reason to
+    /// manufacture it. Burning leaves every holder better off in proportion and
+    /// nobody better off in particular.
+    ///
+    /// Callers must be module code. Nothing reachable from a transaction
+    /// signature may call this.
+    ///
+    /// # Errors
+    /// [`BankError::ZeroAmount`], [`BankError::InsufficientFunds`] if the
+    /// account does not hold that much, or [`BankError::Overflow`].
+    pub fn slash_native(&mut self, from: &Address, amount: Amount) -> Result<()> {
+        if amount.is_zero() {
+            return Err(BankError::ZeroAmount);
+        }
+        let denom = Denom::native();
+        let balance = self.balance(from, &denom)?;
+        let new_balance =
+            balance
+                .checked_sub(amount)
+                .map_err(|_| BankError::InsufficientFunds {
+                    denom: denom.to_string(),
+                    needed: amount.to_string(),
+                    available: balance.to_string(),
+                })?;
+        let supply = self.total_supply(&denom)?;
+        let new_supply = supply
+            .checked_sub(amount)
+            .map_err(|_| BankError::Overflow("slash/supply"))?;
+
+        self.write_balance(from, &denom, new_balance);
+        self.write_supply(&denom, new_supply);
+        Ok(())
+    }
+
     /// Credit an allocation at genesis, raising supply.
     ///
     /// The one path that creates value without an authority check, because at

@@ -23,6 +23,7 @@ afrolink-light.workspace = true
 afrolink-alias.workspace = true
 afrolink-pay.workspace = true
 afrolink-witness.workspace = true
+afrolink-staking.workspace = true
 
 [lints]
 workspace = true
