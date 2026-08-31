@@ -51,7 +51,7 @@ use afrolink_crypto::hash::Hash32;
 use afrolink_executor::{MAX_BLOCK_BYTES, MAX_BLOCK_TRANSACTIONS};
 use afrolink_primitives::codec::Encode;
 use afrolink_primitives::{ChainId, Height};
-use afrolink_types::{Transaction, TxError};
+use afrolink_types::{Account, Transaction, TxError};
 use thiserror::Error;
 
 /// How much a node is willing to hold on someone else's behalf.
@@ -115,6 +115,19 @@ pub enum Rejected {
     /// Stateless verification failed.
     #[error(transparent)]
     Invalid(#[from] TxError),
+    /// The signatures are genuine, but not from keys entitled to act for the
+    /// sender.
+    ///
+    /// Checked **here**, not only in the executor. Since authorisation became a
+    /// fact about the account record rather than about the transaction alone,
+    /// stateless verification no longer ties a signature to a sender — so
+    /// without this check anyone could sign a body naming any address and make
+    /// a node hold it, gossip it, and re-check it forever.
+    #[error("the signing keys are not authorised for this account")]
+    Unauthorised,
+    /// The named fee payer did not consent to covering this fee.
+    #[error("the named fee payer did not authorise this transaction")]
+    SponsorUnauthorised,
 }
 
 /// A bounded, validated queue of pending transactions.
@@ -171,7 +184,15 @@ impl Mempool {
 
     /// Offer a transaction to the pool.
     ///
-    /// `next_nonce` is the sender's current sequence number in committed state.
+    /// `sender_account` is the sender's record in committed state. It carries
+    /// both facts this needs — the next nonce, and who may sign — and passing
+    /// the record rather than the nonce alone is what keeps those two answers
+    /// from being read at different heights.
+    ///
+    /// `fee_payer_account` is the sponsor's record, when the fee names one. A
+    /// sponsored fee spends a third party's balance, so a pool that skipped this
+    /// would hold and gossip transactions that drain strangers.
+    ///
     /// Checks run cheapest-first, so a hostile peer pays for the expensive one —
     /// signature verification — only after everything free has passed.
     ///
@@ -182,10 +203,12 @@ impl Mempool {
         transaction: Transaction,
         chain_id: &ChainId,
         height: Height,
-        next_nonce: u64,
+        sender_account: &Account,
+        fee_payer_account: Option<&Account>,
     ) -> Result<Hash32, Rejected> {
         let sender = transaction.body.sender;
         let nonce = transaction.body.nonce;
+        let next_nonce = sender_account.nonce;
 
         if nonce < next_nonce {
             return Err(Rejected::NonceTooLow {
@@ -216,8 +239,18 @@ impl Mempool {
             return Err(Rejected::Full);
         }
 
-        // Last, because it is the only check that costs real CPU.
-        transaction.verify(chain_id, height)?;
+        // Last, because these are the only checks that cost real CPU.
+        transaction.verify_stateless(chain_id, height)?;
+        if !sender_account.authorises(&transaction.signing_keys()) {
+            return Err(Rejected::Unauthorised);
+        }
+        // A sponsored fee spends someone else's balance, so the pool must not
+        // hold or gossip one the sponsor never agreed to.
+        if transaction.body.fee.is_sponsored()
+            && !fee_payer_account.is_some_and(|payer| payer.authorises(&transaction.sponsor_keys()))
+        {
+            return Err(Rejected::SponsorUnauthorised);
+        }
 
         let id = transaction.id();
         if self.by_id.contains_key(&id) {
@@ -363,8 +396,11 @@ mod tests {
         Mempool::new(MempoolLimits::default())
     }
 
+    /// Offer a transaction, with the sender's account at nonce `next`.
     fn insert(pool: &mut Mempool, transaction: Transaction, next: u64) -> Result<Hash32, Rejected> {
-        pool.insert(transaction, &chain(), Height(1), next)
+        let mut sender = Account::individual(transaction.body.sender);
+        sender.nonce = next;
+        pool.insert(transaction, &chain(), Height(1), &sender, None)
     }
 
     #[test]
@@ -407,15 +443,36 @@ mod tests {
     fn a_forged_signature_never_reaches_the_pool() {
         let mut pool = pool();
         let mut forged = tx(1, 0, 100);
-        // Re-sign the same body with someone else's key: the signature is
-        // valid, it just is not the sender's.
-        forged.signature = forged.body.clone().sign(&key(9)).signature;
+        // Sign the same body with someone else's key. The signature is
+        // perfectly valid — it just is not from a key the sender's account
+        // recognises. Since authorisation became stateful, this is the check
+        // that keeps a stranger from filling a validator's memory with
+        // transactions naming addresses they do not hold.
+        forged.signatures = forged.body.clone().sign(&key(9)).signatures;
 
-        assert!(matches!(
+        assert_eq!(
             insert(&mut pool, forged, 0).unwrap_err(),
-            Rejected::Invalid(_)
-        ));
+            Rejected::Unauthorised
+        );
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn a_rotated_key_is_accepted_where_the_master_key_would_be_too() {
+        // The other half: the pool must not refuse a transaction the executor
+        // would apply, or a user who rotated their key could never transact.
+        let mut pool = pool();
+        let mut rotated = tx(1, 0, 100);
+        rotated.signatures = rotated.body.clone().sign(&key(9)).signatures;
+
+        let mut sender = Account::individual(rotated.body.sender);
+        sender.regular_key = Some(key(9).public_key());
+
+        assert!(
+            pool.insert(rotated, &chain(), Height(1), &sender, None)
+                .is_ok(),
+            "a regular key must be as good as the master key here"
+        );
     }
 
     #[test]

@@ -91,6 +91,11 @@ NGO covers gas for its users. Combined with phone-number aliases and social
 recovery, this is what makes the wallet feel like M-Pesa rather than like a
 wallet.
 
+**The sponsor co-signs.** A transaction naming a fee payer carries that payer's
+own signatures, checked against the payer's account record. Without that, naming
+a fee payer would be a way to spend their money — which is exactly what it was,
+until [08](08-adversarial-testing.md) §7.
+
 > This single feature does more for adoption than any throughput number.
 > Requirement R2 exists because of it.
 

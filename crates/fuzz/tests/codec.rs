@@ -27,7 +27,8 @@ use afrolink_pay::PaymentReference;
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, Proof, ProofLeaf, StoreKey};
 use afrolink_types::{
-    Account, AccountFlag, AccountFlags, AccountKind, Fee, Message, Transaction, TxBody,
+    Account, AccountFlag, AccountFlags, AccountKind, Fee, Message, Signer, SignerList, Transaction,
+    TxBody,
 };
 use afrolink_witness::{Checkpoint, LogEntry, LogId, SignedTreeHead, TreeHead};
 
@@ -195,13 +196,23 @@ fn transaction_decoders_stay_canonical_under_attack() {
     hammer::<Fee>("Fee", &body.fee, ROUNDS);
     hammer::<Message>("Message", &body.messages[0].clone(), ROUNDS);
     hammer::<TxBody>("TxBody", &body, ROUNDS);
+    hammer::<Transaction>("Transaction", &body.clone().sign(&key(50)), ROUNDS);
+    // Two signatures, which is where ordering and uniqueness can be attacked.
+    // A mutator that reorders or duplicates one must not produce a second
+    // spelling of a transaction, because the id is a hash of these bytes.
     hammer::<Transaction>(
-        "Transaction",
-        &Transaction {
-            public_key: key(50).public_key(),
-            signature: key(50).sign(afrolink_crypto::hash::Domain::TxSignDoc, &body.sign_doc()),
-            body,
-        },
+        "Transaction/Multisig",
+        &body.clone().sign_with(&[&key(50), &key(51)]),
+        ROUNDS,
+    );
+    // A sponsored fee: two signature lists, and a rule tying the second one's
+    // emptiness to a field inside the body. A mutator that empties one, or
+    // clears the fee payer, must not produce something that decodes.
+    let mut sponsored = tx_body();
+    sponsored.fee.payer = Some(addr(51));
+    hammer::<Transaction>(
+        "Transaction/Sponsored",
+        &sponsored.sign_sponsored(&[&key(50)], &[&key(51)]),
         ROUNDS,
     );
 }
@@ -256,6 +267,23 @@ fn account_decoders_stay_canonical_under_attack() {
             // flip: every other value in this space must be refused, not
             // masked, or two nodes disagree on a state root.
             flags: AccountFlags::NONE.with(AccountFlag::RequireReference, true),
+            regular_key: Some(key(90).public_key()),
+            signers: Some(
+                SignerList::new(
+                    vec![
+                        Signer {
+                            key: key(91).public_key(),
+                            weight: 1,
+                        },
+                        Signer {
+                            key: key(92).public_key(),
+                            weight: 2,
+                        },
+                    ],
+                    3,
+                )
+                .expect("valid list"),
+            ),
         },
         ROUNDS,
     );
@@ -271,6 +299,8 @@ fn account_decoders_stay_canonical_under_attack() {
             // tempted to substitute a default for something nobody sent.
             last_txn: None,
             flags: AccountFlags::NONE,
+            regular_key: None,
+            signers: None,
         },
         ROUNDS,
     );
@@ -284,6 +314,8 @@ fn account_decoders_stay_canonical_under_attack() {
             },
             last_txn: None,
             flags: AccountFlags::NONE,
+            regular_key: None,
+            signers: None,
         },
         ROUNDS,
     );

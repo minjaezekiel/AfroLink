@@ -95,11 +95,20 @@ pub enum Action {
 /// A free function rather than a method so a selection closure can borrow the
 /// store without borrowing the whole node.
 fn next_nonce(store: &MemoryStore, address: &Address) -> u64 {
+    account_record(store, address).nonce
+}
+
+/// An account's committed record, or a fresh one if it has never been seen.
+///
+/// A fresh record authorises exactly the master key, which is what an address
+/// that has never transacted should accept — so an unknown sender is treated as
+/// unrotated rather than as unauthorised.
+fn account_record(store: &MemoryStore, address: &Address) -> Account {
     store
         .get_decoded::<Account>(&StoreKey::account(address))
         .ok()
         .flatten()
-        .map_or(0, |account| account.nonce)
+        .unwrap_or_else(|| Account::individual(*address))
 }
 
 /// A validator node.
@@ -197,10 +206,20 @@ impl Node {
     /// # Errors
     /// Returns the [`Rejected`] reason.
     pub fn submit(&mut self, transaction: Transaction) -> Result<Transaction, Rejected> {
-        let next = next_nonce(&self.store, &transaction.body.sender);
+        let sender = account_record(&self.store, &transaction.body.sender);
+        let sponsor = transaction
+            .body
+            .fee
+            .payer
+            .map(|payer| account_record(&self.store, &payer));
         let echo = transaction.clone();
-        self.mempool
-            .insert(transaction, &self.chain_id, self.height, next)?;
+        self.mempool.insert(
+            transaction,
+            &self.chain_id,
+            self.height,
+            &sender,
+            sponsor.as_ref(),
+        )?;
         Ok(echo)
     }
 

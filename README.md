@@ -27,12 +27,13 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 | | |
 |---|---|
-| **Never need the native token** | Fees payable in any whitelisted stablecoin, and payable *by someone else*. A user sends money without knowing AFRI exists. The biggest adoption blocker in crypto payments, removed. |
+| **Never need the native token** | Fees payable in any whitelisted stablecoin, and payable *by someone else* who co-signs. A user sends money without knowing AFRI exists. The biggest adoption blocker in crypto payments, removed. |
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
 | **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers — and an address that *needs* one can say so in state, so the ledger refuses an untagged deposit instead of letting it arrive belonging to nobody. |
 | **Send to `@amina`, not to `afri1qzp8h4c…`** | Usernames, phone numbers and email addresses resolve to addresses — *with a proof*. An alias resolves; it never authorises, so a stolen SIM cannot touch the money. Raw addresses keep working for exchanges and existing tooling. |
+| **Lose the phone, keep the account** | The signing key rotates without the address changing, so a username and a printed QR code survive it. An exposed seed can be disabled outright. Recovery is an M-of-N signer list of family, an agent and an attestor — in the protocol, not in a contract, and never a password on a public ledger. |
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Recovers from a QR code after six months offline** | Bootstrapping costs 32 scannable bytes, and returning costs forty remembered ones — checked against append-only witness logs in different jurisdictions, so no single party's word is load-bearing. Built for intermittent connectivity rather than apologising for it. |
 | **Instant finality** | ~1s deterministic. A market trader cannot reason about reorg probability. |
@@ -40,7 +41,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Seventeen crates, **632 tests passing**. A working
+**Phase 2 in progress.** Seventeen crates, **669 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
@@ -63,11 +64,11 @@ crates/
   primitives/   canonical consensus codec, checked amounts, denoms      25 tests ✅
   crypto/       BLAKE3 + Ed25519, bech32m, RFC 6962 Merkle + consistency 38 tests ✅
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
-  types/        accounts, group accounts, transactions, fee abstraction 47 tests ✅
+  types/        accounts, signing authority, transactions, fees            68 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, blocks, genesis                         44 tests ✅
+  executor/     block execution, blocks, genesis                         58 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
-  node/         consensus driver, mempool, proposals, simulator          40 tests ✅
+  node/         consensus driver, mempool, proposals, simulator          41 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
   store/        durable storage, history index, proof-serving view      36 tests ✅
   rpc/          proof-carrying query protocol (no networking)          14 tests ✅
@@ -76,7 +77,7 @@ crates/
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
   fuzz/         deterministic adversarial-input harness (a test tool)      36 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
-  http/         strict HTTP/1.1 transport around the query protocol         82 tests ✅
+  http/         strict HTTP/1.1 transport around the query protocol         83 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
@@ -99,8 +100,14 @@ produced it and reproduces forever. Three suites:
 
 It found five real defects on its first run, and the same root cause has since
 turned up at a sixth place — every one of them a value that was not uniquely
-determined, made safe by a convention enforced somewhere else. See
-[08-adversarial-testing.md](docs/08-adversarial-testing.md).
+determined, made safe by a convention enforced somewhere else.
+
+A seventh was worse and of a different kind, so it is recorded separately:
+sponsored fees debited the named payer **with no consent check at all**, which
+made "name any funded address as your sponsor" a way to drain it. Every byte
+involved was canonical and every signature genuine, so no fuzzer could have
+found it — what found it was writing down an explicit model of who may act for
+an account. See [08-adversarial-testing.md](docs/08-adversarial-testing.md).
 
 A wallet can now send a payment, watch it arrive, and walk its **whole history**
 backwards along a chain of committed links — over a socket, against a node it
@@ -114,10 +121,16 @@ unattributable — and the requirement, the refusal and the reason are each
 provable against a header the sender verified
 ([ADR-0016](docs/adr/0016-required-payment-references.md)).
 
-Next: rotatable signing keys and signer lists — the correct answer to account
-recovery, and the one that lets a key change without invalidating an address,
-a username or a printed QR code. See **[docs/05-roadmap.md](docs/05-roadmap.md)**
-and **[docs/09](docs/09-what-xrpl-answers.md)**.
+An address now **outlives its key**. The signing key rotates while the address,
+the username and every printed QR code stay valid; an exposed seed is retired
+without moving the money; and M-of-N social recovery — family, an agent, an
+attestor — is a protocol primitive rather than a contract. Authorisation moved
+out of the transaction and into the account record, which is what makes all
+three possible ([ADR-0017](docs/adr/0017-key-rotation-and-signer-lists.md)).
+
+Next: the peer-to-peer layer, to replace the in-process simulator with a real
+network. See **[docs/05-roadmap.md](docs/05-roadmap.md)** and
+**[docs/09](docs/09-what-xrpl-answers.md)**.
 
 ```bash
 cargo test --workspace

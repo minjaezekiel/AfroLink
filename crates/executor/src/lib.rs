@@ -96,6 +96,35 @@ pub enum ExecError {
     /// A group payout was requested for an accumulating group.
     #[error("this group accumulates its pot and has no rotation recipient")]
     NoRotationRecipient,
+    /// The keys that signed are not entitled to act for the sender.
+    ///
+    /// Replaces the stateless key-to-address check. That check could not survive
+    /// key rotation: a regular key does not derive the address, and a signer
+    /// list holds keys that never could
+    /// ([ADR-0017](../../../docs/adr/0017-key-rotation-and-signer-lists.md)).
+    #[error("the signing keys are not authorised for this account")]
+    Unauthorised,
+    /// The named fee payer did not consent.
+    ///
+    /// Separate from [`Self::Unauthorised`] because the sender may be perfectly
+    /// authorised and the transaction still refused — and the two are fixed by
+    /// different people.
+    #[error("the named fee payer did not authorise this transaction")]
+    SponsorUnauthorised,
+    /// A change to the signing arrangement would leave nobody able to sign.
+    ///
+    /// Disabling a master key with no replacement, or removing the last
+    /// replacement while the master is disabled. Either would freeze the
+    /// account's funds permanently, so it is refused rather than obeyed.
+    #[error("this change would leave no key able to sign for the account")]
+    WouldLockOut,
+    /// A regular key equal to the master key.
+    ///
+    /// Not merely pointless: it looks like rotation and provides none, so a user
+    /// who did it would believe an exposed seed had been retired when it had
+    /// not.
+    #[error("the regular key must differ from the master key")]
+    RegularKeyIsMasterKey,
     /// The recipient requires a payment reference and none was supplied.
     ///
     /// Deliberately *not* folded into [`Self::Bank`]: this is the one execution
@@ -156,6 +185,9 @@ pub enum ResultCode {
     /// recipient's flags to work out why would put a round trip on the exact
     /// path this flag exists to smooth.
     Reference,
+    /// The signing arrangement refused: wrong keys, or a change that would have
+    /// locked the account out.
+    Authorisation,
 }
 
 impl ResultCode {
@@ -174,6 +206,7 @@ impl ResultCode {
             Self::Binding => 8,
             Self::State => 9,
             Self::Reference => 10,
+            Self::Authorisation => 11,
         }
     }
 
@@ -192,6 +225,7 @@ impl ResultCode {
             8 => Self::Binding,
             9 => Self::State,
             10 => Self::Reference,
+            11 => Self::Authorisation,
             _ => return None,
         })
     }
@@ -216,6 +250,10 @@ impl From<&ExecError> for ResultCode {
             | ExecError::NotAGroupMember
             | ExecError::NoRotationRecipient => Self::Account,
             ExecError::ReferenceRequired => Self::Reference,
+            ExecError::Unauthorised
+            | ExecError::SponsorUnauthorised
+            | ExecError::WouldLockOut
+            | ExecError::RegularKeyIsMasterKey => Self::Authorisation,
             ExecError::Registry(_) => Self::Registry,
             ExecError::Bind(_) => Self::Binding,
             ExecError::State(_) => Self::State,
@@ -507,15 +545,28 @@ impl Executor {
         let tx_id = tx.id();
 
         // Stateless checks first — these cost nothing and reject the cheap attacks.
-        if let Err(e) = tx.verify(&self.chain_id, ctx.height) {
+        if let Err(e) = tx.verify_stateless(&self.chain_id, ctx.height) {
             return TxOutcome::rejected(tx_id, e.into());
         }
 
-        // Nonce check against committed state.
         let account = match load_account(store, &tx.body.sender) {
             Ok(a) => a,
             Err(e) => return TxOutcome::rejected(tx_id, e),
         };
+
+        // Authorisation, before the nonce. `verify_stateless` proved the
+        // signatures are genuine; it said nothing about whether these keys may
+        // act for this account, and that is the question that used to be
+        // answered by comparing a key's address to the sender's
+        // ([ADR-0017](../../../docs/adr/0017-key-rotation-and-signer-lists.md)).
+        //
+        // Ahead of the nonce check deliberately: "wrong nonce" is a misleading
+        // answer to a forgery, and it reports the account's sequence number to
+        // someone who has just proved they do not hold its keys.
+        if !account.authorises(&tx.signing_keys()) {
+            return TxOutcome::rejected(tx_id, ExecError::Unauthorised);
+        }
+
         if account.nonce != tx.body.nonce {
             return TxOutcome::rejected(
                 tx_id,
@@ -526,9 +577,23 @@ impl Executor {
             );
         }
 
+        // A sponsor's balance is about to be debited, so the sponsor must have
+        // agreed. Without this, naming any funded address as the fee payer
+        // drains it — in whichever denomination it holds, since fees are
+        // payable in any of them.
+        let fee_payer = tx.body.fee.payer_or(tx.body.sender);
+        if tx.body.fee.is_sponsored() {
+            let payer = match load_account(store, &fee_payer) {
+                Ok(a) => a,
+                Err(e) => return TxOutcome::rejected(tx_id, e),
+            };
+            if !payer.authorises(&tx.sponsor_keys()) {
+                return TxOutcome::rejected(tx_id, ExecError::SponsorUnauthorised);
+            }
+        }
+
         // Charge the fee against committed state. If the payer cannot cover it
         // the transaction is not includable at all, so nothing is consumed.
-        let fee_payer = tx.body.fee.payer_or(tx.body.sender);
         let fee_result = Bank::new(store).transfer(
             &fee_payer,
             &fee_collector_address(),
@@ -647,16 +712,32 @@ impl Executor {
                 Ok(())
             }
 
-            Message::SetAccountFlag { flag, enabled } => {
-                // Only ever the sender's own record. There is no address
-                // argument on purpose: a message that could flag someone else's
-                // account would let a stranger make their payments fail.
-                let key = StoreKey::account(&sender);
-                let mut account = load_account(store, &sender)?;
+            // Only ever the sender's own record. None of the three takes an
+            // address, on purpose: a message that could change someone else's
+            // account would let a stranger make their payments fail, or take
+            // their money.
+            Message::SetAccountFlag { flag, enabled } => change_account(store, sender, |account| {
                 account.flags = account.flags.with(*flag, *enabled);
-                store.set_encoded(&key, &account);
                 Ok(())
-            }
+            }),
+
+            Message::SetRegularKey { key } => change_account(store, sender, |account| {
+                // A regular key equal to the master key looks like rotation and
+                // achieves none: the exposed seed still signs. Refusing is the
+                // only way the user finds out.
+                if let Some(new) = key
+                    && Address::from_public_key(new) == account.address
+                {
+                    return Err(ExecError::RegularKeyIsMasterKey);
+                }
+                account.regular_key = *key;
+                Ok(())
+            }),
+
+            Message::SetSignerList { list } => change_account(store, sender, |account| {
+                account.signers = list.clone();
+                Ok(())
+            }),
 
             Message::CreateGroup {
                 name,
@@ -859,6 +940,29 @@ fn load_existing_account<S: KeyValueStore>(
     store
         .get_decoded::<Account>(&StoreKey::account(address))?
         .ok_or(ExecError::NoSuchAccount)
+}
+
+/// Apply a change to the sender's own account record, refusing a lock-out.
+///
+/// **Every message that touches a signing arrangement goes through here**, and
+/// the invariant is checked once, afterwards, on whatever the change produced.
+/// The three ways to lock an account out — disabling the master key with no
+/// replacement, clearing the regular key while it is disabled, removing the
+/// signer list while it is disabled — are one rule seen from three sides.
+/// Checking each case at its own call site is how a fourth arrives without one.
+fn change_account<S, F>(store: &mut S, sender: Address, change: F) -> Result<(), ExecError>
+where
+    S: KeyValueStore,
+    F: FnOnce(&mut Account) -> Result<(), ExecError>,
+{
+    let key = StoreKey::account(&sender);
+    let mut account = load_account(store, &sender)?;
+    change(&mut account)?;
+    if !account.has_a_usable_authority() {
+        return Err(ExecError::WouldLockOut);
+    }
+    store.set_encoded(&key, &account);
+    Ok(())
 }
 
 /// Create an account record for a recipient that has never been seen.
@@ -1355,6 +1459,618 @@ mod tests {
             bank.balance(&addr(2), &kes()).expect("read"),
             Amount::from_afri(10_500)
         );
+    }
+
+    // -- Key rotation and signer lists (ADR-0017) ----------------------------
+
+    /// A transaction from `sender`'s account, signed by whichever keys are given.
+    ///
+    /// The separation is the point: `sender` names the account, `signers` name
+    /// the keys presented. Before rotation those were always the same thing.
+    fn signed_by(sender: u8, nonce: u64, signers: &[u8], messages: Vec<Message>) -> Transaction {
+        let keys: Vec<SecretKey> = signers.iter().map(|s| sk(*s)).collect();
+        let refs: Vec<&SecretKey> = keys.iter().collect();
+        TxBody {
+            chain_id: chain(),
+            sender: addr(sender),
+            nonce,
+            valid_until: Height(1_000),
+            fee: Fee::new(Amount::from_units(1_000), kes()),
+            messages,
+            memo: String::new(),
+        }
+        .sign_with(&refs)
+    }
+
+    fn small_transfer() -> Vec<Message> {
+        vec![Message::Transfer {
+            to: addr(2),
+            denom: kes(),
+            amount: Amount::from_afri(1),
+            reference: None,
+        }]
+    }
+
+    /// A 2-of-3 recovery list over keys 11, 12 and 13.
+    fn recovery_list() -> afrolink_types::SignerList {
+        use afrolink_types::{Signer, SignerList};
+        SignerList::new(
+            (11..=13u8)
+                .map(|s| Signer {
+                    key: sk(s).public_key(),
+                    weight: 1,
+                })
+                .collect(),
+            2,
+        )
+        .expect("valid list")
+    }
+
+    #[test]
+    fn a_rotated_key_spends_the_account_and_the_address_never_changes() {
+        // The headline property. A username, a printed QR code and an address
+        // already shared with an employer all keep working across a key change,
+        // which is why this matters more here than on a chain without aliases.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+
+        let rotate = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetRegularKey {
+                    key: Some(sk(9).public_key()),
+                }],
+            )],
+        );
+        assert_eq!(rotate.succeeded(), 1, "{:?}", rotate.outcomes[0].result);
+
+        let spent = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[signed_by(1, 1, &[9], small_transfer())],
+        );
+        assert_eq!(spent.succeeded(), 1, "{:?}", spent.outcomes[0].result);
+        assert_eq!(
+            load_account(&store, &addr(1)).expect("reads").address,
+            addr(1),
+            "the address must not have moved"
+        );
+    }
+
+    #[test]
+    fn a_stranger_still_cannot_spend_an_account_that_rotated() {
+        // Authorisation moved out of stateless verification, so this is the
+        // check that replaced it. A genuine signature from an unrelated key must
+        // buy nothing.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetRegularKey {
+                    key: Some(sk(9).public_key()),
+                }],
+            )],
+        );
+
+        let theft = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[signed_by(1, 1, &[66], small_transfer())],
+        );
+        assert_eq!(theft.succeeded(), 0);
+        assert_eq!(
+            theft.outcomes[0].receipt.code,
+            ResultCode::Authorisation,
+            "and it must be refused as unauthorised, not as a bad nonce"
+        );
+    }
+
+    #[test]
+    fn an_exposed_seed_can_be_retired_without_moving_the_money() {
+        // A leaked seed can never be un-leaked. Disabling it is the only
+        // response that does not mean abandoning the address and racing the
+        // attacker to move funds.
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+
+        let out = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![
+                    Message::SetRegularKey {
+                        key: Some(sk(9).public_key()),
+                    },
+                    Message::SetAccountFlag {
+                        flag: AccountFlag::MasterKeyDisabled,
+                        enabled: true,
+                    },
+                ],
+            )],
+        );
+        assert_eq!(out.succeeded(), 1, "{:?}", out.outcomes[0].result);
+
+        // The attacker holds the seed and can still sign perfectly valid bytes.
+        let with_stolen_seed = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[signed_by(1, 1, &[1], small_transfer())],
+        );
+        assert_eq!(with_stolen_seed.succeeded(), 0, "the old key must be dead");
+        assert_eq!(
+            with_stolen_seed.outcomes[0].receipt.code,
+            ResultCode::Authorisation
+        );
+        assert_eq!(
+            load_account(&store, &addr(1)).expect("reads").nonce,
+            1,
+            "an unauthorised attempt must not burn the owner's nonce, or an \
+             attacker could invalidate every transaction they are about to send"
+        );
+
+        let with_new_key = exec.execute_block(
+            &mut store,
+            ctx(3),
+            &[signed_by(1, 1, &[9], small_transfer())],
+        );
+        assert_eq!(
+            with_new_key.succeeded(),
+            1,
+            "{:?}",
+            with_new_key.outcomes[0].result
+        );
+
+        let after = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+        assert!(
+            after < before,
+            "only fees and the one small transfer left the account"
+        );
+    }
+
+    #[test]
+    fn disabling_the_master_key_with_no_replacement_is_refused() {
+        // The lock-out invariant. Obeying this would freeze the account's funds
+        // permanently, and nothing could ever undo it.
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let out = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetAccountFlag {
+                    flag: AccountFlag::MasterKeyDisabled,
+                    enabled: true,
+                }],
+            )],
+        );
+
+        assert_eq!(out.succeeded(), 0);
+        assert!(matches!(
+            out.outcomes[0].result,
+            Err(ExecError::WouldLockOut)
+        ));
+        assert!(
+            exec.execute_block(
+                &mut store,
+                ctx(2),
+                &[signed_by(1, 1, &[1], small_transfer())]
+            )
+            .succeeded()
+                == 1,
+            "and the account must be entirely unharmed"
+        );
+    }
+
+    #[test]
+    fn clearing_the_last_authority_is_refused_from_every_direction() {
+        // Three ways to lock an account out, one rule. The rule is checked after
+        // the change rather than as a condition on each message, which is what
+        // stops a fourth authority arriving without a check.
+        use afrolink_types::AccountFlag;
+
+        for (name, finisher) in [
+            (
+                "clearing the regular key",
+                Message::SetRegularKey { key: None },
+            ),
+            (
+                "clearing the signer list",
+                Message::SetSignerList { list: None },
+            ),
+        ] {
+            let mut store = funded_store();
+            let exec = Executor::new(chain());
+
+            // Set up both replacements, then disable the master key.
+            let setup = exec.execute_block(
+                &mut store,
+                ctx(1),
+                &[signed_by(
+                    1,
+                    0,
+                    &[1],
+                    vec![
+                        Message::SetRegularKey {
+                            key: Some(sk(9).public_key()),
+                        },
+                        Message::SetAccountFlag {
+                            flag: AccountFlag::MasterKeyDisabled,
+                            enabled: true,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(setup.succeeded(), 1, "{:?}", setup.outcomes[0].result);
+
+            // Now remove the only remaining authority.
+            let out =
+                exec.execute_block(&mut store, ctx(2), &[signed_by(1, 1, &[9], vec![finisher])]);
+            if name == "clearing the regular key" {
+                assert_eq!(out.succeeded(), 0, "{name} must be refused");
+                assert!(matches!(
+                    out.outcomes[0].result,
+                    Err(ExecError::WouldLockOut)
+                ));
+            } else {
+                // Clearing an absent signer list changes nothing and is fine.
+                assert_eq!(out.succeeded(), 1, "{name}: {:?}", out.outcomes[0].result);
+            }
+        }
+    }
+
+    #[test]
+    fn two_family_members_can_recover_an_account_but_one_cannot() {
+        // Social recovery as a protocol primitive rather than a contract, and
+        // the strictly better answer to "recover from something I remember"
+        // than any password scheme ([09](../../../docs/09-what-xrpl-answers.md) §1).
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+
+        let setup = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetSignerList {
+                    list: Some(recovery_list()),
+                }],
+            )],
+        );
+        assert_eq!(setup.succeeded(), 1, "{:?}", setup.outcomes[0].result);
+
+        let alone = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[signed_by(1, 1, &[11], small_transfer())],
+        );
+        assert_eq!(alone.succeeded(), 0, "one signer is not a quorum");
+        assert_eq!(alone.outcomes[0].receipt.code, ResultCode::Authorisation);
+
+        let quorum = exec.execute_block(
+            &mut store,
+            ctx(3),
+            &[signed_by(1, 1, &[11, 12], small_transfer())],
+        );
+        assert_eq!(quorum.succeeded(), 1, "{:?}", quorum.outcomes[0].result);
+    }
+
+    #[test]
+    fn a_quorum_can_replace_a_signer_who_lost_their_key() {
+        // The cost of listing keys rather than accounts, and the reason it is
+        // acceptable: for a recovery list this is the ordinary case, and the
+        // remaining signers can do it themselves.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetSignerList {
+                    list: Some(recovery_list()),
+                }],
+            )],
+        );
+
+        use afrolink_types::{Signer, SignerList};
+        let replaced = SignerList::new(
+            vec![
+                Signer {
+                    key: sk(11).public_key(),
+                    weight: 1,
+                },
+                Signer {
+                    key: sk(12).public_key(),
+                    weight: 1,
+                },
+                Signer {
+                    key: sk(14).public_key(),
+                    weight: 1,
+                },
+            ],
+            2,
+        )
+        .expect("valid list");
+
+        let out = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[signed_by(
+                1,
+                1,
+                &[11, 12],
+                vec![Message::SetSignerList {
+                    list: Some(replaced),
+                }],
+            )],
+        );
+        assert_eq!(out.succeeded(), 1, "{:?}", out.outcomes[0].result);
+
+        let by_new_signer = exec.execute_block(
+            &mut store,
+            ctx(3),
+            &[signed_by(1, 2, &[12, 14], small_transfer())],
+        );
+        assert_eq!(
+            by_new_signer.succeeded(),
+            1,
+            "{:?}",
+            by_new_signer.outcomes[0].result
+        );
+    }
+
+    #[test]
+    fn a_regular_key_equal_to_the_master_key_is_refused() {
+        // It looks like rotation and provides none. A user who did it would
+        // believe an exposed seed had been retired when it had not.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let out = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                1,
+                0,
+                &[1],
+                vec![Message::SetRegularKey {
+                    key: Some(sk(1).public_key()),
+                }],
+            )],
+        );
+        assert!(matches!(
+            out.outcomes[0].result,
+            Err(ExecError::RegularKeyIsMasterKey)
+        ));
+    }
+
+    #[test]
+    fn nobody_can_change_someone_elses_signing_arrangement() {
+        // None of the three messages takes an address. This is the property
+        // that follows from that, stated as a test rather than left implicit.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                2,
+                0,
+                &[2],
+                vec![Message::SetRegularKey {
+                    key: Some(sk(9).public_key()),
+                }],
+            )],
+        );
+
+        assert_eq!(
+            load_account(&store, &addr(1)).expect("reads").regular_key,
+            None,
+            "account 2's rotation must not have touched account 1"
+        );
+        assert_eq!(
+            load_account(&store, &addr(2))
+                .expect("reads")
+                .regular_key
+                .map(|k| k.to_bytes()),
+            Some(sk(9).public_key().to_bytes())
+        );
+    }
+
+    #[test]
+    fn an_unauthorised_transaction_is_refused_before_the_nonce_is_consulted() {
+        // "Wrong nonce" is a misleading answer to a forgery, and it reports the
+        // account's sequence number to someone who has just proved they do not
+        // hold its keys.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let out = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(1, 9_999, &[66], small_transfer())],
+        );
+        assert!(matches!(
+            out.outcomes[0].result,
+            Err(ExecError::Unauthorised)
+        ));
+    }
+
+    #[test]
+    fn naming_a_stranger_as_the_fee_payer_does_not_charge_them() {
+        // Found while adding authorisation: `Fee::sponsored_by` let any
+        // transaction name any address as its payer, and the executor debited
+        // it unconditionally. That is "drain any funded account, one fee at a
+        // time" — and since fees are payable in any whitelisted denom, in any
+        // denom the victim holds.
+        //
+        // Sponsorship is a real feature and stays. What it now needs is the
+        // sponsor's signature.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let victim = addr(2);
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&victim, &kes())
+            .expect("reads");
+
+        let raid = TxBody {
+            chain_id: chain(),
+            sender: addr(1),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::sponsored_by(Amount::from_units(1_000), kes(), victim),
+            messages: small_transfer(),
+            memo: String::new(),
+        }
+        .sign(&sk(1));
+
+        let out = exec.execute_block(&mut store, ctx(1), &[raid]);
+        assert_eq!(out.succeeded(), 0, "an unconsenting sponsor must not pay");
+        // Caught structurally, before any account is read: a sponsored fee with
+        // no sponsor signature is malformed, not merely unauthorised. An
+        // attacker who supplies a signature from a key of their own gets past
+        // this and is stopped by the account check instead — see
+        // `a_sponsor_signature_from_the_wrong_key_is_refused`.
+        assert!(matches!(
+            out.outcomes[0].result,
+            Err(ExecError::Tx(TxError::SponsorSignatureMismatch))
+        ));
+        assert_eq!(
+            Bank::new(&mut store)
+                .view()
+                .balance(&victim, &kes())
+                .expect("reads"),
+            before,
+            "not one unit may leave a stranger's account"
+        );
+    }
+
+    #[test]
+    fn a_sponsor_who_signs_does_pay() {
+        // The feature this chain is partly built around: an employer or an NGO
+        // covering fees so a user never has to hold the native coin. It must
+        // still work, and the only thing that changed is that the sponsor
+        // consents.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        // Account 3, not 2: account 2 is the transfer's recipient, and a
+        // sponsor who is also being paid would hide a mistake in either half.
+        let sponsor = addr(3);
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&sponsor, &kes())
+            .expect("reads");
+
+        let sponsored = TxBody {
+            chain_id: chain(),
+            sender: addr(1),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::sponsored_by(Amount::from_units(1_000), kes(), sponsor),
+            messages: small_transfer(),
+            memo: String::new(),
+        }
+        .sign_sponsored(&[&sk(1)], &[&sk(3)]);
+
+        let out = exec.execute_block(&mut store, ctx(1), &[sponsored]);
+        assert_eq!(out.succeeded(), 1, "{:?}", out.outcomes[0].result);
+        assert_eq!(
+            Bank::new(&mut store)
+                .view()
+                .balance(&sponsor, &kes())
+                .expect("reads"),
+            before
+                .checked_sub(Amount::from_units(1_000))
+                .expect("affordable"),
+            "the sponsor paid exactly the fee"
+        );
+    }
+
+    #[test]
+    fn a_sponsor_signature_from_the_wrong_key_is_refused() {
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let sponsored = TxBody {
+            chain_id: chain(),
+            sender: addr(1),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::sponsored_by(Amount::from_units(1_000), kes(), addr(2)),
+            messages: small_transfer(),
+            memo: String::new(),
+        }
+        .sign_sponsored(&[&sk(1)], &[&sk(66)]);
+
+        let out = exec.execute_block(&mut store, ctx(1), &[sponsored]);
+        assert_eq!(out.succeeded(), 0);
+        assert!(matches!(
+            out.outcomes[0].result,
+            Err(ExecError::SponsorUnauthorised)
+        ));
+    }
+
+    #[test]
+    fn a_sponsor_can_rotate_their_key_like_anyone_else() {
+        // Sponsorship reads the payer's account record, so it gets rotation for
+        // free — an NGO can change its signing key without every wallet that
+        // names it as sponsor having to be updated.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[signed_by(
+                2,
+                0,
+                &[2],
+                vec![Message::SetRegularKey {
+                    key: Some(sk(9).public_key()),
+                }],
+            )],
+        );
+
+        let sponsored = TxBody {
+            chain_id: chain(),
+            sender: addr(1),
+            nonce: 0,
+            valid_until: Height(1_000),
+            fee: Fee::sponsored_by(Amount::from_units(1_000), kes(), addr(2)),
+            messages: small_transfer(),
+            memo: String::new(),
+        }
+        .sign_sponsored(&[&sk(1)], &[&sk(9)]);
+
+        let out = exec.execute_block(&mut store, ctx(2), &[sponsored]);
+        assert_eq!(out.succeeded(), 1, "{:?}", out.outcomes[0].result);
     }
 
     // -- RequireDestinationTag (ADR-0016) ------------------------------------

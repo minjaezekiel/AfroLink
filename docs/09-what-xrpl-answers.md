@@ -199,7 +199,9 @@ Message::Transfer { to, reference: None, .. } if flags(to).requires_reference
 
 Pair it with `DisallowIncoming`-style flags later if licensed entities need them.
 
-### 2.4 Key rotation and signer lists — the *correct* answer to §1(a)
+### 2.4 Key rotation and signer lists — the *correct* answer to §1(a) ✅ *built*
+
+Built as [ADR-0017](adr/0017-key-rotation-and-signer-lists.md).
 
 XRPL accounts separate three things, and we conflate all of them into one key:
 
@@ -294,7 +296,7 @@ bootstrap set in [ADR-0011](adr/0011-objective-anchors.md).
 | ~~1~~ | ~~Commit `outcome_root` in the header~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | |
 | ~~2~~ | ~~`last_txn` and previous pointers~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | ADR-0014's stated weakness is closed |
 | ~~3~~ | ~~`RequireDestinationTag` account flag~~ | **Built** — [ADR-0016](adr/0016-required-payment-references.md) | The requirement, the refusal and the reason are all provable |
-| 4 | Regular keys, master-key disable, signer lists | Large; new message types, account model | The real answer to recovery, and to §1 |
+| ~~4~~ | ~~Regular keys, master-key disable, signer lists~~ | **Built** — [ADR-0017](adr/0017-key-rotation-and-signer-lists.md) | Authorisation is now a fact about the account, not about the transaction |
 | 5 | Fee escalation and a queue | Medium | When congestion is real, not before |
 | 6 | Retention with a named archive role | Large | When storage growth is measured, not assumed |
 
@@ -303,10 +305,17 @@ change the header, so they were cheapest before a network carries headers
 between machines. 3 followed on its own — it needed only an account field and
 one check, and it stands alone because nothing else depends on it.
 
-4 is next, and it is the largest of the six. It is also the one §1 has been
-pointing at from the start: the *correct* answer to "recover my account from
-something I remember" is a rotatable signing key and a signer list, not a
-password anywhere near a ledger.
+4 was the largest of the six and the one §1 had been pointing at from the start:
+the *correct* answer to "recover my account from something I remember" is a
+rotatable signing key and a signer list, not a password anywhere near a ledger.
+It is built, and §1's question is now answered by a mechanism rather than only by
+a refusal.
+
+5 and 6 are both **deliberately not next**. Fee escalation is worth building when
+congestion is real, and retention when storage growth is measured; doing either
+now would be guessing at numbers the network has not produced. The next thing
+this project needs is the peer-to-peer layer, which is where the roadmap says it
+is.
 
 ## Sources
 

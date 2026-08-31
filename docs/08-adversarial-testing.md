@@ -102,11 +102,14 @@ AFROLINK_CAMPAIGN=25 cargo test --release     # ~1 300 schedules, ~9s
 ## The defects
 
 Four the fuzzer found on its first run; two more turned up elsewhere and are
-recorded alongside them because **all six share one root cause**: a value that
+recorded alongside them because **those six share one root cause**: a value that
 is not uniquely determined, made safe by a convention enforced somewhere else.
 
 That is the finding worth carrying forward — not any individual bug, but that
 the same shape keeps reappearing wherever untrusted input becomes a value.
+
+A seventh, §7, is a **different** class and is recorded separately so the pattern
+above is not stretched to cover it. It was not a decoder problem at all.
 
 ### 1 & 2. Decoders that normalised instead of rejecting
 
@@ -196,6 +199,44 @@ ago.
 
 **Fixed:** `MAX_CLOCK_DRIFT_MS`, with `a_header_dated_in_the_future_is_refused`.
 
+### 7. A fee payer nobody asked
+
+The most serious defect recorded here, and the only one no fuzzer would have
+found: it was not a malformed input, it was a **missing check on a well-formed
+one**.
+
+`Fee::sponsored_by` lets a transaction name a third party as its fee payer —
+the fee-abstraction primitive the whole "never need the native token" claim
+rests on. The executor read that field and debited the named account:
+
+```rust
+let fee_payer = tx.body.fee.payer_or(tx.body.sender);
+Bank::new(store).transfer(&fee_payer, &fee_collector_address(), …)
+```
+
+Nothing anywhere asked whether the payer had agreed. So **any address could
+name any funded address as its sponsor and drain it, one fee at a time** — and
+because fees are payable in any whitelisted denomination, in whichever
+denomination the victim happened to hold. Every signature involved was
+genuine; every byte was canonical.
+
+Found while adding [ADR-0017](adr/0017-key-rotation-and-signer-lists.md), for a
+reason worth naming: writing down *who is authorised to act for an account*
+forced the question of every place the chain moves money, and this was the one
+place the answer was "nobody asked".
+
+**Fixed:** a transaction carries a second signature list for the fee payer,
+required exactly when a payer is named, and checked against the payer's own
+account record. `naming_a_stranger_as_the_fee_payer_does_not_charge_them`,
+`a_sponsor_signature_from_the_wrong_key_is_refused`, and
+`a_sponsor_who_signs_does_pay` for the half that must keep working.
+
+**The lesson, and it is not the one above.** Canonicality testing asks *"can
+this input be read two ways?"*. It cannot ask *"should this input have been
+obeyed at all?"* Those are different questions, and the fuzz suite only answers
+the first. What surfaced this was writing an explicit model of authorisation —
+which is an argument for doing that for every capability, not only for signing.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -223,12 +264,18 @@ Named gaps, so they are not mistaken for coverage:
 - **The executor is not fuzzed against semantic invariants** — supply
   conservation under arbitrary transaction sequences is the obvious next
   property, and it is not written yet.
-- **History cannot be verified at all**, by anyone. A node that omits an entry
-  is not caught by any test here, because there is nothing to catch it *with*:
-  the index is not consensus state and no header commits to it
-  ([ADR-0014](adr/0014-payment-history-and-the-mempool.md)). What is tested is
-  the weaker property that every entry is *checkable* — the id turns into an
-  inclusion proof, and a substituted transaction fails it.
+- ~~History cannot be verified at all~~ — **closed** by
+  [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md). An account's
+  history is now a chain of committed back-pointers, so a node that omits an
+  entry produces a link that fails to verify rather than an invisible gap;
+  `a_node_that_skips_a_payment_is_caught_rather_than_believed` is the test. What
+  remains true is that **no test can make a node answer** — withholding is
+  available to whoever holds the data. What is gone is withholding invisibly.
+- **Authorisation is modelled but not fuzzed.** `Account::authorises` is
+  unit-tested against master keys, rotated keys, quorums, strangers and mixed
+  sets, but no adversarial harness throws arbitrary key sets at arbitrary
+  account records. Given §7, a property-based check that *no set of keys the
+  account does not name can ever authorise* is the obvious next thing to write.
 - **The mempool is not fuzzed.** Its limits are unit-tested and its insert path
   runs full stateless verification, but nobody has thrown a hostile sequence of
   submissions at it under the scheduler.

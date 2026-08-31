@@ -71,6 +71,11 @@ the transaction path is not.)*
       so a deposit with no reference to a flagged address fails instead of
       arriving unattributable. The requirement, the refusal and the reason are
       all provable *([ADR-0016](adr/0016-required-payment-references.md))*
+- [x] **Key rotation, master-key disable and signer lists** — an address now
+      outlives its key, an exposed seed can be retired without moving the money,
+      and M-of-N social recovery is a protocol primitive rather than a contract.
+      Authorisation moved from the transaction to the account record
+      *([ADR-0017](adr/0017-key-rotation-and-signer-lists.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature
@@ -141,12 +146,16 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
 - [x] **`afri:` payment request URIs and payment references** — a merchant emits
       one string; any wallet understands it *(ADR-0009, `crates/pay`)*
 - [ ] Off-chain resolver service *(specified in [07](07-resolver-service.md))*
-- [ ] **Key rotation and signer lists** — XRPL's regular key, master-key disable
+- [x] **Key rotation and signer lists** — XRPL's regular key, master-key disable
       and M-of-N signer list. Rotation matters more here than elsewhere because
       the addressing layer is aliases people have already shared, and it is the
       correct answer to "recover from something I remember"
-      *([09](09-what-xrpl-answers.md) §2.4)*
-- [ ] Social recovery; sponsored fees
+      *([ADR-0017](adr/0017-key-rotation-and-signer-lists.md))*
+- [ ] **Time-locked recovery** — the mechanism is built; what is missing is a
+      delay, so a signer list stolen whole is not an account stolen whole. The
+      shape is the one `crates/alias` already uses for contact rebinding
+      *(ADR-0017, "Revisit if")*
+- [ ] Sponsored fees
 - [ ] Contract templates: savings, escrow, payroll, rotating savings (chama/susu)
 - [ ] SDKs: Rust, TypeScript, Kotlin, Flutter
 - [ ] **Upgrade governance** — XRPL-style amendment voting over a Polkadot-style

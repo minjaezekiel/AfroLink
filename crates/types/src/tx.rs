@@ -14,6 +14,19 @@
 //!
 //! The whole document is hashed under [`Domain::TxSignDoc`], so a transaction
 //! signature can never be presented as a consensus vote.
+//!
+//! # Authentication is not authorisation
+//!
+//! [`Transaction::verify_stateless`] establishes that every signature is
+//! genuine. It does **not** establish that the signers may act for the sender —
+//! that question is [`Account::authorises`](crate::Account::authorises), and it
+//! is answered against the account record because it is exactly what key
+//! rotation changes
+//! ([ADR-0017](../../../docs/adr/0017-key-rotation-and-signer-lists.md)).
+//!
+//! Anything that accepts a transaction must ask both. There are two such places:
+//! the executor, where it decides correctness, and the mempool, where it decides
+//! whether a node will hold and gossip something on a stranger's behalf.
 
 use afrolink_alias::{ContactCommitment, Username};
 use afrolink_consensus::{CountryCode, Equivocation};
@@ -24,23 +37,46 @@ use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exac
 use afrolink_primitives::{Amount, ChainId, Denom, Height};
 use thiserror::Error;
 
-use crate::account::AccountFlag;
+use crate::account::{AccountFlag, MAX_SIGNERS, SignerList};
 use crate::group::{Contribution, FoundingMember, PayoutPolicy, Quorum};
 
 /// Maximum bytes in a transaction memo.
 pub const MAX_MEMO_LEN: usize = 256;
 /// Maximum messages in one transaction.
 pub const MAX_MESSAGES: usize = 64;
+/// Maximum signatures on one transaction.
+///
+/// Matches [`MAX_SIGNERS`], which is the most a signer list can require. Every
+/// signature is verified before anything else happens, so this is a bound on the
+/// elliptic-curve work one message can buy from a validator.
+pub const MAX_SIGNATURES: usize = MAX_SIGNERS;
 
 /// Why a transaction was rejected.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TxError {
-    /// The signature did not verify against the declared public key.
+    /// A signature did not verify against the key that presented it.
     #[error("invalid signature")]
     InvalidSignature,
-    /// The declared public key does not derive the sender's address.
-    #[error("public key does not match sender address")]
-    KeyAddressMismatch,
+    /// No signatures at all, or more than [`MAX_SIGNATURES`].
+    #[error("a transaction must carry 1..={MAX_SIGNATURES} signatures, got {0}")]
+    SignatureCount(usize),
+    /// Signatures out of order, or one key signing twice.
+    ///
+    /// Refused rather than sorted: the transaction's id is a hash of its
+    /// encoding, so a second ordering would be a second id for one signed
+    /// transaction — and deduplication by id is what stops a replay.
+    #[error("signatures must be sorted by public key and unique")]
+    UnsortedSignatures,
+    /// Sponsor signatures present without a sponsor, or missing with one.
+    #[error("sponsor signatures must be present exactly when a fee payer is named")]
+    SponsorSignatureMismatch,
+    /// A fee payer that is the sender.
+    ///
+    /// A redundant spelling of an ordinary fee. Two spellings of one meaning is
+    /// the thing the codec refuses everywhere else, and here it would also
+    /// demand a pointless second signature from the sender.
+    #[error("the fee payer must not be the sender; leave it unset instead")]
+    SelfSponsored,
     /// The transaction was signed for a different network.
     #[error("wrong chain id: signed for {signed}, this chain is {expected}")]
     WrongChain {
@@ -270,6 +306,25 @@ pub enum Message {
         enabled: bool,
     },
 
+    /// Replace, or clear, the sender's rotatable signing key.
+    ///
+    /// `None` clears it. Clearing is refused if it would leave nobody able to
+    /// sign — the lock-out invariant is checked once, after the change, rather
+    /// than as a special case here.
+    SetRegularKey {
+        /// The new day-to-day key, or `None` to go back to the master key
+        /// alone.
+        key: Option<PublicKey>,
+    },
+    /// Replace, or clear, the sender's signer list.
+    ///
+    /// The social-recovery primitive: an M-of-N arrangement of family, an agent
+    /// and an attestor, expressed in the protocol rather than in a contract.
+    SetSignerList {
+        /// The new arrangement, or `None` to remove it.
+        list: Option<SignerList>,
+    },
+
     /// Lock AFRI and register as a validator candidate.
     Bond {
         /// The consensus key this operator will sign blocks with.
@@ -338,14 +393,41 @@ impl TxBody {
         self.to_bytes()
     }
 
-    /// Sign this body, producing a complete transaction.
+    /// Sign this body with one key — the ordinary case.
     #[must_use]
     pub fn sign(self, key: &SecretKey) -> Transaction {
-        let signature = key.sign(Domain::TxSignDoc, &self.sign_doc());
+        self.sign_with(std::slice::from_ref(&key))
+    }
+
+    /// Sign this body as sender, with a sponsor co-signing for the fee.
+    ///
+    /// Both authorities are needed because the fee comes out of the sponsor's
+    /// balance. Without the sponsor's signature, naming someone as fee payer
+    /// would be a way to spend their money.
+    #[must_use]
+    pub fn sign_sponsored(self, sender: &[&SecretKey], sponsor: &[&SecretKey]) -> Transaction {
+        let doc = self.sign_doc();
+        let sponsor_signatures = canonical_signatures(&doc, sponsor);
+        let mut transaction = self.sign_with(sender);
+        transaction.sponsor_signatures = sponsor_signatures;
+        transaction
+    }
+
+    /// Sign this body with several keys, for an account with a signer list.
+    ///
+    /// The result is sorted and de-duplicated, so the same set of signers always
+    /// produces the same transaction id however the caller ordered them.
+    ///
+    /// # Panics
+    /// Never for a non-empty `keys`; an empty slice produces a transaction that
+    /// [`Transaction::verify_stateless`] will refuse.
+    #[must_use]
+    pub fn sign_with(self, keys: &[&SecretKey]) -> Transaction {
+        let signatures = canonical_signatures(&self.sign_doc(), keys);
         Transaction {
             body: self,
-            public_key: key.public_key(),
-            signature,
+            signatures,
+            sponsor_signatures: Vec::new(),
         }
     }
 
@@ -359,6 +441,9 @@ impl TxBody {
         }
         if self.memo.len() > MAX_MEMO_LEN {
             return Err(TxError::MemoTooLong);
+        }
+        if self.fee.payer == Some(self.sender) {
+            return Err(TxError::SelfSponsored);
         }
         for msg in &self.messages {
             match msg {
@@ -388,6 +473,8 @@ impl TxBody {
                 | Message::RevokeContact { .. }
                 | Message::ClearPrimaryAlias
                 | Message::SetAccountFlag { .. }
+                | Message::SetRegularKey { .. }
+                | Message::SetSignerList { .. }
                 | Message::ReleaseName { .. } => {}
             }
         }
@@ -395,15 +482,63 @@ impl TxBody {
     }
 }
 
+/// One key's signature over a transaction body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxSignature {
+    /// The key that signed.
+    pub public_key: PublicKey,
+    /// Signature over [`TxBody::sign_doc`] in [`Domain::TxSignDoc`].
+    pub signature: Signature,
+}
+
+/// Sign `doc` with every key, in the one order the wire format accepts.
+///
+/// Sorted and de-duplicated here so a caller cannot produce a non-canonical
+/// transaction by accident, and so one signer cannot reach a quorum by
+/// repeating itself.
+fn canonical_signatures(doc: &[u8], keys: &[&SecretKey]) -> Vec<TxSignature> {
+    let mut signatures: Vec<TxSignature> = keys
+        .iter()
+        .map(|key| TxSignature {
+            public_key: key.public_key(),
+            signature: key.sign(Domain::TxSignDoc, doc),
+        })
+        .collect();
+    signatures.sort_by_key(|s| s.public_key.to_bytes());
+    signatures.dedup_by(|a, b| a.public_key == b.public_key);
+    signatures
+}
+
 /// A signed transaction.
+///
+/// # Why a list
+///
+/// One key was enough while an account had exactly one. It no longer does: an
+/// account may carry a signer list, and an M-of-N arrangement needs M
+/// signatures ([ADR-0017](../../../docs/adr/0017-key-rotation-and-signer-lists.md)).
+/// The ordinary single-signature case is simply a list of one, so nothing about
+/// a plain payment changes except where the signature is read from.
+///
+/// # Canonical form
+///
+/// Non-empty, sorted by public key, and free of repeats. All three are checked
+/// on decode and none is repaired, because the transaction's *id* is a hash of
+/// this encoding: a second spelling of one signed transaction would be a second
+/// id for it, and deduplication by id is what stops a replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     /// The signed body.
     pub body: TxBody,
-    /// Public key of the signer.
-    pub public_key: PublicKey,
-    /// Signature over [`TxBody::sign_doc`] in [`Domain::TxSignDoc`].
-    pub signature: Signature,
+    /// The **sender's** authority. Sorted by public key, unique, at least one.
+    pub signatures: Vec<TxSignature>,
+    /// The **fee payer's** authority, when a third party is sponsoring.
+    ///
+    /// Empty exactly when [`Fee::payer`] is `None`. A separate list rather than
+    /// more entries in `signatures`, because they answer different questions:
+    /// one set must satisfy the sender's account, the other the sponsor's. A
+    /// single list would force the verifier to search for a partition, and would
+    /// let a key recognised by one account be counted toward the other.
+    pub sponsor_signatures: Vec<TxSignature>,
 }
 
 impl Transaction {
@@ -466,6 +601,8 @@ impl Transaction {
                 | Message::VetoRebind { .. }
                 | Message::RevokeContact { .. }
                 | Message::SetAccountFlag { .. }
+                | Message::SetRegularKey { .. }
+                | Message::SetSignerList { .. }
                 | Message::Bond { .. }
                 | Message::AddStake { .. }
                 | Message::Unbond { .. }
@@ -478,16 +615,56 @@ impl Transaction {
         out
     }
 
-    /// Full stateless verification.
+    /// The keys that produced valid signatures over this body.
     ///
-    /// Checks, in order: structure, chain binding, expiry, that the declared key
-    /// actually derives the sender's address, and finally the signature. The key
-    /// check comes before signature verification because a valid signature from
-    /// the *wrong* key would otherwise authorise spending someone else's account.
+    /// Only meaningful after [`Self::verify_stateless`] has succeeded; before
+    /// that, a signature may not check out. Feed the result to
+    /// [`Account::authorises`](crate::Account::authorises), which decides
+    /// whether those keys are entitled to act for the sender.
+    #[must_use]
+    pub fn signing_keys(&self) -> Vec<PublicKey> {
+        self.signatures.iter().map(|s| s.public_key).collect()
+    }
+
+    /// The keys the **fee payer** presented, when a third party is sponsoring.
+    ///
+    /// Empty for an ordinary transaction. Check these against the payer's
+    /// account, never against the sender's: the fee comes out of the payer's
+    /// balance, so naming someone as payer without their consent would be a way
+    /// to spend their money.
+    #[must_use]
+    pub fn sponsor_keys(&self) -> Vec<PublicKey> {
+        self.sponsor_signatures
+            .iter()
+            .map(|s| s.public_key)
+            .collect()
+    }
+
+    /// Everything that can be checked without reading chain state.
+    ///
+    /// Structure, chain binding, expiry, signature canonicality, and that
+    /// **every** signature verifies against the body.
+    ///
+    /// # What this deliberately no longer checks
+    ///
+    /// It used to also require that the signing key derive the sender's address.
+    /// That check has moved to [`Account::authorises`](crate::Account::authorises)
+    /// and become stateful, because it is exactly what key rotation changes: a
+    /// regular key does not derive the address, and a signer list holds keys
+    /// that never could.
+    ///
+    /// **A caller that stops here has authenticated a signature and authorised
+    /// nothing.** The method is named for that, and it returns no evidence a
+    /// caller could mistake for permission — the keys come from
+    /// [`Self::signing_keys`], which says what it is.
     ///
     /// # Errors
     /// Returns the first [`TxError`] encountered.
-    pub fn verify(&self, chain_id: &ChainId, current_height: Height) -> Result<(), TxError> {
+    pub fn verify_stateless(
+        &self,
+        chain_id: &ChainId,
+        current_height: Height,
+    ) -> Result<(), TxError> {
         self.body.validate_basic()?;
 
         if &self.body.chain_id != chain_id {
@@ -504,13 +681,41 @@ impl Transaction {
             });
         }
 
-        if Address::from_public_key(&self.public_key) != self.body.sender {
-            return Err(TxError::KeyAddressMismatch);
+        self.check_signatures()
+    }
+
+    /// Signature count, ordering and validity, for both authorities.
+    fn check_signatures(&self) -> Result<(), TxError> {
+        if self.signatures.is_empty() || self.signatures.len() > MAX_SIGNATURES {
+            return Err(TxError::SignatureCount(self.signatures.len()));
+        }
+        if self.sponsor_signatures.len() > MAX_SIGNATURES {
+            return Err(TxError::SignatureCount(self.sponsor_signatures.len()));
+        }
+        // Empty exactly when there is no sponsor. Both halves matter: a
+        // sponsored fee with no sponsor signature would spend a stranger's
+        // money, and sponsor signatures on an unsponsored fee are bytes that
+        // change the transaction's id while authorising nothing.
+        if self.body.fee.is_sponsored() == self.sponsor_signatures.is_empty() {
+            return Err(TxError::SponsorSignatureMismatch);
         }
 
-        self.public_key
-            .verify(Domain::TxSignDoc, &self.body.sign_doc(), &self.signature)
-            .map_err(|_| TxError::InvalidSignature)
+        let doc = self.body.sign_doc();
+        for list in [&self.signatures, &self.sponsor_signatures] {
+            if !list.windows(2).all(|w| {
+                w.first().map(|s| s.public_key.to_bytes())
+                    < w.get(1).map(|s| s.public_key.to_bytes())
+            }) {
+                return Err(TxError::UnsortedSignatures);
+            }
+            for entry in list {
+                entry
+                    .public_key
+                    .verify(Domain::TxSignDoc, &doc, &entry.signature)
+                    .map_err(|_| TxError::InvalidSignature)?;
+            }
+        }
+        Ok(())
     }
 
     /// Decode a transaction from untrusted bytes.
@@ -656,6 +861,14 @@ impl Encode for Message {
                 flag.encode(out);
                 enabled.encode(out);
             }
+            Self::SetRegularKey { key } => {
+                out.push(20);
+                key.encode(out);
+            }
+            Self::SetSignerList { list } => {
+                out.push(21);
+                list.encode(out);
+            }
         }
     }
 }
@@ -733,6 +946,12 @@ impl Decode for Message {
                 flag: AccountFlag::decode(r)?,
                 enabled: bool::decode(r)?,
             }),
+            20 => Ok(Self::SetRegularKey {
+                key: Option::<PublicKey>::decode(r)?,
+            }),
+            21 => Ok(Self::SetSignerList {
+                list: Option::<SignerList>::decode(r)?,
+            }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,
                 type_name: "Message",
@@ -767,21 +986,64 @@ impl Decode for TxBody {
     }
 }
 
-impl Encode for Transaction {
+impl Encode for TxSignature {
     fn encode(&self, out: &mut Vec<u8>) {
-        self.body.encode(out);
         self.public_key.encode(out);
         self.signature.encode(out);
     }
 }
 
-impl Decode for Transaction {
+impl Decode for TxSignature {
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
-            body: TxBody::decode(r)?,
             public_key: PublicKey::decode(r)?,
             signature: Signature::decode(r)?,
         })
+    }
+}
+
+impl Encode for Transaction {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.body.encode(out);
+        self.signatures.encode(out);
+        self.sponsor_signatures.encode(out);
+    }
+}
+
+impl Decode for Transaction {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let transaction = Self {
+            body: TxBody::decode(r)?,
+            signatures: Vec::<TxSignature>::decode(r)?,
+            sponsor_signatures: Vec::<TxSignature>::decode(r)?,
+        };
+        // Canonical form is enforced at the decode boundary, not left to the
+        // verifier, because the id is a hash of these bytes. An unsorted or
+        // repeated signature list is a second spelling of one transaction, and
+        // two spellings mean two ids for one payment.
+        if transaction.signatures.is_empty() || transaction.signatures.len() > MAX_SIGNATURES {
+            return Err(CodecError::Invalid(format!(
+                "a transaction must carry 1..={MAX_SIGNATURES} signatures, got {}",
+                transaction.signatures.len()
+            )));
+        }
+        if transaction.sponsor_signatures.len() > MAX_SIGNATURES {
+            return Err(CodecError::Invalid(format!(
+                "a transaction may carry at most {MAX_SIGNATURES} sponsor signatures, got {}",
+                transaction.sponsor_signatures.len()
+            )));
+        }
+        for list in [&transaction.signatures, &transaction.sponsor_signatures] {
+            if !list.windows(2).all(|w| {
+                w.first().map(|s| s.public_key.to_bytes())
+                    < w.get(1).map(|s| s.public_key.to_bytes())
+            }) {
+                return Err(CodecError::Invalid(
+                    "transaction signatures must be sorted by public key and unique".to_owned(),
+                ));
+            }
+        }
+        Ok(transaction)
     }
 }
 
@@ -823,7 +1085,7 @@ mod tests {
     fn a_valid_payment_verifies() {
         let sk = key(1);
         let tx = payment(&sk).sign(&sk);
-        assert!(tx.verify(&chain(), Height(10)).is_ok());
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
     }
 
     #[test]
@@ -833,7 +1095,7 @@ mod tests {
         let tx = payment(&sk).sign(&sk);
         assert!(!tx.body.fee.denom.is_native());
         assert!(tx.body.fee.denom.is_sovereign());
-        assert!(tx.verify(&chain(), Height(10)).is_ok());
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
     }
 
     #[test]
@@ -842,11 +1104,13 @@ mod tests {
         let sponsor = Address::from_public_key(&key(9).public_key());
         let mut body = payment(&sk);
         body.fee = Fee::sponsored_by(Amount::from_units(1_000), kes(), sponsor);
-        let tx = body.sign(&sk);
+        // The sponsor co-signs. Their balance is what pays, so their consent is
+        // what makes this sponsorship rather than theft.
+        let tx = body.sign_sponsored(&[&sk], &[&key(9)]);
 
         assert!(tx.body.fee.is_sponsored());
         assert_eq!(tx.body.fee.payer_or(tx.body.sender), sponsor);
-        assert!(tx.verify(&chain(), Height(10)).is_ok());
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
     }
 
     #[test]
@@ -864,7 +1128,7 @@ mod tests {
         body.chain_id = ChainId::new("afrolink-testnet-3").expect("valid");
         let tx = body.sign(&sk);
         assert!(matches!(
-            tx.verify(&chain(), Height(10)),
+            tx.verify_stateless(&chain(), Height(10)),
             Err(TxError::WrongChain { .. })
         ));
     }
@@ -874,11 +1138,11 @@ mod tests {
         let sk = key(1);
         let tx = payment(&sk).sign(&sk);
         assert!(matches!(
-            tx.verify(&chain(), Height(1_001)),
+            tx.verify_stateless(&chain(), Height(1_001)),
             Err(TxError::Expired { .. })
         ));
         assert!(
-            tx.verify(&chain(), Height(1_000)).is_ok(),
+            tx.verify_stateless(&chain(), Height(1_000)).is_ok(),
             "valid_until is inclusive"
         );
     }
@@ -894,7 +1158,7 @@ mod tests {
             reference: None,
         }];
         assert_eq!(
-            tx.verify(&chain(), Height(10)),
+            tx.verify_stateless(&chain(), Height(10)),
             Err(TxError::InvalidSignature)
         );
     }
@@ -910,7 +1174,7 @@ mod tests {
             reference: None,
         }];
         assert_eq!(
-            tx.verify(&chain(), Height(10)),
+            tx.verify_stateless(&chain(), Height(10)),
             Err(TxError::InvalidSignature)
         );
     }
@@ -918,16 +1182,117 @@ mod tests {
     #[test]
     fn a_valid_signature_from_the_wrong_key_cannot_spend_an_account() {
         // Attacker signs a body naming someone else as sender. The signature is
-        // genuine; the key/address binding is what must catch this.
+        // genuine, so stateless verification passes — and must, because that is
+        // all it claims to check. The account record is what refuses.
+        use crate::Account;
+
         let victim = Address::from_public_key(&key(1).public_key());
         let attacker = key(66);
         let mut body = payment(&key(1));
         body.sender = victim;
         let tx = body.sign(&attacker);
-        assert_eq!(
-            tx.verify(&chain(), Height(10)),
-            Err(TxError::KeyAddressMismatch)
+
+        assert!(
+            tx.verify_stateless(&chain(), Height(10)).is_ok(),
+            "the signature is genuine; authentication is not authorisation"
         );
+        assert!(
+            !Account::individual(victim).authorises(&tx.signing_keys()),
+            "but the victim's account must not recognise the attacker's key"
+        );
+    }
+
+    #[test]
+    fn signatures_must_arrive_sorted_and_unique() {
+        // The id is a hash of the encoding, so a second ordering would be a
+        // second id for one signed transaction — and dedup by id is what stops
+        // a replay.
+        let sk = key(1);
+        let mut tx = payment(&sk).sign_with(&[&key(1), &key(2)]);
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
+
+        tx.signatures.reverse();
+        assert_eq!(
+            tx.verify_stateless(&chain(), Height(10)),
+            Err(TxError::UnsortedSignatures)
+        );
+        assert!(
+            Transaction::from_bytes(&tx.to_bytes()).is_err(),
+            "and the decoder must refuse it too, not sort it"
+        );
+    }
+
+    #[test]
+    fn a_sponsored_fee_without_a_sponsor_signature_is_malformed() {
+        // The structural half of the sponsorship fix. A transaction naming a
+        // fee payer who did not sign is not merely unauthorised — it is a
+        // shape this chain does not accept, so it is refused before any account
+        // is read.
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.fee = Fee::sponsored_by(Amount::from_units(1_000), kes(), addr(7));
+        let tx = body.sign(&sk);
+        assert_eq!(
+            tx.verify_stateless(&chain(), Height(10)),
+            Err(TxError::SponsorSignatureMismatch)
+        );
+    }
+
+    #[test]
+    fn sponsor_signatures_on_an_unsponsored_fee_are_refused() {
+        // They authorise nothing and change the transaction's id, which is a
+        // way to make a wallet's status check miss its own payment.
+        let sk = key(1);
+        let mut tx = payment(&sk).sign(&sk);
+        tx.sponsor_signatures = payment(&sk).sign(&key(7)).signatures;
+        assert_eq!(
+            tx.verify_stateless(&chain(), Height(10)),
+            Err(TxError::SponsorSignatureMismatch)
+        );
+    }
+
+    #[test]
+    fn a_sponsored_transaction_round_trips_with_both_authorities() {
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.fee = Fee::sponsored_by(Amount::from_units(1_000), kes(), addr(7));
+        let tx = body.sign_sponsored(&[&key(1)], &[&key(7)]);
+
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
+        assert_eq!(tx.signing_keys(), vec![key(1).public_key()]);
+        assert_eq!(tx.sponsor_keys(), vec![key(7).public_key()]);
+        assert_eq!(Transaction::from_bytes(&tx.to_bytes()), Ok(tx));
+    }
+
+    #[test]
+    fn naming_yourself_as_your_own_sponsor_is_refused() {
+        // A redundant spelling of an ordinary fee, and two spellings of one
+        // meaning is what the codec refuses everywhere else.
+        let sk = key(1);
+        let mut body = payment(&sk);
+        body.fee = Fee::sponsored_by(Amount::from_units(1_000), kes(), body.sender);
+        assert_eq!(body.validate_basic(), Err(TxError::SelfSponsored));
+    }
+
+    #[test]
+    fn a_transaction_with_no_signatures_is_refused() {
+        let sk = key(1);
+        let mut tx = payment(&sk).sign(&sk);
+        tx.signatures.clear();
+        assert_eq!(
+            tx.verify_stateless(&chain(), Height(10)),
+            Err(TxError::SignatureCount(0))
+        );
+        assert!(Transaction::from_bytes(&tx.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn signing_twice_with_one_key_produces_one_signature() {
+        // Otherwise a signer could reach a quorum alone by repeating itself.
+        let sk = key(1);
+        let tx = payment(&sk).sign_with(&[&key(1), &key(1), &key(2)]);
+        assert_eq!(tx.signatures.len(), 2);
+        assert!(tx.verify_stateless(&chain(), Height(10)).is_ok());
     }
 
     #[test]
@@ -1077,7 +1442,7 @@ mod tests {
         let tx = body.sign(&sk);
 
         let decoded = Transaction::from_bytes(&tx.to_bytes()).expect("decodes");
-        assert!(decoded.verify(&chain(), Height(10)).is_ok());
+        assert!(decoded.verify_stateless(&chain(), Height(10)).is_ok());
         assert_eq!(
             decoded.body.messages.first(),
             Some(&Message::Transfer {
@@ -1113,7 +1478,7 @@ mod tests {
         }];
 
         assert_eq!(
-            tx.verify(&chain(), Height(10)),
+            tx.verify_stateless(&chain(), Height(10)),
             Err(TxError::InvalidSignature)
         );
     }
@@ -1124,7 +1489,7 @@ mod tests {
         let tx = payment(&sk).sign(&sk);
         let decoded = Transaction::from_bytes(&tx.to_bytes()).expect("decodes");
         assert_eq!(decoded, tx);
-        assert!(decoded.verify(&chain(), Height(10)).is_ok());
+        assert!(decoded.verify_stateless(&chain(), Height(10)).is_ok());
     }
 
     #[test]

@@ -1288,6 +1288,102 @@ fn fetch_transaction(addr: SocketAddr, id: &afrolink_crypto::hash::Hash32) -> Pr
 }
 
 // ---------------------------------------------------------------------------
+// Key rotation and signer lists, end to end (ADR-0017)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_wallet_can_prove_who_may_sign_for_an_account() {
+    // Authorisation left stateless verification and became a fact about the
+    // account record. That record is served with a proof, so a wallet — or an
+    // exchange deciding whether a withdrawal request is genuine — can establish
+    // which keys are entitled to act, against a header it verified itself.
+    use afrolink_types::{AccountFlag, Message, Signer, SignerList};
+
+    let (path, store, mut state, _client) = chain_on_disk("authority");
+    let executor = afrolink_executor::Executor::new(chain());
+    let parent = store.block(Height::GENESIS).unwrap().unwrap();
+
+    let list = SignerList::new(
+        (11..=13u8)
+            .map(|s| Signer {
+                key: key(s).public_key(),
+                weight: 1,
+            })
+            .collect(),
+        2,
+    )
+    .unwrap();
+
+    let rotate = afrolink_types::TxBody {
+        chain_id: chain(),
+        sender: account(50),
+        nonce: 0,
+        valid_until: Height(10_000),
+        fee: afrolink_types::Fee::new(Amount::from_units(1_000), kes()),
+        messages: vec![
+            Message::SetRegularKey {
+                key: Some(key(9).public_key()),
+            },
+            Message::SetSignerList {
+                list: Some(list.clone()),
+            },
+            Message::SetAccountFlag {
+                flag: AccountFlag::MasterKeyDisabled,
+                enabled: true,
+            },
+        ],
+        memo: String::new(),
+    }
+    .sign(&key(50));
+
+    let (block, outcome) = executor.build_block(
+        &mut state,
+        Height(1),
+        Timestamp::from_millis(1_700_000_001_000),
+        parent.header.id(),
+        vec![rotate],
+        afrolink_executor::ValidatorSets::unchanged(&validators()),
+    );
+    assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+    let receipts: Vec<afrolink_executor::TxReceipt> =
+        outcome.outcomes.iter().map(|o| o.receipt.clone()).collect();
+    store
+        .put_block(&block, &commit_for(&block), &receipts)
+        .unwrap();
+    store.persist_state(&state).unwrap();
+
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        let _stop = handle.clone().stop_on_drop();
+
+        let tip = verified_header(addr, Height(1));
+        let client = afrolink_light::LightClient::new(chain(), validators(), tip);
+        let record = read_account(addr, &client, account(50)).expect("the account exists");
+
+        // The master key is retired, and a wallet can see that rather than
+        // being told it by a node.
+        assert!(
+            !record.authorises(&[key(50).public_key()]),
+            "the disabled master key must not authorise"
+        );
+        assert!(record.authorises(&[key(9).public_key()]));
+        assert!(record.authorises(&[key(11).public_key(), key(12).public_key()]));
+        assert!(
+            !record.authorises(&[key(11).public_key()]),
+            "one signer is not the quorum"
+        );
+        assert_eq!(record.signers.as_ref(), Some(&list));
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
 // RequireDestinationTag, end to end (ADR-0016)
 // ---------------------------------------------------------------------------
 

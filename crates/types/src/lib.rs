@@ -10,6 +10,17 @@
 //! * [`tx::Fee`] — fees are payable in any whitelisted denomination and may be
 //!   sponsored by a third party, so nobody has to acquire the native coin before
 //!   they can send money.
+//!
+//! # Who may spend an account
+//!
+//! [`Account::authorises`] is the answer, and it is a fact about the **account
+//! record** rather than about the transaction. That is what lets a key be
+//! rotated while the address, the username and every printed QR code stay valid
+//! ([ADR-0017](../../../docs/adr/0017-key-rotation-and-signer-lists.md)).
+//!
+//! [`Transaction::verify_stateless`] proves signatures are genuine and claims
+//! nothing beyond it. Both questions have to be asked; neither substitutes for
+//! the other.
 
 #![cfg_attr(
     test,
@@ -27,8 +38,11 @@ pub mod account;
 pub mod group;
 pub mod tx;
 
-pub use account::{Account, AccountFlag, AccountFlags, AccountKind, TxPointer};
+pub use account::{
+    Account, AccountFlag, AccountFlags, AccountKind, AuthorityError, MAX_SIGNERS, Signer,
+    SignerList, TxPointer,
+};
 pub use group::{
     Contribution, FoundingMember, GroupAccount, GroupError, Member, PayoutPolicy, Quorum, Role,
 };
-pub use tx::{Fee, Message, Transaction, TxBody, TxError};
+pub use tx::{Fee, MAX_SIGNATURES, Message, Transaction, TxBody, TxError, TxSignature};
