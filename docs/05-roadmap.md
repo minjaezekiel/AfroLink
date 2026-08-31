@@ -81,6 +81,12 @@ the transaction path is not.)*
       cycle now closes only when it is actually over, a contribution must be the
       amount agreed, and the credit record can go down as well as up
       *([ADR-0018](adr/0018-savings-group-integrity.md))*
+- [x] **Vikoba** — accumulating groups, which is what the word means in
+      Tanzania and a different instrument from a rotation. Members buy shares,
+      the group lends its savings to members at a service charge, and the round
+      ends in a share-out proportional to what each member saved — so a member
+      takes out more than they paid in. `Quorum` finally governs something
+      *([ADR-0019](adr/0019-vikoba-accumulating-savings.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature

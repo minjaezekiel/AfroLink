@@ -295,7 +295,39 @@ an inconvenience. Full reasoning in
 | **14** | No minimum fee | A failed transaction's only punishment is its fee. At zero, failure is free and unlimited |
 | **15** | No fee-denomination whitelist | **Not currently exploitable** — minting needs an issuer, issuers come only from genesis. It is the check that keeps that true once issuers can be registered by transaction |
 
-A ninth finding was the opposite of an exploit: `apply_rebind` was correct,
+### 16. A loan the group's own rules made undue — found by the property suite
+
+Not part of the red-team pass, and worth separating because of **how** it was
+found. When accumulating groups were built
+([ADR-0019](adr/0019-vikoba-accumulating-savings.md)), the property suite in
+`crates/fuzz/tests/ledger.rs` failed on its first complete run with *"seed 6
+height 28: a loan falls due after the round that would settle it."*
+
+`ShareRules::validate` already refused a loan *term* longer than a savings round.
+That is necessary and not sufficient: a term that fits still runs past the round's
+end if the loan is granted late enough in it. Nothing fails at the time — the loan
+is advanced, the borrower does exactly what the group asked, and then the
+share-out arrives before the term does. The debt is outstanding, so the
+borrower's savings are seized to settle it and they are **recorded as a
+defaulter for a term the group itself granted**. That record is the thing a
+lender reads.
+
+This is the first defect the property suite has found on its own, and it is the
+kind it was built for: a sequence of individually reasonable transactions
+arriving somewhere nobody intended. Nobody would have written
+`a_loan_is_refused_when_the_round_would_close_before_it_falls_due` by hand,
+because nobody had noticed there was a question.
+
+The finding also depended on a second guard. A property suite whose generator
+never reaches a path passes every invariant over that path and goes green;
+reaching a share-out means founding an accumulating group, buying shares, closing
+every cycle of a round and then asking, and a uniform generator effectively never
+walks that. `Coverage::assert_meaningful` now requires each of the seven vikoba
+messages to have applied at least once. Wiring the suite up naively tripped that
+guard four times in a row, each time on a different message — four silent
+false-greens that would otherwise have shipped.
+
+A further finding was the opposite of an exploit: `apply_rebind` was correct,
 tested, and **reachable from no transaction at all**, so a rebinding that
 survived its veto window sat pending forever and genuine recovery never
 completed. The SIM-swap defence refused the attacker and the owner alike.
@@ -344,10 +376,12 @@ Named gaps, so they are not mistaken for coverage:
   cannot list. A defect that moves value to an address the generator cannot name
   is a defect this cannot see.
 - **The economic rules have no model.** A chama's payout rule is now enforced,
-  but nobody has written down the full set of states a group can be in and
+  and the vikoba invariants below check a group's savings arithmetic after every
+  block, but nobody has written down the full set of states a group can be in and
   checked that none of them is a trap. `EmptyPot` at period expiry is one such
   state, named in [ADR-0018](adr/0018-savings-group-integrity.md) and not
-  resolved.
+  resolved. §16 is a second such state that *was* found — by the property suite
+  rather than by anybody reasoning about it, which is the point.
 - ~~History cannot be verified at all~~ — **closed** by
   [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md). An account's
   history is now a chain of committed back-pointers, so a node that omits an

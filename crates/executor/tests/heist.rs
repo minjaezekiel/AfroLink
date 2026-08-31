@@ -23,7 +23,7 @@ use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{BlockContext, Executor, fee_collector_address};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::MemoryStore;
-use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role};
+use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role, ShareRules};
 use afrolink_types::{Fee, Message, Transaction, TxBody};
 
 fn sk(seed: u8) -> SecretKey {
@@ -251,7 +251,10 @@ fn creating_a_group_cannot_erase_an_account_that_already_exists() {
             denom: kes(),
             period_blocks: 604_800,
         },
-        policy: PayoutPolicy::Accumulate,
+        policy: PayoutPolicy::Accumulate(ShareRules {
+            required_guarantors: 1,
+            ..ShareRules::vicoba(Amount::ZERO)
+        }),
         quorum: Quorum::TWO_THIRDS,
     };
     exec.execute_block(&mut store, ctx(2), &[tx(1, 0, vec![create])]);
@@ -299,7 +302,10 @@ fn one_fee_cannot_mint_account_records_for_a_crowd_of_strangers() {
             denom: kes(),
             period_blocks: 1,
         },
-        policy: PayoutPolicy::Accumulate,
+        policy: PayoutPolicy::Accumulate(ShareRules {
+            required_guarantors: 1,
+            ..ShareRules::vicoba(Amount::ZERO)
+        }),
         quorum: Quorum::TWO_THIRDS,
     };
 

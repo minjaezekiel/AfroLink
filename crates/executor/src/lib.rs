@@ -872,6 +872,177 @@ impl Executor {
                 Ok(())
             }
 
+            // -- Accumulating groups: vikoba (ADR-0019) ----------------------
+            //
+            // Every arm here reads the group's *ledger balance* rather than
+            // trusting a running total on the record. The record says how much
+            // of that balance is the social fund; the ledger says how much there
+            // is. Two numbers that can disagree are a way to spend money twice,
+            // so only one of them is ever authoritative about what exists.
+            Message::BuyShares { group, shares } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                let cost = match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => g.buy_shares(&sender, *shares)?,
+                    _ => return Err(ExecError::NotAGroup),
+                };
+                // Recorded before the money moves, exactly as a contribution is:
+                // a purchase the rules refuse must not first take the payment.
+                Bank::new(store).transfer(&sender, group, &denom, cost)?;
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::PaySocialFund { group } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                let amount = match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => g.pay_social(&sender)?,
+                    _ => return Err(ExecError::NotAGroup),
+                };
+                Bank::new(store).transfer(&sender, group, &denom, amount)?;
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::ProposeGroupAction {
+                group,
+                beneficiary,
+                kind,
+            } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                // A stranger may not put a question to a group about its own
+                // money, even a question the group would have to approve.
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                let balance = Bank::new(store).view().balance(group, &denom)?;
+                match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => {
+                        g.open_proposal(*beneficiary, kind.clone(), balance)?;
+                    }
+                    _ => return Err(ExecError::NotAGroup),
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::ApproveGroupAction { group } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                let balance = Bank::new(store).view().balance(group, &denom)?;
+
+                let payment = match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => {
+                        if !g.approve(sender)? {
+                            // Recorded, not yet carried out. The group is still
+                            // deciding.
+                            None
+                        } else {
+                            // The approval that reaches the quorum carries the
+                            // proposal out. A separate execution message would
+                            // be one more thing to forget, and a decided
+                            // question left unexecuted is how a group's money
+                            // ends up stuck.
+                            let pending = g
+                                .pending
+                                .as_ref()
+                                .ok_or(GroupError::NoProposal)?
+                                .kind
+                                .clone();
+                            Some(match pending {
+                                afrolink_types::group::ProposalKind::Loan { .. } => {
+                                    g.issue_loan(balance)?
+                                }
+                                afrolink_types::group::ProposalKind::SocialGrant { .. } => {
+                                    g.issue_grant()?
+                                }
+                            })
+                        }
+                    }
+                    _ => return Err(ExecError::NotAGroup),
+                };
+
+                if let Some((beneficiary, amount)) = payment {
+                    Bank::new(store).transfer(group, &beneficiary, &denom, amount)?;
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::RepayLoan { group, amount } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => g.repay(&sender, *amount)?,
+                    _ => return Err(ExecError::NotAGroup),
+                }
+                Bank::new(store).transfer(&sender, group, &denom, *amount)?;
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::CloseCycle { group } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                // Rotations close through `GroupPayout`, which must pay before
+                // it advances. Letting this close one too would let a member
+                // skip the payout and move the rotation past their own turn.
+                record.require_share_rules()?;
+                if !record.payout_due(ctx.height) {
+                    return Err(GroupError::CycleNotDue.into());
+                }
+                if let afrolink_types::AccountKind::Group(g) = &mut account.kind {
+                    g.advance_cycle(ctx.height);
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
+            Message::ShareOut { group } => {
+                let mut account = load_existing_account(store, group)?;
+                let record = account.as_group().ok_or(ExecError::NotAGroup)?;
+                if !record.is_member(&sender) {
+                    return Err(ExecError::NotAGroupMember);
+                }
+                let denom = record.contribution.denom.clone();
+                let balance = Bank::new(store).view().balance(group, &denom)?;
+                // Only the savings are divided. The social fund is insurance the
+                // group agreed to hold, and it survives the round that raised it.
+                let fund = record.lendable(balance)?;
+
+                let payments = match &mut account.kind {
+                    afrolink_types::AccountKind::Group(g) => g.share_out(fund)?,
+                    _ => return Err(ExecError::NotAGroup),
+                };
+                for (member, amount) in payments {
+                    Bank::new(store).transfer(group, &member, &denom, amount)?;
+                }
+                store.set_encoded(&StoreKey::account(group), &account);
+                Ok(())
+            }
+
             // -- Human-readable addressing (ADR-0008) ------------------------
             //
             // Every arm below is a registry write. None of them move value, and
@@ -1115,7 +1286,9 @@ mod tests {
     use afrolink_crypto::SecretKey;
     use afrolink_primitives::Denom;
     use afrolink_state::MemoryStore;
-    use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role};
+    use afrolink_types::group::{
+        Contribution, FoundingMember, PayoutPolicy, Quorum, Role, ShareRules,
+    };
     use afrolink_types::{Fee, TxBody};
 
     fn sk(seed: u8) -> SecretKey {
@@ -2912,7 +3085,10 @@ mod tests {
                 denom: kes(),
                 period_blocks: 100,
             },
-            policy: PayoutPolicy::Accumulate,
+            policy: PayoutPolicy::Accumulate(ShareRules {
+                required_guarantors: 1,
+                ..ShareRules::vicoba(Amount::ZERO)
+            }),
             quorum: Quorum::TWO_THIRDS,
         };
         let group_address = Address::derived(

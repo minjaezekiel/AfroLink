@@ -38,7 +38,7 @@ use afrolink_primitives::{Amount, ChainId, Denom, Height};
 use thiserror::Error;
 
 use crate::account::{AccountFlag, MAX_SIGNERS, SignerList};
-use crate::group::{Contribution, FoundingMember, PayoutPolicy, Quorum};
+use crate::group::{Contribution, FoundingMember, PayoutPolicy, ProposalKind, Quorum};
 
 /// Maximum bytes in a transaction memo.
 pub const MAX_MEMO_LEN: usize = 256;
@@ -221,6 +221,83 @@ pub enum Message {
     },
     /// Release the pot to the cycle's recipient and advance the rotation.
     GroupPayout {
+        /// The group account.
+        group: Address,
+    },
+
+    // -- Accumulating groups: vikoba (ADR-0019) ------------------------------
+    //
+    // A rotation redistributes; this set of messages lets a group *earn*. The
+    // asymmetry between them is real rather than incidental, which is why
+    // `ContributeToGroup` and `GroupPayout` are not reused here: paying a fixed
+    // sum into a pot that will be handed to somebody is a different act from
+    // buying a share of a fund that will lend your money out at a charge.
+    /// Buy shares in the round now open.
+    ///
+    /// The unit of saving in a VICOBA. Members buy between the group's floor and
+    /// its ceiling each cycle, and the share-out at the end of the round divides
+    /// everything the fund has earned in proportion to what each member bought.
+    BuyShares {
+        /// The group account.
+        group: Address,
+        /// How many shares, at the group's share value.
+        shares: u32,
+    },
+    /// Pay this cycle's flat social contribution.
+    ///
+    /// Separate from a share purchase because it is a different instrument: an
+    /// equal premium that buys insurance against a funeral or an illness, not a
+    /// stake that is repaid with earnings. A member may pay one and not the
+    /// other, and a group may agree to have no social fund at all.
+    PaySocialFund {
+        /// The group account.
+        group: Address,
+    },
+    /// Put a loan or a social grant to the group.
+    ///
+    /// The only way money leaves an accumulating fund other than a share-out,
+    /// and the thing [`Quorum`] was always documented to govern.
+    ProposeGroupAction {
+        /// The group account.
+        group: Address,
+        /// Who would receive the money.
+        beneficiary: Address,
+        /// What is being asked for.
+        kind: ProposalKind,
+    },
+    /// Approve the group's open proposal.
+    ///
+    /// Carried out the moment the quorum is reached, by the approval that
+    /// reaches it — so no separate execution message exists to be forgotten,
+    /// and a decided question cannot sit unexecuted.
+    ApproveGroupAction {
+        /// The group account.
+        group: Address,
+    },
+    /// Repay part or all of a loan.
+    RepayLoan {
+        /// The group account.
+        group: Address,
+        /// How much to repay. Never more than is owed.
+        amount: Amount,
+    },
+    /// Close the cycle now open in an accumulating group.
+    ///
+    /// The counterpart of [`Self::GroupPayout`] for a group with no rotation:
+    /// it records who missed the cycle, fines an overdue debt once, refreshes
+    /// each member's share allowance, and moves the clock on. Without it an
+    /// accumulating group has no way to advance, so no loan could ever fall due
+    /// and no round could ever complete.
+    CloseCycle {
+        /// The group account.
+        group: Address,
+    },
+    /// End the round and divide the fund in proportion to shares.
+    ///
+    /// The moment the whole arrangement exists for. Every member is paid their
+    /// share of the savings *and of everything the fund earned* — service
+    /// charges and fines alike — less whatever they still owe.
+    ShareOut {
         /// The group account.
         group: Address,
     },
@@ -475,6 +552,7 @@ impl TxBody {
             match msg {
                 Message::Transfer { amount, .. }
                 | Message::ContributeToGroup { amount, .. }
+                | Message::RepayLoan { amount, .. }
                 | Message::Bond { amount, .. }
                 | Message::AddStake { amount }
                 | Message::Unbond { amount } => {
@@ -482,6 +560,26 @@ impl TxBody {
                         return Err(TxError::ZeroAmount);
                     }
                 }
+                // A purchase of no shares is a fee paid for nothing, and it
+                // would mark a cycle paid if the group's floor were zero — which
+                // `ShareRules::validate` forbids, but this is the cheaper check.
+                Message::BuyShares { shares, .. } => {
+                    if *shares == 0 {
+                        return Err(TxError::ZeroAmount);
+                    }
+                }
+                Message::ProposeGroupAction { kind, .. } => match kind {
+                    ProposalKind::Loan { principal, .. } => {
+                        if principal.is_zero() {
+                            return Err(TxError::ZeroAmount);
+                        }
+                    }
+                    ProposalKind::SocialGrant { amount } => {
+                        if amount.is_zero() {
+                            return Err(TxError::ZeroAmount);
+                        }
+                    }
+                },
                 // These move no value, or carry evidence that proves itself,
                 // so there is nothing here to check beyond what their own types
                 // already enforce on decode.
@@ -489,6 +587,10 @@ impl TxBody {
                 | Message::ReportEquivocation { .. }
                 | Message::CreateGroup { .. }
                 | Message::GroupPayout { .. }
+                | Message::PaySocialFund { .. }
+                | Message::ApproveGroupAction { .. }
+                | Message::CloseCycle { .. }
+                | Message::ShareOut { .. }
                 | Message::RegisterName { .. }
                 | Message::RenewName { .. }
                 | Message::TransferName { .. }
@@ -602,9 +704,33 @@ impl Transaction {
             match message {
                 // Value moving to someone else — the case this index exists for.
                 Message::Transfer { to, .. } => out.push(*to),
-                Message::ContributeToGroup { group, .. } | Message::GroupPayout { group } => {
+                Message::ContributeToGroup { group, .. }
+                | Message::GroupPayout { group }
+                | Message::BuyShares { group, .. }
+                | Message::PaySocialFund { group }
+                | Message::RepayLoan { group, .. }
+                | Message::CloseCycle { group }
+                | Message::ShareOut { group } => {
                     out.push(*group);
                 }
+                // The beneficiary of a loan or a grant did not necessarily send
+                // the transaction that decided it — the approving member did —
+                // and being paid out of the fund is the single event they most
+                // need in their own history.
+                Message::ProposeGroupAction {
+                    group,
+                    beneficiary,
+                    kind,
+                } => {
+                    out.push(*group);
+                    out.push(*beneficiary);
+                    // A guarantee is a liability, and a member should see the
+                    // transaction that recorded theirs.
+                    if let ProposalKind::Loan { guarantors, .. } = kind {
+                        out.extend(guarantors.iter().copied());
+                    }
+                }
+                Message::ApproveGroupAction { group } => out.push(*group),
                 // A member should see the group they were enrolled in, even
                 // though they did not send the transaction that did it.
                 Message::CreateGroup { members, .. } => {
@@ -903,6 +1029,42 @@ impl Encode for Message {
                 out.push(22);
                 commitment.encode(out);
             }
+            Self::BuyShares { group, shares } => {
+                out.push(23);
+                group.encode(out);
+                shares.encode(out);
+            }
+            Self::PaySocialFund { group } => {
+                out.push(24);
+                group.encode(out);
+            }
+            Self::ProposeGroupAction {
+                group,
+                beneficiary,
+                kind,
+            } => {
+                out.push(25);
+                group.encode(out);
+                beneficiary.encode(out);
+                kind.encode(out);
+            }
+            Self::ApproveGroupAction { group } => {
+                out.push(26);
+                group.encode(out);
+            }
+            Self::RepayLoan { group, amount } => {
+                out.push(27);
+                group.encode(out);
+                amount.encode(out);
+            }
+            Self::CloseCycle { group } => {
+                out.push(28);
+                group.encode(out);
+            }
+            Self::ShareOut { group } => {
+                out.push(29);
+                group.encode(out);
+            }
         }
     }
 }
@@ -988,6 +1150,31 @@ impl Decode for Message {
             }),
             22 => Ok(Self::ApplyRebind {
                 commitment: ContactCommitment::decode(r)?,
+            }),
+            23 => Ok(Self::BuyShares {
+                group: Address::decode(r)?,
+                shares: u32::decode(r)?,
+            }),
+            24 => Ok(Self::PaySocialFund {
+                group: Address::decode(r)?,
+            }),
+            25 => Ok(Self::ProposeGroupAction {
+                group: Address::decode(r)?,
+                beneficiary: Address::decode(r)?,
+                kind: ProposalKind::decode(r)?,
+            }),
+            26 => Ok(Self::ApproveGroupAction {
+                group: Address::decode(r)?,
+            }),
+            27 => Ok(Self::RepayLoan {
+                group: Address::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            28 => Ok(Self::CloseCycle {
+                group: Address::decode(r)?,
+            }),
+            29 => Ok(Self::ShareOut {
+                group: Address::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

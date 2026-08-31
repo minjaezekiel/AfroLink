@@ -35,6 +35,17 @@
 //! | A group's cycle only advances on a real payout | The chama drain of §8 |
 //! | A member cannot be due more cycles than have happened | The double-contribution of §10 |
 //! | Every account record still decodes | A state a node could write but not read back |
+//! | A vikoba's social fund never exceeds its balance | Insurance the group has already spent |
+//! | No loan falls due after the round that settles it | §16 — found here, not by hand |
+//!
+//! # Reaching the arithmetic
+//!
+//! Some of the generator aims rather than guesses: it answers an open proposal,
+//! repays a debt it knows the sender carries, and shares out a round it knows is
+//! complete. That is not the generator marking its own homework — every
+//! invariant still runs against whatever the executor actually did. It is the
+//! difference between a suite that reaches a share-out and one that never does,
+//! and an invariant that is never reached always holds.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -52,7 +63,9 @@ use afrolink_executor::{BlockContext, Executor, fee_collector_address};
 use afrolink_fuzz::Rng;
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
-use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role};
+use afrolink_types::group::{
+    Contribution, FoundingMember, PayoutPolicy, ProposalKind, Quorum, Role, ShareRules,
+};
 use afrolink_types::{Account, AccountKind, Fee, Message, Transaction, TxBody};
 
 /// Actors that hold keys and send transactions.
@@ -179,8 +192,12 @@ fn may_lose(transactions: &[Transaction]) -> Vec<Address> {
         out.push(tx.body.fee.payer_or(tx.body.sender));
         for message in &tx.body.messages {
             match message {
-                // The pot is the group's own money leaving on a payout.
-                Message::GroupPayout { group } => out.push(*group),
+                // The pot is the group's own money leaving on a payout — and a
+                // vikoba's fund is the group's own money leaving on a loan, a
+                // grant, or a share-out.
+                Message::GroupPayout { group }
+                | Message::ApproveGroupAction { group }
+                | Message::ShareOut { group } => out.push(*group),
                 // Matured stake and slashed stake both leave the module account.
                 Message::WithdrawUnbonded | Message::ReportEquivocation { .. } => {
                     out.push(afrolink_staking::staking_account());
@@ -283,6 +300,79 @@ fn check_invariants(
                     group.cycle.saturating_add(1)
                 );
             }
+
+            // 5. Vikoba. Everything here is arithmetic on people's savings, and
+            //    the whole point of an accumulating group is that a member's
+            //    claim on the fund is a number the chain computed rather than a
+            //    sum somebody handed over.
+            if let PayoutPolicy::Accumulate(rules) = &group.policy {
+                let balance = view.balance(address, &group.contribution.denom).unwrap();
+                // The social fund is insurance the group promised itself. If the
+                // record claims more of it than the account actually holds, the
+                // promise is already broken and nobody has noticed.
+                assert!(
+                    group.social_fund <= balance,
+                    "seed {seed} height {height}: {address:?} claims a social fund of {} \
+                     against a balance of {}",
+                    group.social_fund.units(),
+                    balance.units()
+                );
+
+                for member in &group.members {
+                    assert!(
+                        member.shares_this_cycle <= rules.max_shares,
+                        "seed {seed} height {height}: a member bought past the ceiling"
+                    );
+                    assert!(
+                        u64::from(member.shares_this_cycle) <= member.shares,
+                        "seed {seed} height {height}: shares bought this cycle exceed \
+                         shares held"
+                    );
+                    if let Some(loan) = &member.loan {
+                        // A repayment beyond the debt is money the group took
+                        // that nobody voted to take.
+                        let total = loan.principal.checked_add(loan.service_charge).unwrap();
+                        assert!(
+                            loan.repaid <= total,
+                            "seed {seed} height {height}: a loan repaid beyond its worth"
+                        );
+                        assert!(
+                            !loan.is_settled(),
+                            "seed {seed} height {height}: a settled loan left on the record — \
+                             it would be counted as a default at the share-out"
+                        );
+                        // The cover rule is what lets the group lend with no
+                        // court behind it. If a loan outlives the savings that
+                        // secured it, the security was never real.
+                        assert!(
+                            loan.due_cycle
+                                <= group
+                                    .round_start_cycle
+                                    .saturating_add(rules.cycles_per_round),
+                            "seed {seed} height {height}: a loan falls due after the round \
+                             that would settle it"
+                        );
+                    }
+                }
+                assert!(
+                    group.round_start_cycle <= group.cycle,
+                    "seed {seed} height {height}: a round starting after the current cycle"
+                );
+                if let Some(pending) = &group.pending {
+                    assert!(
+                        pending.approvals.windows(2).all(|w| w[0] < w[1]),
+                        "seed {seed} height {height}: proposal approvals out of canonical order"
+                    );
+                    assert!(
+                        pending.approvals.iter().all(|a| group.is_member(a)),
+                        "seed {seed} height {height}: a stranger's approval counts toward a quorum"
+                    );
+                    assert!(
+                        group.is_member(&pending.beneficiary),
+                        "seed {seed} height {height}: a proposal would pay a non-member"
+                    );
+                }
+            }
         }
     }
 }
@@ -294,7 +384,37 @@ fn check_invariants(
 /// Tracks enough to build transactions that are usually valid.
 struct World {
     nonces: [u64; ACTORS as usize],
+    /// Every group address an actor has *tried* to create.
     groups: Vec<Address>,
+    /// Groups that exist and accumulate, refreshed from the store each block.
+    ///
+    /// Kept separately because most creation attempts fail — on a nonce, on the
+    /// address already being a group — and a generator that picks uniformly from
+    /// addresses it merely named spends nearly every share purchase on an
+    /// account that is not there. That is how the vikoba paths came out
+    /// unreachable the first time this was wired up.
+    vikoba: Vec<Address>,
+    /// Accumulating groups with a proposal open.
+    ///
+    /// A quorum needs several different members to approve *the same* open
+    /// proposal before it lapses at the end of the cycle. Emitting approvals at
+    /// random almost never lands three of them inside one window, so the
+    /// generator has to aim: it knows a question is open and answers it.
+    pending: Vec<Address>,
+    /// `(group, actor, outstanding)` for every debt a member is carrying.
+    ///
+    /// Same reason. A repayment must name a group the sender actually borrowed
+    /// from and an amount no larger than the debt; guessing satisfies neither.
+    debts: Vec<(Address, u8, Amount)>,
+    /// Groups whose cycle may be closed at the next height.
+    closable: Vec<Address>,
+    /// Groups whose round is complete and whose fund has something to divide.
+    ///
+    /// A share-out sits at the end of the longest path in the chain: found an
+    /// accumulating group, buy shares in it, close every cycle of a round, then
+    /// ask. Waiting for a uniform generator to walk that by chance is waiting
+    /// for a suite whose most consequential arithmetic is never run.
+    sharable: Vec<Address>,
 }
 
 impl World {
@@ -302,6 +422,52 @@ impl World {
         Self {
             nonces: [0; ACTORS as usize],
             groups: Vec::new(),
+            vikoba: Vec::new(),
+            pending: Vec::new(),
+            debts: Vec::new(),
+            closable: Vec::new(),
+            sharable: Vec::new(),
+        }
+    }
+
+    /// Re-read which of the named addresses are live accumulating groups.
+    fn refresh(&mut self, store: &MemoryStore, next_height: u64) {
+        self.vikoba.clear();
+        self.pending.clear();
+        self.debts.clear();
+        self.closable.clear();
+        self.sharable.clear();
+        for address in &self.groups {
+            let Some(bytes) = store.get(&StoreKey::account(address)) else {
+                continue;
+            };
+            let Ok(account) = afrolink_primitives::codec::decode_exact::<Account>(&bytes) else {
+                continue;
+            };
+            let AccountKind::Group(group) = &account.kind else {
+                continue;
+            };
+            if !matches!(group.policy, PayoutPolicy::Accumulate(_)) {
+                continue;
+            }
+            self.vikoba.push(*address);
+            if group.pending.is_some() {
+                self.pending.push(*address);
+            }
+            if group.payout_due(Height(next_height)) {
+                self.closable.push(*address);
+            }
+            if group.round_complete() && group.total_shares() > 0 {
+                self.sharable.push(*address);
+            }
+            for member in &group.members {
+                if let Some(loan) = &member.loan
+                    && let Ok(outstanding) = loan.outstanding()
+                    && let Some(i) = (0..ACTORS).find(|i| actor(*i) == member.address)
+                {
+                    self.debts.push((*address, i, outstanding));
+                }
+            }
         }
     }
 
@@ -315,8 +481,75 @@ impl World {
         }
     }
 
+    /// A member of a group this generator builds.
+    ///
+    /// Every group is founded from `actor(0..count)` with `count` in 2..=4, so
+    /// the low actors are the ones with standing. Naming them deliberately is
+    /// what makes the accumulating-group paths reachable at all — picking a
+    /// beneficiary and a guarantor uniformly from six actors would refuse most
+    /// loans for membership before any of the arithmetic ran.
+    fn member(rng: &mut Rng) -> Address {
+        actor(u8::try_from(rng.below(3)).unwrap())
+    }
+
     fn message(&mut self, rng: &mut Rng, sender: u8) -> Message {
-        match rng.below(12) {
+        // Two paths the generator aims at rather than stumbles into, because
+        // both need a fact only the ledger knows. Everything else is random.
+        // A quorum is the hard part, so an open question gets answered often;
+        // closing a cycle is held back deliberately, because closing one lapses
+        // every proposal in it and a generator that shuts cycles as fast as it
+        // can never lets a loan be agreed.
+        if !self.pending.is_empty() && rng.below(3) != 0 {
+            return Message::ApproveGroupAction {
+                group: self.pending[rng.below(self.pending.len())],
+            };
+        }
+        if self.pending.is_empty() && !self.vikoba.is_empty() && rng.below(3) == 0 {
+            let beneficiary = Self::member(rng);
+            let mut guarantor = Self::member(rng);
+            if guarantor == beneficiary {
+                guarantor = actor(if beneficiary == actor(0) { 1 } else { 0 });
+            }
+            return Message::ProposeGroupAction {
+                group: self.vikoba[rng.below(self.vikoba.len())],
+                beneficiary,
+                kind: ProposalKind::Loan {
+                    principal: Amount::from_afri(1 + u64::from(rng.byte() % 20)),
+                    guarantors: vec![guarantor],
+                },
+            };
+        }
+        if !self.sharable.is_empty() && rng.below(2) == 0 {
+            return Message::ShareOut {
+                group: self.sharable[rng.below(self.sharable.len())],
+            };
+        }
+        if !self.closable.is_empty() && rng.below(8) == 0 {
+            return Message::CloseCycle {
+                group: self.closable[rng.below(self.closable.len())],
+            };
+        }
+        if rng.below(2) == 0
+            && let Some((group, _, outstanding)) = self
+                .debts
+                .iter()
+                .find(|(_, who, _)| *who == sender)
+                .copied()
+        {
+            return Message::RepayLoan {
+                group,
+                // Usually part or all of the debt; sometimes more than it, which
+                // must be refused rather than pocketed.
+                amount: if rng.below(4) == 0 {
+                    outstanding.checked_add(Amount::from_afri(1)).unwrap()
+                } else if rng.below(2) == 0 {
+                    outstanding
+                } else {
+                    Amount::from_units(outstanding.units() / 2 + 1)
+                },
+            };
+        }
+        match rng.below(18) {
             0..=3 => Message::Transfer {
                 to: self.destination(rng),
                 denom: if rng.below(4) == 0 {
@@ -339,7 +572,7 @@ impl World {
                 if !self.groups.contains(&address) {
                     self.groups.push(address);
                 }
-                let count = 2 + rng.below(3);
+                let count = 3 + rng.below(2);
                 let members: Vec<FoundingMember> = (0..count)
                     .map(|i| {
                         FoundingMember::new(
@@ -359,10 +592,28 @@ impl World {
                     contribution: Contribution {
                         amount: Amount::from_afri(10),
                         denom: kes(),
-                        period_blocks: 5,
+                        period_blocks: 3,
                     },
-                    policy: if rng.below(4) == 0 {
-                        PayoutPolicy::Accumulate
+                    policy: if rng.below(2) == 0 {
+                        // Deliberately short: a round of two cycles and a
+                        // one-cycle loan term means a generated sequence can
+                        // actually reach a share-out, which is the only moment
+                        // the fund's arithmetic is fully exercised.
+                        PayoutPolicy::Accumulate(ShareRules {
+                            min_shares: 1,
+                            max_shares: 3,
+                            // Mixed lengths: a two-cycle round reaches a
+                            // share-out often, a three-cycle one leaves room for
+                            // a loan to be agreed and repaid inside it. One
+                            // number could not exercise both.
+                            cycles_per_round: 2 + u64::from(rng.byte() % 2),
+                            service_charge_bps: 1_000,
+                            cover_bps: 3_334,
+                            loan_term_cycles: 1,
+                            late_fine_bps: 1_000,
+                            required_guarantors: 1,
+                            social_contribution: Amount::from_afri(2),
+                        })
                     } else {
                         PayoutPolicy::Rotation { order, next: 0 }
                     },
@@ -391,15 +642,84 @@ impl World {
                 amount: Amount::from_afri(1_000 + u64::from(rng.byte())),
             },
             10 => Message::WithdrawUnbonded,
-            _ => Message::SetAccountFlag {
+            11 => Message::SetAccountFlag {
                 flag: afrolink_types::AccountFlag::RequireReference,
                 enabled: rng.below(2) == 0,
+            },
+
+            // -- Vikoba. Every arm below moves savings, and the arithmetic they
+            //    run — a share price, a service charge, a fine, a proportional
+            //    division — is the newest and least exercised in the chain.
+            12 | 13 if !self.vikoba.is_empty() => Message::BuyShares {
+                group: self.vikoba[rng.below(self.vikoba.len())],
+                // Usually inside the ceiling, sometimes over it: buying past the
+                // limit must be refused rather than clamped, because a clamped
+                // purchase would charge for shares it did not grant.
+                shares: if rng.below(5) == 0 {
+                    4 + u32::try_from(rng.below(4)).unwrap()
+                } else {
+                    1 + u32::try_from(rng.below(3)).unwrap()
+                },
+            },
+            14 if !self.vikoba.is_empty() => Message::PaySocialFund {
+                group: self.vikoba[rng.below(self.vikoba.len())],
+            },
+            15 | 16 if !self.vikoba.is_empty() => {
+                let beneficiary = Self::member(rng);
+                let mut guarantor = Self::member(rng);
+                if guarantor == beneficiary {
+                    guarantor = actor(if beneficiary == actor(0) { 1 } else { 0 });
+                }
+                Message::ProposeGroupAction {
+                    group: self.vikoba[rng.below(self.vikoba.len())],
+                    beneficiary,
+                    kind: if rng.below(3) == 0 {
+                        ProposalKind::SocialGrant {
+                            amount: Amount::from_afri(1 + u64::from(rng.byte() % 8)),
+                        }
+                    } else {
+                        ProposalKind::Loan {
+                            // Small enough that a member's own shares can cover
+                            // it, sometimes far more — an uncovered loan is the
+                            // one the whole rule exists to refuse.
+                            principal: if rng.below(4) == 0 {
+                                Amount::from_afri(5_000)
+                            } else {
+                                Amount::from_afri(1 + u64::from(rng.byte() % 40))
+                            },
+                            guarantors: vec![guarantor],
+                        }
+                    },
+                }
+            }
+            17 if !self.vikoba.is_empty() => {
+                let group = self.vikoba[rng.below(self.vikoba.len())];
+                if rng.below(2) == 0 {
+                    Message::CloseCycle { group }
+                } else {
+                    Message::ShareOut { group }
+                }
+            }
+
+            _ => Message::Transfer {
+                to: self.destination(rng),
+                denom: kes(),
+                amount: Amount::from_units(u128::from(rng.next_u64() % 5_000) + 1),
+                reference: None,
             },
         }
     }
 
     fn transaction(&mut self, rng: &mut Rng) -> Transaction {
-        let sender = u8::try_from(rng.below(ACTORS as usize)).unwrap();
+        // Weighted toward the actors that found groups. Uniform over six would
+        // send most group messages from strangers, and a suite whose group
+        // transactions are nearly all refused for membership never reaches the
+        // arithmetic it was written to check.
+        let sender = if rng.below(2) == 0 {
+            u8::try_from(rng.below(3)).unwrap()
+        } else {
+            u8::try_from(rng.below(ACTORS as usize)).unwrap()
+        };
         let messages = vec![self.message(rng, sender)];
 
         // Mostly the right nonce, so blocks make progress; sometimes wrong, so
@@ -447,16 +767,57 @@ struct Coverage {
     applied: u64,
     total: u64,
     codes: [u64; 16],
+    /// Applied vikoba messages, by kind — see [`VIKOBA_KINDS`].
+    ///
+    /// A share-out is reached only by a sequence that founds an accumulating
+    /// group, buys shares in it, closes two whole cycles and then asks. A
+    /// generator can drift away from a path that long without any invariant
+    /// noticing, because an invariant that is never reached always holds.
+    vikoba: [u64; VIKOBA_KINDS.len()],
+}
+
+/// The accumulating-group messages this suite insists on actually exercising.
+const VIKOBA_KINDS: [&str; 7] = [
+    "BuyShares",
+    "PaySocialFund",
+    "ProposeGroupAction",
+    "ApproveGroupAction",
+    "RepayLoan",
+    "CloseCycle",
+    "ShareOut",
+];
+
+fn vikoba_slot(message: &Message) -> Option<usize> {
+    Some(match message {
+        Message::BuyShares { .. } => 0,
+        Message::PaySocialFund { .. } => 1,
+        Message::ProposeGroupAction { .. } => 2,
+        Message::ApproveGroupAction { .. } => 3,
+        Message::RepayLoan { .. } => 4,
+        Message::CloseCycle { .. } => 5,
+        Message::ShareOut { .. } => 6,
+        _ => return None,
+    })
 }
 
 impl Coverage {
-    fn record(&mut self, outcome: &afrolink_executor::BlockOutcome, offered: usize) {
+    fn record(&mut self, outcome: &afrolink_executor::BlockOutcome, transactions: &[Transaction]) {
         self.applied = self.applied.saturating_add(outcome.succeeded() as u64);
-        self.total = self.total.saturating_add(offered as u64);
+        self.total = self.total.saturating_add(transactions.len() as u64);
         for o in &outcome.outcomes {
             let slot = o.receipt.code.as_u16() as usize;
             if let Some(count) = self.codes.get_mut(slot) {
                 *count = count.saturating_add(1);
+            }
+        }
+        for (o, tx) in outcome.outcomes.iter().zip(transactions) {
+            if !o.receipt.code.succeeded() {
+                continue;
+            }
+            for message in &tx.body.messages {
+                if let Some(slot) = vikoba_slot(message) {
+                    self.vikoba[slot] = self.vikoba[slot].saturating_add(1);
+                }
             }
         }
     }
@@ -485,6 +846,18 @@ impl Coverage {
             self.distinct_codes(),
             self.codes
         );
+        // Every accumulating-group message must actually have applied. An
+        // invariant that is never reached always holds, so without this the
+        // whole vikoba section of `check_invariants` could go green over a run
+        // that never once bought a share.
+        for (kind, count) in VIKOBA_KINDS.iter().zip(self.vikoba) {
+            assert!(
+                count > 0,
+                "no {kind} ever applied: the vikoba invariants are vacuous \
+                 ({:?})",
+                self.vikoba
+            );
+        }
     }
 }
 
@@ -526,7 +899,8 @@ fn run(seed: u64, blocks: u64, coverage: &mut Coverage) -> afrolink_crypto::hash
                 }
             }
         }
-        coverage.record(&outcome, transactions.len());
+        world.refresh(&store, height + 1);
+        coverage.record(&outcome, &transactions);
     }
     store.root()
 }

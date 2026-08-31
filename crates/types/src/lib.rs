@@ -43,6 +43,7 @@ pub use account::{
     SignerList, TxPointer,
 };
 pub use group::{
-    Contribution, FoundingMember, GroupAccount, GroupError, Member, PayoutPolicy, Quorum, Role,
+    Contribution, FoundingMember, GroupAccount, GroupError, Loan, Member, PayoutPolicy, Proposal,
+    ProposalKind, Quorum, Role, ShareRules,
 };
 pub use tx::{Fee, MAX_SIGNATURES, Message, Transaction, TxBody, TxError, TxSignature};

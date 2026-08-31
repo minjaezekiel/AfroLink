@@ -178,10 +178,11 @@ survives group creation. Genuine recovery completes.
 
 **Bad, and worth being clear about.**
 
-- **`Quorum` is still stored and never enforced.** It is documented as the
-  approval share for "extraordinary withdrawals", and there is no message that
-  makes one. So the field is a promise with nothing behind it — recorded here
-  rather than left for the next reader to discover.
+- ~~**`Quorum` is still stored and never enforced.**~~ **Closed** by
+  [ADR-0019](0019-vikoba-accumulating-savings.md): it now governs loans and
+  social-fund grants in an accumulating group, which are the "extraordinary
+  withdrawals" it was always documented for. It remains unused by a *rotating*
+  group, which still has no message that moves the pot other than the rotation.
 - **A group can still stall.** If the pot is empty when the period expires,
   `EmptyPot` refuses the payout and the cycle cannot close. That is the safe
   direction, but a group where nobody pays is stuck rather than gracefully
@@ -191,7 +192,9 @@ survives group creation. Genuine recovery completes.
   governance authority the chain does not have yet, and inventing one here would
   be worse than naming the gap.
 - **Groups cannot change.** No member may join or leave, and the contribution
-  cannot be renegotiated. Real groups do all three.
+  cannot be renegotiated. Real groups do all three. Still true after
+  [ADR-0019](0019-vikoba-accumulating-savings.md), which adds a round boundary —
+  the obvious place to allow it.
 
 ## Revisit if
 

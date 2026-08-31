@@ -29,6 +29,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 |---|---|
 | **Never need the native token** | Fees payable in any whitelisted stablecoin, and payable *by someone else* who co-signs. A user sends money without knowing AFRI exists. The biggest adoption blocker in crypto payments, removed. |
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The chain enforces the rules the group agreed: a contribution is the agreed amount, once a cycle, and a payout waits until the cycle is actually over. The contribution history is user-owned and portable — a credit file for people with no credit file, and one that can say no. |
+| **And groups that lend, not only rotate** | *Vikoba* is a different instrument from *upatu*, and the difference is that a rotation redistributes while a vikoba **earns**. Members buy shares, the group lends its own savings to members at a service charge behind a quorum and a cover rule, keeps a separate social fund for funerals and illness, and ends each round by dividing everything — earnings included — in proportion to what each member saved. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
 | **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers — and an address that *needs* one can say so in state, so the ledger refuses an untagged deposit instead of letting it arrive belonging to nobody. |
@@ -116,6 +117,13 @@ seven working attacks and one feature that could not run at all — **the saving
 group took the worst of it**, including one member able to drain a chama by
 spinning the rotation until it pointed at them. All fixed, each with the exploit
 kept as a test ([ADR-0018](docs/adr/0018-savings-group-integrity.md)).
+
+The property suite has since found one of its own, which is the kind that is
+hardest to see: a vikoba loan granted late in a savings round falls due *after*
+the share-out that settles it, so the borrower is recorded as a defaulter and
+their savings seized — for a term the group itself granted. Nothing fails at the
+time. Nobody would have written that test by hand, because nobody had noticed
+there was a question ([ADR-0019](docs/adr/0019-vikoba-accumulating-savings.md)).
 
 The first of that kind was found earlier and is recorded separately:
 sponsored fees debited the named payer **with no consent check at all**, which
