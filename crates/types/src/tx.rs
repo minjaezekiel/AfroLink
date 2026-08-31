@@ -102,6 +102,14 @@ pub enum TxError {
     /// A transfer of zero.
     #[error("transfer amount must be greater than zero")]
     ZeroAmount,
+    /// A transaction offering no fee at all.
+    ///
+    /// The fee is the only cost of making every validator on the network
+    /// execute a transaction, and the only punishment a *failed* one carries.
+    /// At zero, failure is free and one account can make the whole network
+    /// re-execute for as long as it likes.
+    #[error("a transaction must offer a fee greater than zero")]
+    ZeroFee,
     /// Underlying crypto failure.
     #[error(transparent)]
     Crypto(#[from] CryptoError),
@@ -283,6 +291,21 @@ pub enum Message {
         /// The contact whose rebinding should be cancelled.
         commitment: ContactCommitment,
     },
+    /// Push a rebinding whose delay has elapsed into effect.
+    ///
+    /// **Permissionless on purpose.** The protection is the delay and the
+    /// veto, both of which have already run their course by the time this can
+    /// succeed; whoever pays the fee to finish the job changes nothing about
+    /// the outcome. Requiring the *new* owner to send it would defeat the point,
+    /// since the case this exists for is a user who has lost the key that
+    /// account is being moved away from.
+    ///
+    /// Without it a matured rebinding sits pending forever and genuine recovery
+    /// never completes.
+    ApplyRebind {
+        /// The contact whose pending rebinding should take effect.
+        commitment: ContactCommitment,
+    },
     /// Remove a contact binding, by the account it points at.
     RevokeContact {
         /// The contact to unbind.
@@ -445,6 +468,9 @@ impl TxBody {
         if self.fee.payer == Some(self.sender) {
             return Err(TxError::SelfSponsored);
         }
+        if self.fee.amount.is_zero() {
+            return Err(TxError::ZeroFee);
+        }
         for msg in &self.messages {
             match msg {
                 Message::Transfer { amount, .. }
@@ -475,6 +501,7 @@ impl TxBody {
                 | Message::SetAccountFlag { .. }
                 | Message::SetRegularKey { .. }
                 | Message::SetSignerList { .. }
+                | Message::ApplyRebind { .. }
                 | Message::ReleaseName { .. } => {}
             }
         }
@@ -586,6 +613,9 @@ impl Transaction {
                 Message::TransferName { to, .. } => out.push(*to),
                 Message::AttestContact { address, .. } => out.push(*address),
                 Message::RequestRebind { new_address, .. } => out.push(*new_address),
+                // The account gaining the binding should see the transaction
+                // that gave it to them, even though a stranger may have sent it.
+                Message::ApplyRebind { .. } => {}
                 // The offender belongs in the index: a slashing is the single
                 // most important thing that can happen to a validator's account,
                 // and they did not send the report.
@@ -869,6 +899,10 @@ impl Encode for Message {
                 out.push(21);
                 list.encode(out);
             }
+            Self::ApplyRebind { commitment } => {
+                out.push(22);
+                commitment.encode(out);
+            }
         }
     }
 }
@@ -951,6 +985,9 @@ impl Decode for Message {
             }),
             21 => Ok(Self::SetSignerList {
                 list: Option::<SignerList>::decode(r)?,
+            }),
+            22 => Ok(Self::ApplyRebind {
+                commitment: ContactCommitment::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

@@ -28,7 +28,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | | |
 |---|---|
 | **Never need the native token** | Fees payable in any whitelisted stablecoin, and payable *by someone else* who co-signs. A user sends money without knowing AFRI exists. The biggest adoption blocker in crypto payments, removed. |
-| **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
+| **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The chain enforces the rules the group agreed: a contribution is the agreed amount, once a cycle, and a payout waits until the cycle is actually over. The contribution history is user-owned and portable — a credit file for people with no credit file, and one that can say no. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
 | **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers — and an address that *needs* one can say so in state, so the ledger refuses an untagged deposit instead of letting it arrive belonging to nobody. |
@@ -41,7 +41,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Seventeen crates, **669 tests passing**. A working
+**Phase 2 in progress.** Seventeen crates, **683 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
@@ -64,9 +64,9 @@ crates/
   primitives/   canonical consensus codec, checked amounts, denoms      25 tests ✅
   crypto/       BLAKE3 + Ed25519, bech32m, RFC 6962 Merkle + consistency 38 tests ✅
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
-  types/        accounts, signing authority, transactions, fees            68 tests ✅
+  types/        accounts, signing authority, transactions, fees            71 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, blocks, genesis                         58 tests ✅
+  executor/     block execution, genesis, and attacks on the money         69 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
   node/         consensus driver, mempool, proposals, simulator          41 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
@@ -102,7 +102,15 @@ It found five real defects on its first run, and the same root cause has since
 turned up at a sixth place — every one of them a value that was not uniquely
 determined, made safe by a convention enforced somewhere else.
 
-A seventh was worse and of a different kind, so it is recorded separately:
+A further eight came from asking a different question. Canonicality testing asks
+*"can this input be read two ways?"*; it cannot ask *"should this input have been
+obeyed?"* Attacking the chain the way someone who wanted the money would found
+seven working attacks and one feature that could not run at all — **the savings
+group took the worst of it**, including one member able to drain a chama by
+spinning the rotation until it pointed at them. All fixed, each with the exploit
+kept as a test ([ADR-0018](docs/adr/0018-savings-group-integrity.md)).
+
+The first of that kind was found earlier and is recorded separately:
 sponsored fees debited the named payer **with no consent check at all**, which
 made "name any funded address as your sponsor" a way to drain it. Every byte
 involved was canonical and every signature genuine, so no fuzzer could have

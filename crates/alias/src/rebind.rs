@@ -209,7 +209,7 @@ impl<'a, S: KeyValueStore> Bindings<'a, S> {
         &mut self,
         commitment: &ContactCommitment,
         now: Height,
-    ) -> Result<(), BindError> {
+    ) -> Result<Address, BindError> {
         let mut record = self.resolve(commitment)?.ok_or(BindError::NotBound)?;
         let pending = record.rebind.clone().ok_or(BindError::NoPendingRebind)?;
 
@@ -226,7 +226,9 @@ impl<'a, S: KeyValueStore> Bindings<'a, S> {
         record.rebind = None;
         self.store
             .set_encoded(&StoreKey::contact(commitment.as_hash()), &record);
-        Ok(())
+        // The account the contact now points at, so a caller can make sure it
+        // exists rather than leaving a binding aimed at nothing.
+        Ok(record.address)
     }
 
     /// Remove a binding entirely.

@@ -90,6 +90,12 @@ pub enum ExecError {
     /// The named account is not a group account.
     #[error("account is not a group")]
     NotAGroup,
+    /// An account already occupies the address a new record would take.
+    #[error("an account already exists at this address")]
+    AccountExists,
+    /// The fee was offered in a denomination the chain does not accept.
+    #[error("fees are not accepted in {0}")]
+    FeeDenomNotAccepted(String),
     /// The signer may not perform this action on this group.
     #[error("signer is not a member of this group")]
     NotAGroupMember,
@@ -246,10 +252,12 @@ impl From<&ExecError> for ResultCode {
             ExecError::Group(_) => Self::Group,
             ExecError::Staking(_) => Self::Staking,
             ExecError::NoSuchAccount
+            | ExecError::AccountExists
             | ExecError::NotAGroup
             | ExecError::NotAGroupMember
             | ExecError::NoRotationRecipient => Self::Account,
             ExecError::ReferenceRequired => Self::Reference,
+            ExecError::FeeDenomNotAccepted(_) => Self::Bank,
             ExecError::Unauthorised
             | ExecError::SponsorUnauthorised
             | ExecError::WouldLockOut
@@ -592,6 +600,24 @@ impl Executor {
             }
         }
 
+        // The denomination has to be one the chain actually accepts. The native
+        // coin always is; a sovereign asset is only if governance registered its
+        // issuer, which is what "governance-whitelisted" means in ADR-0005 §4.1.
+        //
+        // Not currently reachable — an attacker cannot obtain units of a denom
+        // with no issuer, because minting requires one — but it is the check
+        // that keeps that true once issuers can be registered by transaction.
+        match accepts_as_fee(store, &tx.body.fee.denom) {
+            Ok(true) => {}
+            Ok(false) => {
+                return TxOutcome::rejected(
+                    tx_id,
+                    ExecError::FeeDenomNotAccepted(tx.body.fee.denom.to_string()),
+                );
+            }
+            Err(e) => return TxOutcome::rejected(tx_id, e),
+        }
+
         // Charge the fee against committed state. If the payer cannot cover it
         // the transaction is not includable at all, so nothing is consumed.
         let fee_result = Bank::new(store).transfer(
@@ -758,11 +784,24 @@ impl Executor {
                     contribution.clone(),
                     policy.clone(),
                     *quorum,
+                    ctx.height,
                 )?;
-                store.set_encoded(
-                    &StoreKey::account(&group_address),
-                    &Account::group(group_address, group),
-                );
+
+                // A group's address is derived from `(creator, nonce)`, so
+                // anyone can compute it in advance and pay it. Writing a fresh
+                // record over whatever is there would reset `last_txn` and
+                // orphan every payment already made to it — the provable-history
+                // chain of ADR-0015 broken by an ordinary group creation.
+                //
+                // So the record is *converted*, not replaced: history and flags
+                // survive, only the kind changes.
+                let key = StoreKey::account(&group_address);
+                let mut account = load_account(store, &group_address)?;
+                if !matches!(account.kind, afrolink_types::AccountKind::Individual { .. }) {
+                    return Err(ExecError::AccountExists);
+                }
+                account.kind = afrolink_types::AccountKind::Group(Box::new(group));
+                store.set_encoded(&key, &account);
                 Ok(())
             }
 
@@ -772,13 +811,25 @@ impl Executor {
                 if !record.is_member(&sender) {
                     return Err(ExecError::NotAGroupMember);
                 }
+                // The group agreed one figure. Crediting a cycle for whatever
+                // was sent lets a member pay one unit, be recorded as having
+                // met the obligation, and collect the full pot when the
+                // rotation reaches them.
+                if *amount != record.contribution.amount {
+                    return Err(GroupError::WrongContributionAmount {
+                        expected: record.contribution.amount.units().to_string(),
+                        got: amount.units().to_string(),
+                    }
+                    .into());
+                }
                 let denom = record.contribution.denom.clone();
-                Bank::new(store).transfer(&sender, group, &denom, *amount)?;
 
-                // Re-borrow mutably now the transfer is done.
+                // Recorded first, so a member who has already paid this cycle is
+                // refused *before* their money moves.
                 if let afrolink_types::AccountKind::Group(g) = &mut account.kind {
                     g.record_contribution(&sender)?;
                 }
+                Bank::new(store).transfer(&sender, group, &denom, *amount)?;
                 store.set_encoded(&StoreKey::account(group), &account);
                 Ok(())
             }
@@ -794,16 +845,28 @@ impl Executor {
                     .ok_or(ExecError::NoRotationRecipient)?;
                 let denom = record.contribution.denom.clone();
 
+                // A cycle ends when everybody has paid, or when the agreed
+                // period runs out. Without this any member could call payout
+                // repeatedly against an empty pot, advancing the rotation until
+                // it pointed at themselves, and then collect every cycle.
+                if !record.payout_due(ctx.height) {
+                    return Err(GroupError::CycleNotDue.into());
+                }
+
                 // Pay out whatever the pot actually holds, rather than the
                 // nominal figure: a member may have missed a contribution, and
                 // paying the nominal amount would overdraw the group.
                 let pot = Bank::new(store).view().balance(group, &denom)?;
-                if !pot.is_zero() {
-                    Bank::new(store).transfer(group, &recipient, &denom, pot)?;
+                if pot.is_zero() {
+                    // Nothing to pay is not a cycle. Letting it through would
+                    // make the rotation a counter anyone able to pay a fee can
+                    // increment.
+                    return Err(GroupError::EmptyPot.into());
                 }
+                Bank::new(store).transfer(group, &recipient, &denom, pot)?;
 
                 if let afrolink_types::AccountKind::Group(g) = &mut account.kind {
-                    g.advance_cycle();
+                    g.advance_cycle(ctx.height);
                 }
                 store.set_encoded(&StoreKey::account(group), &account);
                 Ok(())
@@ -863,6 +926,17 @@ impl Executor {
                 // already proves possession of the key. Whether that key holds
                 // the bound account is what `veto_rebind` checks.
                 Bindings::new(store).veto_rebind(commitment, sender)?;
+                Ok(())
+            }
+
+            Message::ApplyRebind { commitment } => {
+                // No sender check: the delay has elapsed and the veto window has
+                // closed, so the outcome is already decided. Whoever pays to
+                // finish it changes nothing — and requiring the new owner would
+                // defeat the purpose, since this exists for a user who lost the
+                // key the account is moving away from.
+                let record = Bindings::new(store).apply_rebind(commitment, ctx.height)?;
+                ensure_account(store, &record);
                 Ok(())
             }
 
@@ -940,6 +1014,21 @@ fn load_existing_account<S: KeyValueStore>(
     store
         .get_decoded::<Account>(&StoreKey::account(address))?
         .ok_or(ExecError::NoSuchAccount)
+}
+
+/// Whether the chain accepts fees in this denomination.
+///
+/// The native coin always. A sovereign asset only when governance has registered
+/// its issuer — issuers exist solely through genesis today, so the issuer
+/// registry *is* the whitelist ADR-0005 §4.1 describes.
+fn accepts_as_fee<S: KeyValueStore>(
+    store: &S,
+    denom: &afrolink_primitives::Denom,
+) -> Result<bool, ExecError> {
+    if denom.is_native() {
+        return Ok(true);
+    }
+    Ok(afrolink_bank::BankView::new(store).issuer(denom)?.is_some())
 }
 
 /// Apply a change to the sender's own account record, refusing a lock-out.

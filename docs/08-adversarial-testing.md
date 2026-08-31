@@ -111,6 +111,12 @@ the same shape keeps reappearing wherever untrusted input becomes a value.
 A seventh, §7, is a **different** class and is recorded separately so the pattern
 above is not stretched to cover it. It was not a decoder problem at all.
 
+§8–15 are that same second class, found deliberately rather than by accident:
+a session spent attacking the chain the way someone who wanted the money would.
+None of them is a malformed input. Every one arrives as a well-formed
+transaction, correctly signed, from an account entitled to send it — which is
+exactly why no amount of fuzzing would have surfaced them.
+
 ### 1 & 2. Decoders that normalised instead of rejecting
 
 `Username::decode` lowercased; `ValidatorSet::decode` sorted. Both route through
@@ -237,6 +243,48 @@ obeyed at all?"* Those are different questions, and the fuzz suite only answers
 the first. What surfaced this was writing an explicit model of authorisation —
 which is an argument for doing that for every capability, not only for signing.
 
+### 8–15. What an attacker with a wallet could actually do
+
+The fuzz suite asks *"can this input be read two ways?"*. It cannot ask *"should
+this input have been obeyed?"* So the second question was asked directly: build
+a chain, submit ordinary transactions, try to end up richer. The exploits are in
+[`crates/executor/tests/heist.rs`](../crates/executor/tests/heist.rs), each
+written to fail against the fixed code.
+
+Seven attacks worked. **The savings group took the worst of it**, which is the
+part that matters — a chama's money belongs to people for whom losing it is not
+an inconvenience. Full reasoning in
+[ADR-0018](adr/0018-savings-group-integrity.md); the shape of each is:
+
+| # | What it was | Effect |
+|---|---|---|
+| **8** | `GroupPayout` had no clock: any member could call it, and an empty pot still advanced the cycle | **One member drains the group.** Spin the rotation for the price of fees until it points at you, then collect every cycle |
+| **9** | `ContributeToGroup` never compared the amount sent against the amount agreed | Pay one shilling, be credited a full cycle, take the whole pot |
+| **10** | No per-cycle contribution check | Pay ten times in one cycle, buy a reliability record you did not earn |
+| **11** | `record_missed` was **never called from anywhere** | The credit signal could only ever say yes — about borrowers who can least afford a loan they should not get |
+| **12** | `CreateGroup` overwrote any existing record at the derived address | Resets `last_txn`, orphaning the provable-history chain of ADR-0015 |
+| **13** | No cap on group membership, and every member is filed in `touched_addresses` | One fee mints unbounded account records for strangers — the exact property ADR-0015 claims |
+| **14** | No minimum fee | A failed transaction's only punishment is its fee. At zero, failure is free and unlimited |
+| **15** | No fee-denomination whitelist | **Not currently exploitable** — minting needs an issuer, issuers come only from genesis. It is the check that keeps that true once issuers can be registered by transaction |
+
+A ninth finding was the opposite of an exploit: `apply_rebind` was correct,
+tested, and **reachable from no transaction at all**, so a rebinding that
+survived its veto window sat pending forever and genuine recovery never
+completed. The SIM-swap defence refused the attacker and the owner alike.
+
+**What did *not* break, which is worth as much.** Supply conservation held under
+every sequence tried — no transaction changed the recorded supply of an asset.
+Naming the fee collector as a fee payer bought nothing, because module accounts
+authorise no keys ([ADR-0017](adr/0017-key-rotation-and-signer-lists.md)). The
+staking module's arithmetic and the bank's atomicity held up to inspection.
+
+**The lesson, and it is the same one §7 taught at smaller scale.** Every defect
+above lived in the gap between *what a message says* and *what the code does
+with it* — an amount carried but never compared, a period agreed but never read,
+a counter incremented but never balanced. Canonicality testing cannot see that
+gap, because both sides of it are well-formed. What finds it is writing down
+what a feature is supposed to guarantee and then trying to violate it.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -261,9 +309,18 @@ Named gaps, so they are not mistaken for coverage:
   checker, and a rare interleaving may sit outside any seed tried. TLA+ or Stateright
   over the round state machine would be the honest next step.
 - **No timing or side-channel analysis.**
-- **The executor is not fuzzed against semantic invariants** — supply
-  conservation under arbitrary transaction sequences is the obvious next
-  property, and it is not written yet.
+- **The executor's semantic invariants are asserted, not fuzzed.** Supply
+  conservation is now checked over one deliberately messy sequence
+  (`no_sequence_of_transactions_changes_the_total_supply`), which is a great
+  deal better than nothing and a great deal weaker than a property-based search.
+  A generator producing arbitrary valid transaction sequences and asserting
+  conservation after each block is the obvious next step, and §8–15 are the
+  argument for it.
+- **The economic rules have no model.** A chama's payout rule is now enforced,
+  but nobody has written down the full set of states a group can be in and
+  checked that none of them is a trap. `EmptyPot` at period expiry is one such
+  state, named in [ADR-0018](adr/0018-savings-group-integrity.md) and not
+  resolved.
 - ~~History cannot be verified at all~~ — **closed** by
   [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md). An account's
   history is now a chain of committed back-pointers, so a node that omits an

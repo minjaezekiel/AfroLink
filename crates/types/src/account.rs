@@ -728,6 +728,7 @@ mod tests {
             },
             PayoutPolicy::Rotation { order, next: 0 },
             Quorum::TWO_THIRDS,
+            Height(0),
         )
         .expect("valid group")
     }

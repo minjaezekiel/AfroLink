@@ -16,8 +16,21 @@
 
 use afrolink_crypto::Address;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
-use afrolink_primitives::{Amount, Denom};
+use afrolink_primitives::{Amount, Denom, Height};
 use thiserror::Error;
+
+/// Most members one group may hold.
+///
+/// A bound rather than a preference. Every founding member is filed in the
+/// transaction's `touched_addresses`, and being filed **creates an account
+/// record** — so without a cap, one fee buys unbounded state written for
+/// addresses that never asked to be named
+/// ([ADR-0015](../../../docs/adr/0015-committed-outcomes-and-provable-history.md)
+/// states the property this protects).
+///
+/// 100 is far above any real savings group: a VSLA is 15–30 people by design,
+/// because the model depends on members knowing one another.
+pub const MAX_GROUP_MEMBERS: usize = 100;
 
 /// Errors from group account operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -51,6 +64,29 @@ pub enum GroupError {
     /// The group name was empty or too long.
     #[error("group name must be 1..=64 bytes")]
     InvalidName,
+    /// More than [`MAX_GROUP_MEMBERS`].
+    #[error("a group may hold at most {MAX_GROUP_MEMBERS} members, got {0}")]
+    TooManyMembers(usize),
+    /// A second contribution in one cycle.
+    ///
+    /// Not merely redundant: crediting it would let a member buy reliability
+    /// they did not earn, and the record is what a lender reads.
+    #[error("this member has already contributed for this cycle")]
+    AlreadyContributed,
+    /// The amount offered is not the amount the group agreed.
+    #[error("this group's contribution is {expected}, not {got}")]
+    WrongContributionAmount {
+        /// What the group agreed.
+        expected: String,
+        /// What was offered.
+        got: String,
+    },
+    /// A payout was requested before the cycle was due.
+    #[error("the cycle is not due: not every member has paid and the period has not elapsed")]
+    CycleNotDue,
+    /// A payout was requested with nothing to pay out.
+    #[error("there is nothing in the pot to pay out")]
+    EmptyPot,
 }
 
 /// A member's role within the group.
@@ -117,6 +153,12 @@ pub struct Member {
     pub contributions_made: u64,
     /// Contributions missed.
     pub contributions_missed: u64,
+    /// The cycle this member last paid into, if any.
+    ///
+    /// Cumulative counters cannot answer *"has this member paid for the cycle
+    /// now open?"* — which is the only question that decides whether a payout
+    /// is due, and whether a second payment is a duplicate.
+    pub last_paid_cycle: Option<u64>,
 }
 
 impl Member {
@@ -129,7 +171,14 @@ impl Member {
             joined_cycle: cycle,
             contributions_made: 0,
             contributions_missed: 0,
+            last_paid_cycle: None,
         }
+    }
+
+    /// Whether this member has already paid into `cycle`.
+    #[must_use]
+    pub fn has_paid(&self, cycle: u64) -> bool {
+        self.last_paid_cycle == Some(cycle)
     }
 
     /// Contributions this member was due, on time or not.
@@ -249,6 +298,12 @@ pub struct GroupAccount {
     pub quorum: Quorum,
     /// Cycles completed since formation.
     pub cycle: u64,
+    /// Height at which the cycle now open began.
+    ///
+    /// Without it `Contribution::period_blocks` is a number nobody reads, and
+    /// "the cycle is over" has no definition the chain can check — which is what
+    /// let any member advance the rotation at will.
+    pub cycle_started: Height,
 }
 
 impl GroupAccount {
@@ -262,6 +317,7 @@ impl GroupAccount {
         contribution: Contribution,
         policy: PayoutPolicy,
         quorum: Quorum,
+        opened_at: Height,
     ) -> Result<Self, GroupError> {
         let name = name.into();
         if name.is_empty() || name.len() > 64 {
@@ -269,6 +325,9 @@ impl GroupAccount {
         }
         if members.len() < 2 {
             return Err(GroupError::TooFewMembers(members.len()));
+        }
+        if members.len() > MAX_GROUP_MEMBERS {
+            return Err(GroupError::TooManyMembers(members.len()));
         }
         if contribution.amount.is_zero() {
             return Err(GroupError::ZeroContribution);
@@ -313,6 +372,7 @@ impl GroupAccount {
             policy,
             quorum,
             cycle: 0,
+            cycle_started: opened_at,
         })
     }
 
@@ -357,13 +417,49 @@ impl GroupAccount {
     /// # Errors
     /// Returns [`GroupError::NotAMember`] if the address is not in the group.
     pub fn record_contribution(&mut self, address: &Address) -> Result<(), GroupError> {
+        let cycle = self.cycle;
         let member = self
             .members
             .iter_mut()
             .find(|m| &m.address == address)
             .ok_or(GroupError::NotAMember)?;
+        // One contribution per member per cycle. Without this a member could
+        // pay ten times in one cycle and buy a reliability record they did not
+        // earn — and that record is what a lender reads.
+        if member.has_paid(cycle) {
+            return Err(GroupError::AlreadyContributed);
+        }
         member.contributions_made = member.contributions_made.saturating_add(1);
+        member.last_paid_cycle = Some(cycle);
         Ok(())
+    }
+
+    /// Whether every member has paid into the cycle now open.
+    #[must_use]
+    pub fn everyone_has_paid(&self) -> bool {
+        self.members.iter().all(|m| m.has_paid(self.cycle))
+    }
+
+    /// Whether a payout may be taken at `now`.
+    ///
+    /// Either every member has met the obligation, or the agreed period has
+    /// elapsed and the cycle closes with whatever was collected. **Both are
+    /// needed:** requiring only full payment lets one member hold the group
+    /// hostage by never paying, and requiring only the period would make an
+    /// early payout impossible even when everybody has paid.
+    #[must_use]
+    pub fn payout_due(&self, now: Height) -> bool {
+        self.everyone_has_paid() || now.0 >= self.period_ends().0
+    }
+
+    /// The height at which the current cycle's period expires.
+    #[must_use]
+    pub fn period_ends(&self) -> Height {
+        Height(
+            self.cycle_started
+                .0
+                .saturating_add(self.contribution.period_blocks),
+        )
     }
 
     /// Record that `address` missed this cycle's obligation.
@@ -394,7 +490,19 @@ impl GroupAccount {
         clippy::arithmetic_side_effects,
         reason = "`len` is forced to at least 1 by `.max(1)`, so the modulo cannot divide by zero"
     )]
-    pub fn advance_cycle(&mut self) {
+    pub fn advance_cycle(&mut self, at: Height) {
+        // Anyone who did not pay into the cycle just closed missed it. Nothing
+        // called `record_missed` before this, so `contributions_missed` was
+        // always zero and `reliability_bps` reported a perfect record for every
+        // member who had ever paid once — a credit signal that could only ever
+        // flatter.
+        let closing = self.cycle;
+        for member in &mut self.members {
+            if !member.has_paid(closing) {
+                member.contributions_missed = member.contributions_missed.saturating_add(1);
+            }
+        }
+        self.cycle_started = at;
         self.cycle = self.cycle.saturating_add(1);
         if let PayoutPolicy::Rotation { order, next } = &mut self.policy {
             let len = u32::try_from(order.len()).unwrap_or(1).max(1);
@@ -442,6 +550,7 @@ impl Encode for Member {
         self.joined_cycle.encode(out);
         self.contributions_made.encode(out);
         self.contributions_missed.encode(out);
+        self.last_paid_cycle.encode(out);
     }
 }
 
@@ -453,6 +562,7 @@ impl Decode for Member {
             joined_cycle: u64::decode(r)?,
             contributions_made: u64::decode(r)?,
             contributions_missed: u64::decode(r)?,
+            last_paid_cycle: Option::<u64>::decode(r)?,
         })
     }
 }
@@ -528,19 +638,31 @@ impl Encode for GroupAccount {
         self.policy.encode(out);
         self.quorum.encode(out);
         self.cycle.encode(out);
+        self.cycle_started.encode(out);
     }
 }
 
 impl Decode for GroupAccount {
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
-        Ok(Self {
+        let group = Self {
             name: String::decode(r)?,
             members: Vec::<Member>::decode(r)?,
             contribution: Contribution::decode(r)?,
             policy: PayoutPolicy::decode(r)?,
             quorum: Quorum::decode(r)?,
             cycle: u64::decode(r)?,
-        })
+            cycle_started: Height::decode(r)?,
+        };
+        // The cap is a consensus rule, so it has to hold at the decode boundary
+        // too: a record this chain could never have produced must not be
+        // accepted from a database or a peer just because it parses.
+        if group.members.len() > MAX_GROUP_MEMBERS {
+            return Err(CodecError::Invalid(format!(
+                "a group may hold at most {MAX_GROUP_MEMBERS} members, got {}",
+                group.members.len()
+            )));
+        }
+        Ok(group)
     }
 }
 
@@ -585,6 +707,7 @@ mod tests {
             contribution(),
             PayoutPolicy::Rotation { order, next: 0 },
             Quorum::TWO_THIRDS,
+            Height(0),
         )
         .expect("valid chama")
     }
@@ -596,7 +719,7 @@ mod tests {
         let mut paid = Vec::new();
         for _ in 0..5 {
             paid.push(group.next_recipient().expect("rotation has a recipient"));
-            group.advance_cycle();
+            group.advance_cycle(Height(0));
         }
         let mut sorted = paid.clone();
         sorted.sort_unstable();
@@ -636,7 +759,8 @@ mod tests {
                 members,
                 contribution(),
                 PayoutPolicy::Rotation { order, next: 0 },
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::DuplicateMember)
         );
@@ -669,7 +793,8 @@ mod tests {
                     order: short_order,
                     next: 0
                 },
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::InvalidRotationOrder)
         );
@@ -700,7 +825,8 @@ mod tests {
                     order: stranger_order,
                     next: 0
                 },
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::InvalidRotationOrder)
         );
@@ -715,7 +841,8 @@ mod tests {
                 solo,
                 contribution(),
                 PayoutPolicy::Accumulate,
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::TooFewMembers(1))
         );
@@ -730,7 +857,8 @@ mod tests {
                 no_treasurer,
                 contribution(),
                 PayoutPolicy::Accumulate,
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::TreasurerCount(0))
         );
@@ -745,7 +873,8 @@ mod tests {
                 two_treasurers,
                 contribution(),
                 PayoutPolicy::Accumulate,
-                Quorum::TWO_THIRDS
+                Quorum::TWO_THIRDS,
+                Height(0)
             ),
             Err(GroupError::TreasurerCount(2))
         );
@@ -790,16 +919,89 @@ mod tests {
 
     #[test]
     fn contribution_history_becomes_a_credit_signal() {
+        // Driven through real cycles rather than by poking the counters,
+        // because that is the part that was broken: nothing called
+        // `record_missed`, so every member who had ever paid once scored a
+        // perfect 100% forever — a credit signal that could only ever flatter
+        // the borrower, in a feature written to help a lender trust them.
         let mut group = chama(3);
         let member = addr(2);
-        for _ in 0..9 {
-            group.record_contribution(&member).expect("member exists");
+        for cycle in 0..10u64 {
+            if cycle != 4 {
+                group.record_contribution(&member).expect("member exists");
+            }
+            group.advance_cycle(Height(cycle));
         }
-        group.record_missed(&member).expect("member exists");
 
         let m = group.member(&member).expect("member exists");
         assert_eq!(m.contributions_due(), 10);
         assert_eq!(m.reliability_bps(), Some(9_000), "9 of 10 on time = 90%");
+    }
+
+    #[test]
+    fn a_member_cannot_pay_twice_in_one_cycle_to_inflate_their_record() {
+        // The record is what a lender reads, so buying it is buying credit.
+        let mut group = chama(3);
+        let member = addr(2);
+        group.record_contribution(&member).expect("member exists");
+        assert_eq!(
+            group.record_contribution(&member),
+            Err(GroupError::AlreadyContributed)
+        );
+        assert_eq!(group.member(&member).expect("exists").contributions_made, 1);
+    }
+
+    #[test]
+    fn a_cycle_is_due_when_everyone_has_paid_or_the_period_runs_out() {
+        // Both halves are needed. Requiring only full payment lets one member
+        // hold the group hostage by never paying; requiring only the period
+        // would stop a group that has all paid from closing early.
+        let mut group = chama(3);
+        let opened = group.cycle_started;
+        let deadline = group.period_ends();
+
+        assert!(!group.payout_due(opened), "nobody has paid yet");
+        assert!(
+            group.payout_due(deadline),
+            "the agreed period expiring closes the cycle regardless"
+        );
+
+        for who in [addr(1), addr(2), addr(3)] {
+            group.record_contribution(&who).expect("member exists");
+        }
+        assert!(
+            group.payout_due(opened),
+            "and everyone paying closes it immediately"
+        );
+    }
+
+    #[test]
+    fn a_group_larger_than_any_real_one_is_refused() {
+        let members: Vec<Member> = (0..=u8::try_from(MAX_GROUP_MEMBERS).unwrap())
+            .map(|i| {
+                Member::new(
+                    addr(i),
+                    if i == 0 {
+                        Role::Treasurer
+                    } else {
+                        Role::Member
+                    },
+                    0,
+                )
+            })
+            .collect();
+        let n = members.len();
+        assert_eq!(
+            GroupAccount::new(
+                "crowd",
+                members,
+                contribution(),
+                PayoutPolicy::Accumulate,
+                Quorum::TWO_THIRDS,
+                Height(0)
+            ),
+            Err(GroupError::TooManyMembers(n))
+        );
     }
 
     #[test]
@@ -834,6 +1036,7 @@ mod tests {
             contribution(),
             PayoutPolicy::Accumulate,
             Quorum::TWO_THIRDS,
+            Height(0),
         )
         .expect("valid VSLA");
         assert_eq!(vsla.next_recipient(), None);

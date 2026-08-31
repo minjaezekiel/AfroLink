@@ -1721,22 +1721,24 @@ fn a_receipt_proves_a_failed_transaction_failed() {
     let (path, store, mut state, _client) = chain_on_disk("failed");
     let genesis_block = store.block(Height::GENESIS).unwrap().unwrap();
 
-    // Account 60 has nothing, so its transfer cannot be funded.
+    // Account 50 can afford the fee and nothing like the transfer, so the fee
+    // is charged and the bank refuses the payment. (A zero fee would be a
+    // simpler fixture and is no longer accepted: it made failure free.)
     let broke = afrolink_types::TxBody {
         chain_id: chain(),
-        sender: account(60),
+        sender: account(50),
         nonce: 0,
         valid_until: Height(10_000),
-        fee: afrolink_types::Fee::new(Amount::ZERO, kes()),
+        fee: afrolink_types::Fee::new(Amount::from_units(1_000), kes()),
         messages: vec![afrolink_types::Message::Transfer {
-            to: account(50),
+            to: account(60),
             denom: kes(),
             amount: Amount::from_afri(1_000_000),
             reference: None,
         }],
         memo: String::new(),
     }
-    .sign(&key(60));
+    .sign(&key(50));
 
     let executor = Executor::new(chain());
     let (block, outcome) = executor.build_block(
@@ -1761,9 +1763,12 @@ fn a_receipt_proves_a_failed_transaction_failed() {
     // otherwise anyone could write into a stranger's history by failing to pay
     // them.
     let touched: Vec<_> = receipt.touched.iter().map(|t| t.address).collect();
-    assert!(touched.contains(&account(60)), "the sender paid a nonce");
     assert!(
-        !touched.contains(&account(50)),
+        touched.contains(&account(50)),
+        "the sender paid a fee and a nonce"
+    );
+    assert!(
+        !touched.contains(&account(60)),
         "a failed payment must not appear in the intended recipient's history"
     );
 
