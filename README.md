@@ -41,7 +41,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Seventeen crates, **683 tests passing**. A working
+**Phase 2 in progress.** Seventeen crates, **686 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
@@ -75,7 +75,7 @@ crates/
   alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
   pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         deterministic adversarial-input harness (a test tool)      36 tests ✅
+  fuzz/         adversarial inputs, and ledger invariants under load       39 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
   http/         strict HTTP/1.1 transport around the query protocol         83 tests ✅
 ```
@@ -97,6 +97,13 @@ produced it and reproduces forever. Three suites:
   first thing an anonymous peer reaches — asserting it never panics, never reads
   one request two ways, and never lets what *follows* a request change where
   that request ended. The last one is the property request smuggling violates.
+* **Seeded sequences of *valid* transactions**, asserting after every block that
+  balances still sum to supply, that no account lost money without a transaction
+  naming it, and that no savings group has reached a state it could not have
+  reached honestly. This is the suite that asks whether an input should have
+  been *obeyed*, rather than whether it could be *read two ways* — and it tests
+  itself, failing if the generator ever degenerates into inputs that are all
+  rejected.
 
 It found five real defects on its first run, and the same root cause has since
 turned up at a sixth place — every one of them a value that was not uniquely

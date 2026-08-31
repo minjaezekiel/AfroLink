@@ -12,7 +12,7 @@ is about exactly that.
 
 ## What it is
 
-Three suites, all ordinary `cargo test`, all deterministic.
+Four suites, all ordinary `cargo test`, all deterministic.
 
 **Determinism is the design constraint.** Every case is a pure function of a
 `u64` seed, so a failing assertion names the seed that produced it and re-running
@@ -74,7 +74,35 @@ that sorted it rather than refusing an out-of-order one would give two honest
 nodes two `outcome_root`s for the same execution — a chain split, arriving
 through a convenience.
 
-### 3. `crates/node/tests/adversarial.rs` — a hostile scheduler
+### 3. `crates/fuzz/tests/ledger.rs` — valid transactions, in hostile sequences
+
+The suite that asks the *second* question, written because §8–15 proved the
+first one was not enough. It generates sequences of well-formed, correctly
+signed transactions from a seed — transfers, group creation, contributions,
+payouts, bonding, unbonding, flag changes, and sponsored fees both genuine and
+forged — and asserts after **every block** that:
+
+| Invariant | What it would have caught |
+|---|---|
+| Balances sum to the recorded supply, per denomination | Value appearing where none was destroyed |
+| No account loses money unless a transaction in that block named it as sender, sponsor or source | The fee-payer drain of §7 |
+| No account record has become unreadable or unsignable | A state a node can write but not read back |
+| A group's members are within bounds and its rotation index is in range | §13 |
+| No member is credited more cycles than the group has had | §10 |
+| A history pointer never names a future block | A broken ADR-0015 chain |
+
+**Writing down "who may lose money" was itself the point.** That model did not
+exist anywhere before, which is precisely why §7 could happen: nothing in the
+code or the docs said which accounts a block is entitled to debit.
+
+The suite also **tests itself**. A property run whose inputs are all rejected
+passes every invariant and proves nothing, and fails silently — the run still
+goes green. So it counts what actually applied and asserts on it: at present
+about a third of generated transactions apply, across seven distinct result
+codes. If a change makes the generator degenerate into an endless run of
+rejections, the run fails rather than quietly stopping to test anything.
+
+### 4. `crates/node/tests/adversarial.rs` — a hostile scheduler
 
 The scheduler is the adversary: it decides who hears what, and in what order.
 [`sim.rs`](../crates/node/src/sim.rs) gained partitions, packet loss, reordering
@@ -309,13 +337,12 @@ Named gaps, so they are not mistaken for coverage:
   checker, and a rare interleaving may sit outside any seed tried. TLA+ or Stateright
   over the round state machine would be the honest next step.
 - **No timing or side-channel analysis.**
-- **The executor's semantic invariants are asserted, not fuzzed.** Supply
-  conservation is now checked over one deliberately messy sequence
-  (`no_sequence_of_transactions_changes_the_total_supply`), which is a great
-  deal better than nothing and a great deal weaker than a property-based search.
-  A generator producing arbitrary valid transaction sequences and asserting
-  conservation after each block is the obvious next step, and §8–15 are the
-  argument for it.
+- ~~The executor's semantic invariants are asserted, not fuzzed~~ — **closed**
+  by `crates/fuzz/tests/ledger.rs`, above. What remains true, and matters: the
+  suite works inside a **closed universe of addresses**, because a sparse Merkle
+  store cannot be enumerated and conservation cannot be summed over a set you
+  cannot list. A defect that moves value to an address the generator cannot name
+  is a defect this cannot see.
 - **The economic rules have no model.** A chama's payout rule is now enforced,
   but nobody has written down the full set of states a group can be in and
   checked that none of them is a trap. `EmptyPot` at period expiry is one such

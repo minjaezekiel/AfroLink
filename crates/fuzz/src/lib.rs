@@ -32,6 +32,23 @@
 //! Panics need no explicit assertion: a panic in a decoder *is* the test
 //! failure, and the workspace already denies `unwrap`/`expect`/`panic` in
 //! non-test code precisely so that this stays true.
+//!
+//! # The second question, and the suite that asks it
+//!
+//! Everything above asks *"can this input be read two ways?"* That is a real
+//! question and it found six real defects. It is also not the only one.
+//!
+//! A hand-written attack pass later found seven working attacks that this
+//! harness could never have seen, because every one arrived as a **well-formed
+//! transaction, correctly signed, from an account entitled to send it**
+//! ([08](../../../docs/08-adversarial-testing.md) §8–15). The gap they lived in
+//! was between what a message *says* and what the code *does with it* — an
+//! amount carried but never compared, a period agreed but never read.
+//!
+//! `tests/ledger.rs` asks the second question systematically: it generates
+//! sequences of valid transactions from a seed and asserts, after every block,
+//! that the ledger's invariants still hold. Same seeds, same reproducibility,
+//! same reasoning — a different property.
 
 #![cfg_attr(
     test,
