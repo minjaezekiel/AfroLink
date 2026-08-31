@@ -26,7 +26,9 @@ use afrolink_fuzz::hammer;
 use afrolink_pay::PaymentReference;
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, Proof, ProofLeaf, StoreKey};
-use afrolink_types::{Account, AccountKind, Fee, Message, Transaction, TxBody};
+use afrolink_types::{
+    Account, AccountFlag, AccountFlags, AccountKind, Fee, Message, Transaction, TxBody,
+};
 use afrolink_witness::{Checkpoint, LogEntry, LogId, SignedTreeHead, TreeHead};
 
 /// Mutations per fixture. Each also draws a pure-noise case, so this is 4 000
@@ -224,6 +226,12 @@ fn every_message_variant_stays_canonical_under_attack() {
         Message::RenewName {
             name: afrolink_alias::Username::new("amina").expect("valid"),
         },
+        // A flag travels as its bit. Every other `u32` names no flag and must
+        // be refused, which is exactly the kind of near-miss a mutator finds.
+        Message::SetAccountFlag {
+            flag: AccountFlag::RequireReference,
+            enabled: true,
+        },
     ];
     for (i, m) in variants.iter().enumerate() {
         hammer::<Message>(&format!("Message[{i}]"), m, ROUNDS);
@@ -244,6 +252,10 @@ fn account_decoders_stay_canonical_under_attack() {
                 tx_id: Hash32::from_bytes([9u8; 32]),
                 height: Height(77),
             }),
+            // A flags word with a bit set, so the mutator has a live bit to
+            // flip: every other value in this space must be refused, not
+            // masked, or two nodes disagree on a state root.
+            flags: AccountFlags::NONE.with(AccountFlag::RequireReference, true),
         },
         ROUNDS,
     );
@@ -258,6 +270,7 @@ fn account_decoders_stay_canonical_under_attack() {
             // Both `Option` fields empty: the case where a decoder is most
             // tempted to substitute a default for something nobody sent.
             last_txn: None,
+            flags: AccountFlags::NONE,
         },
         ROUNDS,
     );
@@ -270,9 +283,24 @@ fn account_decoders_stay_canonical_under_attack() {
                 name: "fee_pool".to_owned(),
             },
             last_txn: None,
+            flags: AccountFlags::NONE,
         },
         ROUNDS,
     );
+}
+
+#[test]
+fn account_flag_decoders_stay_canonical_under_attack() {
+    // A flags word is the one place a decoder is most tempted to be helpful and
+    // mask a bit it does not recognise. Masking is a fork: two nodes store two
+    // different account records and neither can see anything wrong.
+    hammer::<AccountFlags>("AccountFlags/None", &AccountFlags::NONE, ROUNDS);
+    hammer::<AccountFlags>(
+        "AccountFlags/RequireReference",
+        &AccountFlags::NONE.with(AccountFlag::RequireReference, true),
+        ROUNDS,
+    );
+    hammer::<AccountFlag>("AccountFlag", &AccountFlag::RequireReference, ROUNDS);
 }
 
 #[test]

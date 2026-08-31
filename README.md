@@ -31,7 +31,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 | **Savings groups are a native account type** | Chama, susu, stokvel, tontine, equb, VSLA — with contribution schedules, rotation order and a treasurer, not bolted on as a multisig. The contribution history is user-owned and portable: a credit file for people with no credit file. |
 | **Sovereign stablecoins** | Countries issue `sov/ke/kes`, `sov/ng/ngn` with their own controls — enforced in the type system, so no contract can mint something that looks like a national currency. |
 | **Agent liquidity mining** | Rewards the bottleneck that actually binds rural payments: agent cash float. Earn with a phone and a small bond — no capital, no grid power. |
-| **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers. |
+| **Two lines to accept payment** | A merchant emits one `afri:` URI into a link or a QR code; any wallet understands it. No SDK, no API key, no account with us. Payments carry an XRPL-style reference, so one address serves millions of customers — and an address that *needs* one can say so in state, so the ledger refuses an untagged deposit instead of letting it arrive belonging to nobody. |
 | **Send to `@amina`, not to `afri1qzp8h4c…`** | Usernames, phone numbers and email addresses resolve to addresses — *with a proof*. An alias resolves; it never authorises, so a stolen SIM cannot touch the money. Raw addresses keep working for exchanges and existing tooling. |
 | **Verifiable from a $40 phone** | All state under one Merkle root. A wallet holding 32 bytes verifies any balance from a server it does not trust — and can prove a *negative*, so it cannot be lied to by omission. Implemented and tested end to end in `crates/light`. |
 | **Recovers from a QR code after six months offline** | Bootstrapping costs 32 scannable bytes, and returning costs forty remembered ones — checked against append-only witness logs in different jurisdictions, so no single party's word is load-bearing. Built for intermittent connectivity rather than apologising for it. |
@@ -40,7 +40,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Seventeen crates, **611 tests passing**. A working
+**Phase 2 in progress.** Seventeen crates, **632 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
@@ -63,9 +63,9 @@ crates/
   primitives/   canonical consensus codec, checked amounts, denoms      25 tests ✅
   crypto/       BLAKE3 + Ed25519, bech32m, RFC 6962 Merkle + consistency 38 tests ✅
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
-  types/        accounts, group accounts, transactions, fee abstraction 40 tests ✅
+  types/        accounts, group accounts, transactions, fee abstraction 47 tests ✅
   bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, blocks, genesis                         34 tests ✅
+  executor/     block execution, blocks, genesis                         44 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
   node/         consensus driver, mempool, proposals, simulator          40 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
@@ -74,9 +74,9 @@ crates/
   alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
   pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         deterministic adversarial-input harness (a test tool)      35 tests ✅
+  fuzz/         deterministic adversarial-input harness (a test tool)      36 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
-  http/         strict HTTP/1.1 transport around the query protocol         79 tests ✅
+  http/         strict HTTP/1.1 transport around the query protocol         82 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
@@ -107,11 +107,17 @@ backwards along a chain of committed links — over a socket, against a node it
 does not trust. A node that hides a payment produces a broken chain rather than
 an invisible gap ([ADR-0015](docs/adr/0015-committed-outcomes-and-provable-history.md)),
 and every other way of lying about an answer is a named test.
-Next: the peer-to-peer layer, to replace the in-process simulator with a real
-network. See **[docs/05-roadmap.md](docs/05-roadmap.md)**, and
-**[docs/09](docs/09-what-xrpl-answers.md)** for what a fresh pass over the XRP
-Ledger says we should build next — including the one design that turns payment
-history from a hint a node could quietly truncate into something it cannot.
+
+An exchange deposit address can now require a payment reference and have the
+**ledger enforce it**, so an untagged deposit fails rather than arriving
+unattributable — and the requirement, the refusal and the reason are each
+provable against a header the sender verified
+([ADR-0016](docs/adr/0016-required-payment-references.md)).
+
+Next: rotatable signing keys and signer lists — the correct answer to account
+recovery, and the one that lets a key change without invalidating an address,
+a username or a printed QR code. See **[docs/05-roadmap.md](docs/05-roadmap.md)**
+and **[docs/09](docs/09-what-xrpl-answers.md)**.
 
 ```bash
 cargo test --workspace

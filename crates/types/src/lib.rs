@@ -27,7 +27,7 @@ pub mod account;
 pub mod group;
 pub mod tx;
 
-pub use account::{Account, AccountKind, TxPointer};
+pub use account::{Account, AccountFlag, AccountFlags, AccountKind, TxPointer};
 pub use group::{
     Contribution, FoundingMember, GroupAccount, GroupError, Member, PayoutPolicy, Quorum, Role,
 };

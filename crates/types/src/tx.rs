@@ -24,6 +24,7 @@ use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exac
 use afrolink_primitives::{Amount, ChainId, Denom, Height};
 use thiserror::Error;
 
+use crate::account::AccountFlag;
 use crate::group::{Contribution, FoundingMember, PayoutPolicy, Quorum};
 
 /// Maximum bytes in a transaction memo.
@@ -146,7 +147,12 @@ pub enum Message {
         /// truncated, auto-corrected and pasted with a trailing space; a `u64`
         /// does not.
         ///
-        /// The protocol never reads it. It is data for the recipient's systems.
+        /// The protocol never reads its **value** — it does not route on it,
+        /// index it, or give it meaning. It is data for the recipient's systems.
+        /// The one question consensus asks is whether a reference is *present*,
+        /// and only when the recipient has set
+        /// [`AccountFlag::RequireReference`] on their own record
+        /// ([ADR-0016](../../../docs/adr/0016-required-payment-references.md)).
         reference: Option<PaymentReference>,
     },
     /// Form a savings group (chama, susu, stokvel, tontine, equb, VSLA).
@@ -245,6 +251,23 @@ pub enum Message {
     RevokeContact {
         /// The contact to unbind.
         commitment: ContactCommitment,
+    },
+
+    // -- Account settings ----------------------------------------------------
+    /// Turn one flag on the sender's own account record on or off.
+    ///
+    /// **One flag per message, named explicitly**, rather than assigning a whole
+    /// flags word. XRPL takes the same shape (`SetFlag`/`ClearFlag`) and the
+    /// reason is upgrades: a wallet built before a flag existed, submitting an
+    /// absolute assignment, would silently clear the flag it has never heard of.
+    /// Naming one flag means a message can only ever change what it names.
+    SetAccountFlag {
+        /// Which switch.
+        flag: AccountFlag,
+        /// On or off. Idempotent: setting a flag that is already set succeeds
+        /// and changes nothing, so a wallet may safely retry a submission whose
+        /// result it never saw.
+        enabled: bool,
     },
 
     /// Lock AFRI and register as a validator candidate.
@@ -364,6 +387,7 @@ impl TxBody {
                 | Message::VetoRebind { .. }
                 | Message::RevokeContact { .. }
                 | Message::ClearPrimaryAlias
+                | Message::SetAccountFlag { .. }
                 | Message::ReleaseName { .. } => {}
             }
         }
@@ -441,6 +465,7 @@ impl Transaction {
                 | Message::ReleaseName { .. }
                 | Message::VetoRebind { .. }
                 | Message::RevokeContact { .. }
+                | Message::SetAccountFlag { .. }
                 | Message::Bond { .. }
                 | Message::AddStake { .. }
                 | Message::Unbond { .. }
@@ -626,6 +651,11 @@ impl Encode for Message {
                 out.push(18);
                 evidence.encode(out);
             }
+            Self::SetAccountFlag { flag, enabled } => {
+                out.push(19);
+                flag.encode(out);
+                enabled.encode(out);
+            }
         }
     }
 }
@@ -698,6 +728,10 @@ impl Decode for Message {
             17 => Ok(Self::WithdrawUnbonded),
             18 => Ok(Self::ReportEquivocation {
                 evidence: Box::new(Equivocation::decode(r)?),
+            }),
+            19 => Ok(Self::SetAccountFlag {
+                flag: AccountFlag::decode(r)?,
+                enabled: bool::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

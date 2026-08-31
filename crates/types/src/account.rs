@@ -9,10 +9,123 @@
 
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, PublicKey};
+use afrolink_pay::RequiresReference;
 use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 
 use crate::group::GroupAccount;
+
+/// One switch an account owner may set on their own record.
+///
+/// Flags are **consensus**: the executor reads them while applying a block, so
+/// every node must agree on what each bit means. That is why the set is closed
+/// and why an unknown bit is refused on decode rather than ignored — see
+/// [`AccountFlags::from_bits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum AccountFlag {
+    /// Incoming transfers must carry a [`PaymentReference`].
+    ///
+    /// XRPL's `asfRequireDest`. An exchange deposit address serves millions of
+    /// customers from one address, and a deposit with no reference belongs to
+    /// nobody until a human intervenes. With this set, such a payment **fails**
+    /// instead — and a failed payment the sender can retry is enormously better
+    /// than a successful one nobody can attribute
+    /// ([09](../../../docs/09-what-xrpl-answers.md) §2.3).
+    ///
+    /// [`PaymentReference`]: afrolink_pay::PaymentReference
+    RequireReference,
+}
+
+impl AccountFlag {
+    /// Every flag, in bit order. Exhaustive by construction.
+    pub const ALL: &'static [Self] = &[Self::RequireReference];
+
+    /// This flag's bit in an [`AccountFlags`] word.
+    ///
+    /// **Never renumber one.** The bit is in the state tree, so changing it
+    /// changes every state root and silently reinterprets existing accounts.
+    #[must_use]
+    pub const fn bit(self) -> u32 {
+        match self {
+            Self::RequireReference => 1 << 0,
+        }
+    }
+
+    /// The flag a single bit names, if any.
+    #[must_use]
+    pub fn from_bit(bit: u32) -> Option<Self> {
+        Self::ALL.iter().copied().find(|flag| flag.bit() == bit)
+    }
+}
+
+/// The switches set on one account.
+///
+/// A bitfield rather than a struct of booleans because it is encoded into state:
+/// a word has one spelling, where a growing list of `bool`s would need a length
+/// and an ordering to stay canonical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccountFlags(u32);
+
+impl AccountFlags {
+    /// Every bit this version understands.
+    const KNOWN: u32 = AccountFlag::RequireReference.bit();
+
+    /// No flags set — what every account starts with.
+    pub const NONE: Self = Self(0);
+
+    /// Whether `flag` is set.
+    #[must_use]
+    pub fn is_set(self, flag: AccountFlag) -> bool {
+        self.0 & flag.bit() != 0
+    }
+
+    /// A copy with `flag` set or cleared.
+    ///
+    /// Returns a new value rather than mutating, so a caller cannot half-apply a
+    /// change and leave the record in a state nobody asked for.
+    #[must_use]
+    pub fn with(self, flag: AccountFlag, enabled: bool) -> Self {
+        if enabled {
+            Self(self.0 | flag.bit())
+        } else {
+            Self(self.0 & !flag.bit())
+        }
+    }
+
+    /// The raw word.
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Parse a raw word, refusing any bit this version does not understand.
+    ///
+    /// **Refusing rather than masking is the consensus-critical half.** A node
+    /// that masked an unknown bit away would compute a different state root than
+    /// one that kept it, and the two would fork on a record neither of them can
+    /// see anything wrong with. Refusing means the disagreement is a decode
+    /// error at the boundary, where it is visible.
+    #[must_use]
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        (bits & !Self::KNOWN == 0).then_some(Self(bits))
+    }
+
+    /// Whether transfers into this account must carry a payment reference.
+    ///
+    /// The bridge between the advisory type in `crates/pay` — what a wallet
+    /// reads to warn *before* sending — and the enforced flag the executor
+    /// obeys. One concept, so a wallet's warning and the ledger's refusal can
+    /// never disagree.
+    #[must_use]
+    pub fn requires_reference(self) -> RequiresReference {
+        if self.is_set(AccountFlag::RequireReference) {
+            RequiresReference::Yes
+        } else {
+            RequiresReference::No
+        }
+    }
+}
 
 /// What kind of thing owns an address.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +186,12 @@ pub struct Account {
     ///
     /// `None` on an account that has never been party to a transaction.
     pub last_txn: Option<TxPointer>,
+    /// Switches the owner has set on their own record.
+    ///
+    /// Consensus-visible: the executor reads these while applying a block, which
+    /// is what makes [`AccountFlag::RequireReference`] an enforcement rather
+    /// than a request.
+    pub flags: AccountFlags,
 }
 
 impl Account {
@@ -84,6 +203,7 @@ impl Account {
             nonce: 0,
             kind: AccountKind::Individual { public_key: None },
             last_txn: None,
+            flags: AccountFlags::NONE,
         }
     }
 
@@ -97,6 +217,7 @@ impl Account {
                 public_key: Some(public_key),
             },
             last_txn: None,
+            flags: AccountFlags::NONE,
         }
     }
 
@@ -108,6 +229,7 @@ impl Account {
             nonce: 0,
             kind: AccountKind::Group(Box::new(group)),
             last_txn: None,
+            flags: AccountFlags::NONE,
         }
     }
 
@@ -119,6 +241,7 @@ impl Account {
             nonce: 0,
             kind: AccountKind::Module { name: name.into() },
             last_txn: None,
+            flags: AccountFlags::NONE,
         }
     }
 
@@ -143,6 +266,14 @@ impl Account {
     /// Advance the nonce after a successful transaction.
     pub fn increment_nonce(&mut self) {
         self.nonce = self.nonce.saturating_add(1);
+    }
+
+    /// Whether transfers into this account must carry a payment reference.
+    ///
+    /// The question the executor asks of the **recipient** on every transfer.
+    #[must_use]
+    pub fn requires_reference(&self) -> RequiresReference {
+        self.flags.requires_reference()
     }
 }
 
@@ -199,12 +330,46 @@ impl Decode for TxPointer {
     }
 }
 
+impl Encode for AccountFlag {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.bit().encode(out);
+    }
+}
+
+impl Decode for AccountFlag {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        // A flag travels as its bit, not as a separate discriminant, so a
+        // message naming a flag and the state word holding it use one number.
+        // Two numberings for one concept is how they drift apart.
+        let bit = u32::decode(r)?;
+        Self::from_bit(bit).ok_or_else(|| {
+            CodecError::Invalid(format!("no account flag is defined for bit {bit:#x}"))
+        })
+    }
+}
+
+impl Encode for AccountFlags {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.0.encode(out);
+    }
+}
+
+impl Decode for AccountFlags {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let bits = u32::decode(r)?;
+        Self::from_bits(bits).ok_or_else(|| {
+            CodecError::Invalid(format!("account flags carry unknown bits: {bits:#x}"))
+        })
+    }
+}
+
 impl Encode for Account {
     fn encode(&self, out: &mut Vec<u8>) {
         self.address.encode(out);
         self.nonce.encode(out);
         self.kind.encode(out);
         self.last_txn.encode(out);
+        self.flags.encode(out);
     }
 }
 
@@ -215,6 +380,7 @@ impl Decode for Account {
             nonce: u64::decode(r)?,
             kind: AccountKind::decode(r)?,
             last_txn: Option::<TxPointer>::decode(r)?,
+            flags: AccountFlags::decode(r)?,
         })
     }
 }
@@ -284,6 +450,77 @@ mod tests {
         account.nonce = u64::MAX;
         account.increment_nonce();
         assert_eq!(account.nonce, u64::MAX, "must saturate, not wrap");
+    }
+
+    #[test]
+    fn a_new_account_requires_nothing_of_its_senders() {
+        // The default has to be permissive: an ordinary person's address must
+        // accept an ordinary payment. The flag is for the address that serves
+        // millions of customers, not for everyone.
+        let account = Account::individual(addr(1));
+        assert_eq!(account.flags, AccountFlags::NONE);
+        assert_eq!(account.requires_reference(), RequiresReference::No);
+    }
+
+    #[test]
+    fn setting_a_flag_leaves_the_others_alone() {
+        let flags = AccountFlags::NONE.with(AccountFlag::RequireReference, true);
+        assert!(flags.is_set(AccountFlag::RequireReference));
+        assert_eq!(flags.requires_reference(), RequiresReference::Yes);
+
+        let cleared = flags.with(AccountFlag::RequireReference, false);
+        assert_eq!(cleared, AccountFlags::NONE);
+    }
+
+    #[test]
+    fn setting_a_flag_twice_is_the_same_as_setting_it_once() {
+        // Idempotence matters because a wallet may retry a submission it never
+        // saw the result of. Two arrivals must not toggle it back off.
+        let once = AccountFlags::NONE.with(AccountFlag::RequireReference, true);
+        assert_eq!(once.with(AccountFlag::RequireReference, true), once);
+    }
+
+    #[test]
+    fn an_unknown_flag_bit_is_refused_rather_than_masked_away() {
+        // Consensus-critical. A node that masked the bit away would store a
+        // different account record — and so compute a different state root —
+        // than one that kept it, and the fork would be invisible to both.
+        assert_eq!(AccountFlags::from_bits(1 << 31), None);
+        assert_eq!(AccountFlags::from_bits(0b11), None);
+
+        let forged = 1u32 << 31;
+        assert!(
+            decode_exact::<AccountFlags>(&forged.to_bytes()).is_err(),
+            "an unknown bit must not decode"
+        );
+    }
+
+    #[test]
+    fn a_flag_and_the_state_word_agree_on_its_number() {
+        // One numbering, so a message naming a flag and the record holding it
+        // can never drift apart.
+        for flag in AccountFlag::ALL {
+            assert_eq!(AccountFlag::from_bit(flag.bit()), Some(*flag));
+            assert_eq!(decode_exact::<AccountFlag>(&flag.to_bytes()), Ok(*flag));
+            assert!(AccountFlags::NONE.with(*flag, true).bits() == flag.bit());
+        }
+    }
+
+    #[test]
+    fn a_flag_naming_no_bit_at_all_is_refused() {
+        // `0` is not "no flag", it is a message that names nothing. Accepting it
+        // would make `SetAccountFlag` a no-op that looks like a success.
+        assert_eq!(AccountFlag::from_bit(0), None);
+        assert!(decode_exact::<AccountFlag>(&0u32.to_bytes()).is_err());
+        assert!(decode_exact::<AccountFlag>(&0b11u32.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn flags_survive_the_account_record() {
+        let mut account = Account::individual(addr(1));
+        account.flags = account.flags.with(AccountFlag::RequireReference, true);
+        let decoded = decode_exact::<Account>(&account.to_bytes()).expect("round trips");
+        assert_eq!(decoded.requires_reference(), RequiresReference::Yes);
     }
 
     #[test]

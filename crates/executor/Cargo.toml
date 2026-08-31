@@ -19,5 +19,11 @@ afrolink-consensus.workspace = true
 afrolink-staking.workspace = true
 thiserror.workspace = true
 
+# Only the tests need to *construct* a payment reference. Execution merely asks
+# whether one is present, through `Account::requires_reference`, so the enforcing
+# code has no dependency on the payments crate at all.
+[dev-dependencies]
+afrolink-pay.workspace = true
+
 [lints]
 workspace = true

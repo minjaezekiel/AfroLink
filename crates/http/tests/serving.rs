@@ -1287,6 +1287,190 @@ fn fetch_transaction(addr: SocketAddr, id: &afrolink_crypto::hash::Hash32) -> Pr
     *proved
 }
 
+// ---------------------------------------------------------------------------
+// RequireDestinationTag, end to end (ADR-0016)
+// ---------------------------------------------------------------------------
+
+/// Genesis, a payment that funds the exchange, the exchange flagging itself, and
+/// an untagged deposit that the ledger refuses.
+///
+/// Returns the id of the refused deposit, because the interesting artefact is
+/// its **receipt**: the reason for the failure is committed, not asserted by
+/// whichever node the wallet happened to ask.
+fn chain_with_a_tag_requiring_exchange(
+    name: &str,
+) -> (
+    std::path::PathBuf,
+    ChainStore,
+    MemoryStore,
+    afrolink_crypto::hash::Hash32,
+) {
+    use afrolink_executor::{Executor, ValidatorSets};
+    use afrolink_types::{AccountFlag, Fee, Message, TxBody};
+
+    let (path, store, mut state, _client) = chain_on_disk(name);
+    let mut parent = store.block(Height::GENESIS).unwrap().unwrap();
+    let executor = Executor::new(chain());
+
+    let flag = TxBody {
+        chain_id: chain(),
+        sender: account(60),
+        nonce: 0,
+        valid_until: Height(10_000),
+        fee: Fee::new(Amount::from_units(1_000), kes()),
+        messages: vec![Message::SetAccountFlag {
+            flag: AccountFlag::RequireReference,
+            enabled: true,
+        }],
+        memo: String::new(),
+    }
+    .sign(&key(60));
+
+    let untagged = TxBody {
+        chain_id: chain(),
+        sender: account(50),
+        nonce: 1,
+        valid_until: Height(10_000),
+        fee: Fee::new(Amount::from_units(1_000), kes()),
+        messages: vec![Message::Transfer {
+            to: account(60),
+            denom: kes(),
+            amount: Amount::from_afri(7),
+            reference: None,
+        }],
+        memo: String::new(),
+    }
+    .sign(&key(50));
+    let refused = untagged.id();
+
+    // Block 1 funds the exchange, block 2 flags it, block 3 is the mistake.
+    let blocks = [
+        (vec![payment(0)], 1u64),
+        (vec![flag], 1),
+        (vec![untagged], 0),
+    ];
+    for (transactions, expect_succeeded) in blocks {
+        let (block, outcome) = executor.build_block(
+            &mut state,
+            parent.header.height.next(),
+            Timestamp::from_millis(1_700_000_000_000 + parent.header.height.next().0 * 1_000),
+            parent.header.id(),
+            transactions,
+            ValidatorSets::unchanged(&validators()),
+        );
+        assert_eq!(
+            outcome.succeeded() as u64,
+            expect_succeeded,
+            "fixture block {} did not behave as intended: {:?}",
+            block.header.height.0,
+            outcome.outcomes[0].result
+        );
+        let receipts: Vec<afrolink_executor::TxReceipt> =
+            outcome.outcomes.iter().map(|o| o.receipt.clone()).collect();
+        store
+            .put_block(&block, &commit_for(&block), &receipts)
+            .unwrap();
+        parent = block;
+    }
+    store.persist_state(&state).unwrap();
+
+    (path, store, state, refused)
+}
+
+#[test]
+fn a_wallet_can_prove_an_address_requires_a_reference_before_it_pays() {
+    // The half of the flag that makes it usable rather than merely correct. A
+    // warning a wallet shows *before* sending is the only warning that helps,
+    // and it has to be provable — a node that lied in either direction would
+    // otherwise be able to make a payment fail, or make a wallet skip the
+    // prompt on an address that genuinely needs one.
+    let (path, store, state, _refused) = chain_with_a_tag_requiring_exchange("requires-flag");
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        let _stop = handle.clone().stop_on_drop();
+
+        let tip = verified_header(addr, Height(3));
+        let client = afrolink_light::LightClient::new(chain(), validators(), tip);
+
+        let flagged = read_account(addr, &client, account(60)).expect("the exchange has a record");
+        assert_eq!(
+            flagged.requires_reference(),
+            afrolink_pay::RequiresReference::Yes,
+            "the wallet must be able to see the requirement, with a proof"
+        );
+
+        let ordinary = read_account(addr, &client, account(50)).expect("the payer has a record");
+        assert_eq!(
+            ordinary.requires_reference(),
+            afrolink_pay::RequiresReference::No,
+            "and must not see one where there is none"
+        );
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_reason_an_untagged_deposit_failed_is_itself_proved() {
+    // "You forgot the reference" arrives as a committed receipt rather than as
+    // a node's opinion. That matters because it is the one failure the sender
+    // can act on, and acting on it means resending money.
+    let (path, store, state, refused) = chain_with_a_tag_requiring_exchange("requires-receipt");
+    let view = ServedChain::new(chain(), &store, &state);
+    let server = Server::bind("127.0.0.1:0", Config::default()).unwrap();
+    let handle = server.handle();
+    let addr = server.local_addr();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| server.run(&view, &ReadOnly).unwrap());
+        let _stop = handle.clone().stop_on_drop();
+
+        let header = verified_header(addr, Height(3));
+        let proved = fetch_transaction(addr, &refused);
+        let effects = proved
+            .verify(&header)
+            .expect("the receipt must prove against outcome_root");
+
+        assert_eq!(
+            effects.receipt.code,
+            afrolink_executor::ResultCode::Reference,
+            "the ledger committed to *why* it refused"
+        );
+        assert!(
+            effects.receipt.previous_for(&account(60)).is_err(),
+            "a refused deposit must not appear in the exchange's history"
+        );
+    });
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Fetch an account record and verify it against a header the wallet trusts.
+fn read_account(
+    addr: SocketAddr,
+    client: &afrolink_light::LightClient,
+    address: Address,
+) -> Option<afrolink_types::Account> {
+    let query = Query::Account { address };
+    let reply = get(
+        addr,
+        &format!("/v1/accounts/{}", address.to_bech32().unwrap()),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let Response::Value(proved) = decode_exact::<Response>(&reply.body).unwrap() else {
+        panic!("expected a value response");
+    };
+    proved
+        .verify(client, &query.store_key().unwrap())
+        .unwrap()
+        .map(|bytes| decode_exact::<afrolink_types::Account>(bytes).unwrap())
+}
+
 #[test]
 fn a_wallet_walks_its_whole_history_and_knows_when_it_has_all_of_it() {
     // The claim ADR-0014 could not make. Every link is committed: the account's

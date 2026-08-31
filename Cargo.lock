@@ -52,6 +52,7 @@ dependencies = [
  "afrolink-bank",
  "afrolink-consensus",
  "afrolink-crypto",
+ "afrolink-pay",
  "afrolink-primitives",
  "afrolink-staking",
  "afrolink-state",

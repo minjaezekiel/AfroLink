@@ -177,9 +177,10 @@ XRPL commits transactions *and their metadata* in one tree, so
 `outcome_root` gives us the same, and turns `ProvedTransaction` from
 *"this is in the block"* into *"this is in the block and it worked"*.
 
-### 2.3 `RequireDestinationTag`, on-ledger
+### 2.3 `RequireDestinationTag`, on-ledger ✅ *built*
 
 Smallest change here, largest operational effect.
+Built as [ADR-0016](adr/0016-required-payment-references.md).
 
 `crates/pay` has [`RequiresReference`](../crates/pay/src/reference.rs), and it is
 advisory — a recipient's stated preference that a wallet may honour. XRPL makes
@@ -292,14 +293,20 @@ bootstrap set in [ADR-0011](adr/0011-objective-anchors.md).
 |---|---|---|---|
 | ~~1~~ | ~~Commit `outcome_root` in the header~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | |
 | ~~2~~ | ~~`last_txn` and previous pointers~~ | **Built** — [ADR-0015](adr/0015-committed-outcomes-and-provable-history.md) | ADR-0014's stated weakness is closed |
-| 3 | `RequireDestinationTag` account flag | Small; executor + account flags | Largest operational win per line of code |
+| ~~3~~ | ~~`RequireDestinationTag` account flag~~ | **Built** — [ADR-0016](adr/0016-required-payment-references.md) | The requirement, the refusal and the reason are all provable |
 | 4 | Regular keys, master-key disable, signer lists | Large; new message types, account model | The real answer to recovery, and to §1 |
 | 5 | Fee escalation and a queue | Medium | When congestion is real, not before |
 | 6 | Retention with a named archive role | Large | When storage growth is measured, not assumed |
 
 1 and 2 were one project and were done together, for the reason given: they
 change the header, so they were cheapest before a network carries headers
-between machines. 3 is next.
+between machines. 3 followed on its own — it needed only an account field and
+one check, and it stands alone because nothing else depends on it.
+
+4 is next, and it is the largest of the six. It is also the one §1 has been
+pointing at from the start: the *correct* answer to "recover my account from
+something I remember" is a rotatable signing key and a signer list, not a
+password anywhere near a ledger.
 
 ## Sources
 

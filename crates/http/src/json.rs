@@ -103,6 +103,7 @@ fn write_header(header: &BlockHeader, out: &mut String) {
     field_hash("parent", &header.parent, out);
     field_hash("tx_root", &header.tx_root, out);
     field_hash("app_hash", &header.app_hash, out);
+    field_hash("outcome_root", &header.outcome_root, out);
     field_hash("validators_hash", &header.validators_hash, out);
     field_hash("next_validators_hash", &header.next_validators_hash, out);
     close(out);
@@ -388,6 +389,56 @@ mod tests {
         let mut out = String::new();
         write_string("a\u{0007}b", &mut out);
         assert_eq!(out, "\"a\\u0007b\"");
+    }
+
+    #[test]
+    fn the_rendered_header_carries_every_root_the_real_one_does() {
+        // A dropped root is invisible: the JSON still parses, still looks like a
+        // header, and a developer checking a proof against it simply cannot.
+        // `outcome_root` was missing here for exactly that reason, so this test
+        // names each one rather than trusting the renderer to keep up.
+        use afrolink_primitives::{ChainId, Height, Timestamp};
+
+        let mut out = String::new();
+        write_header(
+            &BlockHeader {
+                chain_id: ChainId::new("afrolink-1").expect("valid"),
+                height: Height(9),
+                time: Timestamp::from_millis(1_700_000_000_000),
+                parent: Hash32::from_bytes([1; 32]),
+                tx_root: Hash32::from_bytes([2; 32]),
+                app_hash: Hash32::from_bytes([3; 32]),
+                outcome_root: Hash32::from_bytes([4; 32]),
+                validators_hash: Hash32::from_bytes([5; 32]),
+                next_validators_hash: Hash32::from_bytes([6; 32]),
+            },
+            &mut out,
+        );
+
+        for field in [
+            "chain_id",
+            "height",
+            "time_ms",
+            "block_id",
+            "parent",
+            "tx_root",
+            "app_hash",
+            "outcome_root",
+            "validators_hash",
+            "next_validators_hash",
+        ] {
+            assert!(
+                out.contains(field),
+                "{field} missing from the header: {out}"
+            );
+        }
+        // And each distinct root renders distinctly, so none is a copy of another.
+        for byte in 1..=6u8 {
+            assert!(
+                out.contains(&Hash32::from_bytes([byte; 32]).to_hex()),
+                "a root was rendered as some other root's value: {out}"
+            );
+        }
     }
 
     #[test]

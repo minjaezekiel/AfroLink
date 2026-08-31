@@ -19,19 +19,24 @@
 //!
 //! # What it is not
 //!
-//! A reference has **no on-ledger meaning**. The protocol does not read it,
-//! route on it, or validate it beyond its type. It is data for the recipient's
-//! own systems — the same position XRPL takes, and the reason the feature stays
-//! simple enough to be reliable.
+//! A reference's **value** has no on-ledger meaning. The protocol does not read
+//! it, route on it, or validate it beyond its type. It is data for the
+//! recipient's own systems — the same position XRPL takes, and the reason the
+//! feature stays simple enough to be reliable.
 //!
 //! # The failure this prevents, and the one it does not
 //!
-//! It prevents an exchange guessing which customer a deposit belongs to. It does
-//! **not** prevent a user forgetting to include one, which is the other half of
-//! the same support ticket. That half is a wallet problem:
+//! It prevents an exchange guessing which customer a deposit belongs to. On its
+//! own it does **not** prevent a user forgetting to include one, which is the
+//! other half of the same support ticket.
+//!
+//! That half is answered twice over. Before sending,
 //! [`PaymentRequest`](crate::request::PaymentRequest) carries the reference so
-//! the sender never types it, and [`RequiresReference`] lets a recipient say
-//! plainly that payments without one cannot be credited.
+//! the sender never types it. And at the ledger,
+//! [`RequiresReference`] is no longer only advice: an account that sets
+//! `RequireReference` in its own record makes the executor **refuse** an
+//! untagged payment outright, which is XRPL's `asfRequireDest`
+//! ([ADR-0016](../../../docs/adr/0016-required-payment-references.md)).
 
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 
@@ -76,8 +81,17 @@ impl core::fmt::Display for PaymentReference {
 /// nobody, and the money sits in limbo until a human intervenes. A market
 /// trader's own address obviously can.
 ///
-/// Publishing the requirement lets a wallet warn *before* sending rather than
-/// after, which is the only point at which the warning helps.
+/// # Where this is decided
+///
+/// This type is the *answer*, not the storage. The authority is
+/// `AccountFlag::RequireReference` on the recipient's own account record, which
+/// is in state and so provable against a header. `Account::requires_reference`
+/// converts one to the other, and it is the only bridge — so a wallet's warning
+/// and the ledger's refusal read the same bit and cannot disagree.
+///
+/// Publishing the requirement in state does two jobs at once: a wallet can warn
+/// *before* sending, which is the only point at which a warning helps, and the
+/// executor refuses afterwards for the sender who was not warned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequiresReference {
     /// Payments without a reference are fine.
@@ -150,6 +164,9 @@ mod tests {
 
     #[test]
     fn an_exchange_address_refuses_unreferenced_payments() {
+        // This is the predicate the executor calls. `crates/executor` proves the
+        // end-to-end refusal; here it is only that the answer is the right way
+        // round, which is the sort of thing a negation typo silently reverses.
         let exchange = RequiresReference::Yes;
         assert!(
             !exchange.accepts(None),

@@ -96,6 +96,13 @@ pub enum ExecError {
     /// A group payout was requested for an accumulating group.
     #[error("this group accumulates its pot and has no rotation recipient")]
     NoRotationRecipient,
+    /// The recipient requires a payment reference and none was supplied.
+    ///
+    /// Deliberately *not* folded into [`Self::Bank`]: this is the one execution
+    /// failure the sender can fix and retry immediately, and telling them so is
+    /// the entire point of the flag.
+    #[error("this account requires a payment reference and none was supplied")]
+    ReferenceRequired,
     /// A username registry operation failed.
     #[error(transparent)]
     Registry(#[from] RegistryError),
@@ -141,6 +148,14 @@ pub enum ResultCode {
     Binding,
     /// State was corrupt. Never a client's fault.
     State,
+    /// The recipient requires a payment reference and none was carried.
+    ///
+    /// Its own code rather than a shade of [`Self::Account`], because it is the
+    /// only failure here a wallet can *act* on without asking anything further:
+    /// prompt for the reference and resend. Making the wallet fetch the
+    /// recipient's flags to work out why would put a round trip on the exact
+    /// path this flag exists to smooth.
+    Reference,
 }
 
 impl ResultCode {
@@ -158,6 +173,7 @@ impl ResultCode {
             Self::Registry => 7,
             Self::Binding => 8,
             Self::State => 9,
+            Self::Reference => 10,
         }
     }
 
@@ -175,6 +191,7 @@ impl ResultCode {
             7 => Self::Registry,
             8 => Self::Binding,
             9 => Self::State,
+            10 => Self::Reference,
             _ => return None,
         })
     }
@@ -198,6 +215,7 @@ impl From<&ExecError> for ResultCode {
             | ExecError::NotAGroup
             | ExecError::NotAGroupMember
             | ExecError::NoRotationRecipient => Self::Account,
+            ExecError::ReferenceRequired => Self::Reference,
             ExecError::Registry(_) => Self::Registry,
             ExecError::Bind(_) => Self::Binding,
             ExecError::State(_) => Self::State,
@@ -606,14 +624,37 @@ impl Executor {
                 to,
                 denom,
                 amount,
-                // The protocol carries the reference and never reads it — it is
-                // the recipient's reconciliation data, not ours. Named here
-                // rather than wildcarded so that adding a field to `Transfer`
-                // has to be a deliberate decision at this call site.
-                reference: _,
+                reference,
             } => {
+                // The protocol still never *reads* the reference — it does not
+                // route on it, index it, or give it meaning. The only question
+                // asked is whether one is present, and only when the recipient
+                // has said in state that it must be
+                // ([09](../../../docs/09-what-xrpl-answers.md) §2.3).
+                //
+                // Checked before the transfer, so a refused payment costs the
+                // sender a fee and nothing else. The money never moves, which is
+                // the whole point: a failure they can retry beats an arrival
+                // nobody can attribute.
+                if !load_account(store, to)?
+                    .requires_reference()
+                    .accepts(*reference)
+                {
+                    return Err(ExecError::ReferenceRequired);
+                }
                 Bank::new(store).transfer(&sender, to, denom, *amount)?;
                 ensure_account(store, to);
+                Ok(())
+            }
+
+            Message::SetAccountFlag { flag, enabled } => {
+                // Only ever the sender's own record. There is no address
+                // argument on purpose: a message that could flag someone else's
+                // account would let a stranger make their payments fail.
+                let key = StoreKey::account(&sender);
+                let mut account = load_account(store, &sender)?;
+                account.flags = account.flags.with(*flag, *enabled);
+                store.set_encoded(&key, &account);
                 Ok(())
             }
 
@@ -1313,6 +1354,313 @@ mod tests {
         assert_eq!(
             bank.balance(&addr(2), &kes()).expect("read"),
             Amount::from_afri(10_500)
+        );
+    }
+
+    // -- RequireDestinationTag (ADR-0016) ------------------------------------
+
+    /// Turn the exchange's deposit address into one that insists on a reference.
+    fn require_reference(store: &mut MemoryStore, exec: &Executor, who: u8, nonce: u64, at: u64) {
+        use afrolink_types::AccountFlag;
+        let outcome = exec.execute_block(
+            store,
+            ctx(at),
+            &[tx(
+                who,
+                nonce,
+                vec![Message::SetAccountFlag {
+                    flag: AccountFlag::RequireReference,
+                    enabled: true,
+                }],
+            )],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+    }
+
+    fn transfer_with(to: Address, reference: Option<afrolink_pay::PaymentReference>) -> Message {
+        Message::Transfer {
+            to,
+            denom: kes(),
+            amount: Amount::from_afri(500),
+            reference,
+        }
+    }
+
+    #[test]
+    fn a_deposit_without_a_reference_is_refused_rather_than_left_unattributable() {
+        // The headline case. An exchange address serves millions of customers;
+        // a deposit with no reference belongs to nobody until a human
+        // intervenes. Failing is better, because the sender can retry.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let exchange = addr(2);
+        require_reference(&mut store, &exec, 2, 0, 1);
+
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&exchange, &kes())
+            .expect("reads");
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(1, 0, vec![transfer_with(exchange, None)])],
+        );
+
+        assert_eq!(outcome.succeeded(), 0, "an untagged deposit must not land");
+        assert_eq!(outcome.outcomes[0].receipt.code, ResultCode::Reference);
+        assert_eq!(
+            Bank::new(&mut store)
+                .view()
+                .balance(&exchange, &kes())
+                .expect("reads"),
+            before,
+            "and the money must not have moved"
+        );
+    }
+
+    #[test]
+    fn the_same_deposit_with_a_reference_succeeds() {
+        // The flag must not break the path it exists to protect.
+        use afrolink_pay::PaymentReference;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let exchange = addr(2);
+        require_reference(&mut store, &exec, 2, 0, 1);
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(
+                1,
+                0,
+                vec![transfer_with(exchange, Some(PaymentReference(88_121)))],
+            )],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+    }
+
+    #[test]
+    fn an_ordinary_account_still_accepts_an_untagged_payment() {
+        // The default has to stay permissive. Most recipients are people, and a
+        // person's address that refused plain payments would be broken.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[tx(1, 0, vec![transfer_with(addr(2), None)])],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+    }
+
+    #[test]
+    fn nobody_can_set_the_flag_on_someone_elses_account() {
+        // `SetAccountFlag` names no address, so this is checked by proving the
+        // effect lands on the *sender*: account 1 flagging itself must not make
+        // account 2 start refusing payments.
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        require_reference(&mut store, &exec, 1, 0, 1);
+
+        assert!(
+            load_account(&store, &addr(1))
+                .expect("reads")
+                .flags
+                .is_set(AccountFlag::RequireReference)
+        );
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(3, 0, vec![transfer_with(addr(2), None)])],
+        );
+        assert_eq!(
+            outcome.succeeded(),
+            1,
+            "a stranger's flag must not affect this account"
+        );
+    }
+
+    #[test]
+    fn the_flag_can_be_turned_off_again() {
+        // A setting that cannot be undone is a way to brick an account by
+        // typo — and the owner is the only one who could have set it.
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let exchange = addr(2);
+        require_reference(&mut store, &exec, 2, 0, 1);
+
+        let off = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(
+                2,
+                1,
+                vec![Message::SetAccountFlag {
+                    flag: AccountFlag::RequireReference,
+                    enabled: false,
+                }],
+            )],
+        );
+        assert_eq!(off.succeeded(), 1, "{:?}", off.outcomes[0].result);
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(3),
+            &[tx(1, 0, vec![transfer_with(exchange, None)])],
+        );
+        assert_eq!(outcome.succeeded(), 1, "{:?}", outcome.outcomes[0].result);
+    }
+
+    #[test]
+    fn setting_the_flag_twice_is_not_a_failure() {
+        // A wallet that never saw the result of its first submission will send
+        // the second. Idempotence is what stops that being an error the user has
+        // to understand.
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        require_reference(&mut store, &exec, 2, 0, 1);
+        require_reference(&mut store, &exec, 2, 1, 2);
+
+        assert!(
+            load_account(&store, &addr(2))
+                .expect("reads")
+                .flags
+                .is_set(AccountFlag::RequireReference)
+        );
+    }
+
+    #[test]
+    fn a_refused_deposit_still_charges_the_sender_a_fee() {
+        // Otherwise a flagged address is a free way to make a validator execute
+        // transactions: send untagged payments forever and pay nothing.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        require_reference(&mut store, &exec, 2, 0, 1);
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(1, 0, vec![transfer_with(addr(2), None)])],
+        );
+        assert_eq!(outcome.outcomes[0].fee_charged(), Amount::from_units(1_000));
+        assert_eq!(
+            load_account(&store, &addr(1)).expect("reads").nonce,
+            1,
+            "and consumes the nonce, so it is not replayable either"
+        );
+    }
+
+    #[test]
+    fn the_flag_applies_to_every_transfer_in_a_transaction_not_only_the_first() {
+        // A batch is atomic here: one untagged leg must take the whole
+        // transaction down, or the flag is bypassable by putting a good
+        // payment first.
+        use afrolink_pay::PaymentReference;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let exchange = addr(2);
+        require_reference(&mut store, &exec, 2, 0, 1);
+
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&exchange, &kes())
+            .expect("reads");
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(
+                1,
+                0,
+                vec![
+                    transfer_with(exchange, Some(PaymentReference(1))),
+                    transfer_with(exchange, None),
+                ],
+            )],
+        );
+        assert_eq!(outcome.succeeded(), 0);
+        assert_eq!(outcome.outcomes[0].receipt.code, ResultCode::Reference);
+        assert_eq!(
+            Bank::new(&mut store)
+                .view()
+                .balance(&exchange, &kes())
+                .expect("reads"),
+            before,
+            "the good leg must roll back with the bad one"
+        );
+    }
+
+    #[test]
+    fn a_refused_deposit_does_not_write_into_the_recipients_history() {
+        // It is a failure, so ADR-0015's narrow rule applies: only the sender
+        // and the fee payer are touched. Otherwise anyone could push entries
+        // into an exchange's history by failing to pay it.
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        require_reference(&mut store, &exec, 2, 0, 1);
+        let pointer_before = load_account(&store, &addr(2)).expect("reads").last_txn;
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(2),
+            &[tx(1, 0, vec![transfer_with(addr(2), None)])],
+        );
+
+        let touched: Vec<_> = outcome.outcomes[0]
+            .receipt
+            .touched
+            .iter()
+            .map(|t| t.address)
+            .collect();
+        assert!(!touched.contains(&addr(2)));
+        assert_eq!(
+            load_account(&store, &addr(2)).expect("reads").last_txn,
+            pointer_before,
+            "the recipient's history must not have moved"
+        );
+    }
+
+    #[test]
+    fn setting_a_flag_moves_no_money_beyond_the_fee() {
+        use afrolink_types::AccountFlag;
+
+        let mut store = funded_store();
+        let exec = Executor::new(chain());
+        let before = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+
+        let outcome = exec.execute_block(
+            &mut store,
+            ctx(1),
+            &[tx(
+                1,
+                0,
+                vec![Message::SetAccountFlag {
+                    flag: AccountFlag::RequireReference,
+                    enabled: true,
+                }],
+            )],
+        );
+        let after = Bank::new(&mut store)
+            .view()
+            .balance(&addr(1), &kes())
+            .expect("reads");
+        assert_eq!(
+            after,
+            before
+                .checked_sub(outcome.outcomes[0].fee_charged())
+                .expect("affordable")
         );
     }
 

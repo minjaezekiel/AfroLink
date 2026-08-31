@@ -67,8 +67,10 @@ the transaction path is not.)*
       omitting a payment produces a *broken chain* rather than an invisible gap.
       Closes the one thing [ADR-0014](adr/0014-payment-history-and-the-mempool.md)
       could not prove *(ADR-0015)*
-- [ ] **`RequireDestinationTag`** as an enforced account flag — the largest
-      operational win per line of code on this list *([09](09-what-xrpl-answers.md) §2.3)*
+- [x] **Required payment references** — an account flag the *ledger* enforces,
+      so a deposit with no reference to a flagged address fails instead of
+      arriving unattributable. The requirement, the refusal and the reason are
+      all provable *([ADR-0016](adr/0016-required-payment-references.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature
@@ -197,9 +199,21 @@ cost.** Kenya↔Tanzania and Nigeria↔Ghana are the strongest candidates.
 
 ## Deliberately not scheduled
 
-Things that look like progress and are not: a token sale before Phase 4, an
-exchange listing before there is a working corridor, "partnerships" that are
-press releases, and any scaling work before measured demand requires it.
+Things that look like progress and are not: a token sale before Phase 4,
+"partnerships" that are press releases, and any scaling work before measured
+demand requires it.
+
+**Exchange listing** sits differently now that adoption by a large exchange is a
+stated goal. The work an exchange actually needs — destination tags
+([ADR-0009](adr/0009-developer-payment-surface.md)), a ledger that enforces them
+([ADR-0016](adr/0016-required-payment-references.md)), deposit detection and a
+history a node cannot quietly truncate
+([ADR-0015](adr/0015-committed-outcomes-and-provable-history.md)) — is scheduled
+and mostly built. What stays off the list is *pursuing a listing* ahead of a
+working corridor: a listed token with nowhere to spend it is a speculative
+instrument, which is the opposite of what this chain is for. Build the
+integration surface early; seek the listing when there is a corridor behind
+it.
 
 ---
 
