@@ -406,8 +406,14 @@ mod tests {
 
         let mut bank = Bank::new(&mut store);
         assert!(bank.issuer(&kes()).expect("read").is_some());
-        bank.mint(&addr(100), &addr(3), &kes(), Amount::from_afri(10))
-            .expect("issuer can mint");
+        // The genesis file names the authority *and* whatever minters it wants
+        // live from block one. An authority alone cannot mint — see ADR-0020 —
+        // so a genesis that forgets the minter produces a currency nobody can
+        // issue, which is worth failing a test over.
+        bank.set_minter_allowance(&addr(100), &kes(), &addr(101), Amount::from_afri(50))
+            .expect("the authority may authorise a minter");
+        bank.mint(&addr(101), &addr(3), &kes(), Amount::from_afri(10))
+            .expect("an authorised minter can mint");
     }
 
     #[test]

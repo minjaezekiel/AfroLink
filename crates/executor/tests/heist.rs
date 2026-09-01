@@ -54,8 +54,11 @@ fn ctx(height: u64) -> BlockContext {
 fn funded() -> MemoryStore {
     let mut store = MemoryStore::new();
     let mut bank = Bank::new(&mut store);
-    bank.register_issuer(&kes(), &Issuer::new(addr(100)))
-        .unwrap();
+    bank.register_issuer(
+        &kes(),
+        &Issuer::new(addr(100)).with_minter(addr(100), Amount::from_afri(1_000_000_000)),
+    )
+    .unwrap();
     for i in [1u8, 2, 3, 4, 66, 90] {
         bank.mint(&addr(100), &addr(i), &kes(), Amount::from_afri(10_000))
             .unwrap();

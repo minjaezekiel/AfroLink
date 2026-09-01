@@ -142,10 +142,18 @@ fn denoms() -> &'static [Denom; 2] {
 fn opening_state() -> MemoryStore {
     let mut store = MemoryStore::new();
     let mut bank = Bank::new(&mut store);
-    bank.register_issuer(&kes(), &Issuer::new(actor(0)))
-        .unwrap();
+    // actor(0) governs and never issues; actor(1) holds the hot key. The split
+    // is the point of ADR-0020, so the generator has to live with it.
+    bank.register_issuer(
+        &kes(),
+        &Issuer::new(actor(0)).with_minter(actor(1), Amount::from_afri(2_000_000)),
+    )
+    .unwrap();
+    // Allocated rather than minted: at height 0 the genesis file *is* the
+    // authority, and starting the run with the minter's allowance untouched
+    // leaves every shilling the generator creates visible as issuance.
     for i in 0..ACTORS {
-        bank.mint(&actor(0), &actor(i), &kes(), Amount::from_afri(1_000_000))
+        bank.genesis_allocate(&actor(i), &kes(), Amount::from_afri(1_000_000))
             .unwrap();
         bank.genesis_allocate(&actor(i), &Denom::native(), Amount::from_afri(500_000))
             .unwrap();
@@ -224,7 +232,8 @@ fn check_invariants(
     let entitled = may_lose(transactions);
 
     // 1. Supply is conserved. The sum of every balance in the world equals the
-    //    recorded total supply, for every denomination, always.
+    //    recorded total supply, for every denomination, always. Issuance moves
+    //    that number deliberately; nothing else may move it at all.
     for (slot, denom) in denoms().iter().enumerate() {
         let mut total = Amount::ZERO;
         for row in &after {
@@ -235,6 +244,21 @@ fn check_invariants(
             view.total_supply(denom).unwrap(),
             "seed {seed} height {height}: balances no longer sum to supply of {denom}"
         );
+        // 1b. A declared supply cap is a promise holders can verify from the
+        //     chain. If supply may exceed it even once, the promise is worth
+        //     nothing — and the cap ratchet exists precisely so the issuer
+        //     cannot quietly move the line instead.
+        if let Some(issuer) = view.issuer(denom).unwrap()
+            && let Some(cap) = issuer.max_supply
+        {
+            assert!(
+                total <= cap,
+                "seed {seed} height {height}: supply of {denom} is {} against a \
+                 declared cap of {}",
+                total.units(),
+                cap.units()
+            );
+        }
     }
 
     // 2. Nobody loses money without cause.
@@ -529,7 +553,7 @@ impl World {
                 group: self.closable[rng.below(self.closable.len())],
             };
         }
-        if rng.below(2) == 0
+        if rng.below(4) != 0
             && let Some((group, _, outstanding)) = self
                 .debts
                 .iter()
@@ -549,7 +573,7 @@ impl World {
                 },
             };
         }
-        match rng.below(18) {
+        match rng.below(23) {
             0..=3 => Message::Transfer {
                 to: self.destination(rng),
                 denom: if rng.below(4) == 0 {
@@ -701,6 +725,57 @@ impl World {
                 }
             }
 
+            // -- Sovereign issuance. The only paths in the chain that may
+            //    change a total supply, which makes them the only paths that
+            //    can break the invariant every other test rests on.
+            18 => Message::Mint {
+                denom: kes(),
+                to: self.destination(rng),
+                // Usually inside the minter's allowance, sometimes absurd. The
+                // absurd one must be refused whole rather than clamped: a
+                // partial mint would credit money the allowance did not cover.
+                amount: if rng.below(6) == 0 {
+                    Amount::from_afri(9_000_000_000)
+                } else {
+                    Amount::from_afri(1 + u64::from(rng.byte()))
+                },
+            },
+            19 => Message::Burn {
+                denom: kes(),
+                amount: Amount::from_afri(1 + u64::from(rng.byte() % 50)),
+            },
+            20 => Message::SetMinterAllowance {
+                denom: kes(),
+                minter: actor(u8::try_from(rng.below(ACTORS as usize)).unwrap()),
+                allowance: Amount::from_afri(u64::from(rng.byte()) * 100),
+            },
+            21 => match rng.below(2) {
+                0 => Message::SetSupplyCap {
+                    denom: kes(),
+                    // Generous, and generated *above* what the run can reach as
+                    // often as below it — a cap is a ratchet, so a tight one
+                    // early would end issuance for the whole seed and quietly
+                    // stop testing the paths that matter.
+                    cap: Amount::from_afri(50_000_000 + u64::from(rng.byte()) * 1_000_000),
+                },
+                _ => Message::SetIssuerPaused {
+                    denom: kes(),
+                    paused: rng.below(2) == 0,
+                },
+            },
+            22 => {
+                // Only outsiders are frozen. Freezing an actor is a legitimate
+                // state and the invariants hold through it, but an actor frozen
+                // in the fee denomination cannot pay a fee, so the run would
+                // spend its remaining blocks watching that actor fail — and a
+                // suite that stops reaching the executor stops proving anything.
+                Message::SetFrozen {
+                    denom: kes(),
+                    account: outsider(u8::try_from(rng.below(OUTSIDERS as usize)).unwrap()),
+                    frozen: rng.below(2) == 0,
+                }
+            }
+
             _ => Message::Transfer {
                 to: self.destination(rng),
                 denom: kes(),
@@ -767,17 +842,22 @@ struct Coverage {
     applied: u64,
     total: u64,
     codes: [u64; 16],
-    /// Applied vikoba messages, by kind — see [`VIKOBA_KINDS`].
+    /// Applied messages on the paths this suite insists on — see [`TRACKED_KINDS`].
     ///
     /// A share-out is reached only by a sequence that founds an accumulating
-    /// group, buys shares in it, closes two whole cycles and then asks. A
-    /// generator can drift away from a path that long without any invariant
-    /// noticing, because an invariant that is never reached always holds.
-    vikoba: [u64; VIKOBA_KINDS.len()],
+    /// group, buys shares in it, closes whole cycles and then asks. A generator
+    /// can drift away from a path that long without any invariant noticing,
+    /// because an invariant that is never reached always holds.
+    tracked: [u64; TRACKED_KINDS.len()],
 }
 
-/// The accumulating-group messages this suite insists on actually exercising.
-const VIKOBA_KINDS: [&str; 7] = [
+/// Messages this suite refuses to pass without having actually executed.
+///
+/// Two families, for one reason: both move money along paths that no other test
+/// watches under arbitrary sequencing. The accumulating-group messages sit at
+/// the end of a long chain of preconditions, and the issuance messages are the
+/// only ones in the chain that may change a total supply.
+const TRACKED_KINDS: [&str; 12] = [
     "BuyShares",
     "PaySocialFund",
     "ProposeGroupAction",
@@ -785,9 +865,14 @@ const VIKOBA_KINDS: [&str; 7] = [
     "RepayLoan",
     "CloseCycle",
     "ShareOut",
+    "Mint",
+    "Burn",
+    "SetMinterAllowance",
+    "SetSupplyCap",
+    "SetFrozen",
 ];
 
-fn vikoba_slot(message: &Message) -> Option<usize> {
+fn tracked_slot(message: &Message) -> Option<usize> {
     Some(match message {
         Message::BuyShares { .. } => 0,
         Message::PaySocialFund { .. } => 1,
@@ -796,6 +881,11 @@ fn vikoba_slot(message: &Message) -> Option<usize> {
         Message::RepayLoan { .. } => 4,
         Message::CloseCycle { .. } => 5,
         Message::ShareOut { .. } => 6,
+        Message::Mint { .. } => 7,
+        Message::Burn { .. } => 8,
+        Message::SetMinterAllowance { .. } => 9,
+        Message::SetSupplyCap { .. } => 10,
+        Message::SetFrozen { .. } => 11,
         _ => return None,
     })
 }
@@ -815,8 +905,8 @@ impl Coverage {
                 continue;
             }
             for message in &tx.body.messages {
-                if let Some(slot) = vikoba_slot(message) {
-                    self.vikoba[slot] = self.vikoba[slot].saturating_add(1);
+                if let Some(slot) = tracked_slot(message) {
+                    self.tracked[slot] = self.tracked[slot].saturating_add(1);
                 }
             }
         }
@@ -831,7 +921,12 @@ impl Coverage {
         self.codes.iter().filter(|c| **c > 0).count()
     }
 
-    fn assert_meaningful(&self) {
+    /// The generator is still reaching the executor at all.
+    ///
+    /// Thresholds sit below what a healthy run produces rather than at it: this
+    /// catches a generator that has stopped working, not one whose mix has
+    /// shifted by a few percent.
+    fn assert_not_degenerate(&self) {
         assert!(
             self.applied * 4 >= self.total,
             "the generator has degenerated: only {} of {} transactions applied, \
@@ -846,16 +941,23 @@ impl Coverage {
             self.distinct_codes(),
             self.codes
         );
-        // Every accumulating-group message must actually have applied. An
-        // invariant that is never reached always holds, so without this the
-        // whole vikoba section of `check_invariants` could go green over a run
-        // that never once bought a share.
-        for (kind, count) in VIKOBA_KINDS.iter().zip(self.vikoba) {
+    }
+
+    /// Every path this suite claims to cover was actually walked.
+    ///
+    /// An invariant that is never reached always holds, so without this whole
+    /// sections of [`check_invariants`] would go green over a run that never
+    /// bought a share or minted a shilling. Asserted only over the broad sweep —
+    /// a pinned regression set is there to replay specific sequences, and
+    /// demanding breadth of it would conflate two jobs and make it fail for a
+    /// reason that has nothing to do with the bug it preserves.
+    fn assert_every_path_ran(&self) {
+        for (kind, count) in TRACKED_KINDS.iter().zip(self.tracked) {
             assert!(
                 count > 0,
-                "no {kind} ever applied: the vikoba invariants are vacuous \
-                 ({:?})",
-                self.vikoba
+                "no {kind} ever applied: the invariants over that path are \
+                 vacuous ({:?})",
+                self.tracked
             );
         }
     }
@@ -911,14 +1013,15 @@ fn run(seed: u64, blocks: u64, coverage: &mut Coverage) -> afrolink_crypto::hash
 
 #[test]
 fn the_ledger_holds_together_under_arbitrary_transaction_sequences() {
-    // 30 seeds × up to 4 transactions × 30 blocks. Each seed is a different
+    // 30 seeds × up to 4 transactions × 40 blocks. Each seed is a different
     // sequence, and every invariant is checked after every block — so a failure
     // names the seed, the height, and the rule that broke.
     let mut coverage = Coverage::default();
     for seed in 0..30u64 {
-        run(seed, 30, &mut coverage);
+        run(seed, 40, &mut coverage);
     }
-    coverage.assert_meaningful();
+    coverage.assert_not_degenerate();
+    coverage.assert_every_path_ran();
 }
 
 #[test]
@@ -927,10 +1030,10 @@ fn a_sequence_that_broke_once_stays_fixed() {
     // what it found, so the specific sequence is never lost to a change in the
     // generator.
     let mut coverage = Coverage::default();
-    for seed in [0u64, 1, 7, 42, 99] {
+    for seed in [0u64, 1, 7, 42, 99, 123, 777, 4242] {
         run(seed, 60, &mut coverage);
     }
-    coverage.assert_meaningful();
+    coverage.assert_not_degenerate();
 }
 
 #[test]

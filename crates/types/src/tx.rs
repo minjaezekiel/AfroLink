@@ -425,6 +425,110 @@ pub enum Message {
         list: Option<SignerList>,
     },
 
+    // -- Sovereign issuance (ADR-0020) ---------------------------------------
+    //
+    // The three keys these messages answer to are different on purpose. The
+    // authority configures and never issues; a minter issues up to a finite
+    // allowance and never configures; a freezer does neither. A single key that
+    // could do all three would be the most valuable target on the network, and
+    // the highest-severity finding in any review of a stablecoin is who can
+    // call mint.
+    /// Put `amount` of a sovereign denomination into circulation.
+    ///
+    /// The sender must hold a minter allowance of at least `amount`, and the
+    /// mint spends it. **The authority cannot mint**; if a central bank wants to
+    /// issue directly it grants itself an allowance, and that grant is on the
+    /// chain for anyone to read.
+    Mint {
+        /// The asset. Never the native coin — AFRI is created by protocol
+        /// emission alone, and no issuer may reach it.
+        denom: Denom,
+        /// Who receives the new money.
+        to: Address,
+        /// How much to create.
+        amount: Amount,
+    },
+    /// Destroy `amount` of a denomination **out of the sender's own balance**.
+    ///
+    /// There is no `from`, and its absence is the design. Burning a holder's
+    /// balance is confiscation with an accounting name on it, and an issuer able
+    /// to do it makes every balance of that asset conditional. Redemption works
+    /// the other way round: the holder signs a transfer to the minter, and the
+    /// minter burns what it now owns — so the holder's consent is on the chain.
+    Burn {
+        /// The asset.
+        denom: Denom,
+        /// How much to destroy.
+        amount: Amount,
+    },
+    /// Authorise a minter for exactly `allowance`, or revoke it at zero.
+    ///
+    /// Absolute rather than an increment: the authority is stating what this
+    /// minter may do from now on, and an operator reading the record should not
+    /// have to replay history to learn the answer.
+    SetMinterAllowance {
+        /// The asset.
+        denom: Denom,
+        /// The hot key being authorised.
+        minter: Address,
+        /// What it may mint from now on. Zero revokes.
+        allowance: Amount,
+    },
+    /// Stop or resume new issuance of a denomination.
+    ///
+    /// The circuit breaker for a suspected key compromise. It stops new money
+    /// **without freezing money that already exists**, so the response to an
+    /// incident is not a payments outage for everyone holding the currency.
+    SetIssuerPaused {
+        /// The asset.
+        denom: Denom,
+        /// On or off.
+        paused: bool,
+    },
+    /// Bind a denomination to a supply cap no looser than its current one.
+    ///
+    /// **A ratchet.** A cap is a promise that no more than a stated amount can
+    /// exist, verifiable from the chain without trusting an attestation — and a
+    /// promise the promiser can revoke is not a promise. So a cap may be set, or
+    /// lowered, and never raised or removed. Stellar and XRPL reach the same
+    /// rule for their own issuer flags and for the same reason: a holder should
+    /// be able to check what can be done to them once, when they accept the
+    /// asset, and rely on the answer.
+    ///
+    /// A cap below the supply already outstanding is allowed and means no more
+    /// may be minted until burns bring the total under it — which is how a
+    /// currency is wound down.
+    SetSupplyCap {
+        /// The asset.
+        denom: Denom,
+        /// The new ceiling.
+        cap: Amount,
+    },
+    /// Name, or clear, the key permitted to freeze holders of a denomination.
+    ///
+    /// Clearing it leaves the power with the authority rather than with nobody:
+    /// a denomination that cannot answer a court order is one no central bank
+    /// will issue on.
+    SetFreezer {
+        /// The asset.
+        denom: Denom,
+        /// The compliance key, or `None` to return the power to the authority.
+        freezer: Option<Address>,
+    },
+    /// Freeze or unfreeze one account's holdings of one denomination.
+    ///
+    /// Scoped to a single asset: an issuer may immobilise its own currency in an
+    /// account and can never reach AFRI, another country's currency, or anything
+    /// else that account holds.
+    SetFrozen {
+        /// The asset.
+        denom: Denom,
+        /// Whose holdings.
+        account: Address,
+        /// On or off.
+        frozen: bool,
+    },
+
     /// Lock AFRI and register as a validator candidate.
     Bond {
         /// The consensus key this operator will sign blocks with.
@@ -553,6 +657,8 @@ impl TxBody {
                 Message::Transfer { amount, .. }
                 | Message::ContributeToGroup { amount, .. }
                 | Message::RepayLoan { amount, .. }
+                | Message::Mint { amount, .. }
+                | Message::Burn { amount, .. }
                 | Message::Bond { amount, .. }
                 | Message::AddStake { amount }
                 | Message::Unbond { amount } => {
@@ -591,6 +697,14 @@ impl TxBody {
                 | Message::ApproveGroupAction { .. }
                 | Message::CloseCycle { .. }
                 | Message::ShareOut { .. }
+                // A zero allowance revokes a minter and a zero cap winds a
+                // currency down; both are deliberate, so neither is a
+                // zero-amount mistake.
+                | Message::SetMinterAllowance { .. }
+                | Message::SetSupplyCap { .. }
+                | Message::SetIssuerPaused { .. }
+                | Message::SetFreezer { .. }
+                | Message::SetFrozen { .. }
                 | Message::RegisterName { .. }
                 | Message::RenewName { .. }
                 | Message::TransferName { .. }
@@ -737,6 +851,17 @@ impl Transaction {
                     out.extend(members.iter().map(|m| m.address));
                 }
                 Message::TransferName { to, .. } => out.push(*to),
+                // Money arriving is the case this index exists for.
+                Message::Mint { to, .. } => out.push(*to),
+                // Being frozen is the single most consequential thing that can
+                // happen to a holder, and they did not send the transaction
+                // that did it. A holder who cannot find that event in their own
+                // history has no way to know why their money stopped moving.
+                Message::SetFrozen { account, .. } => out.push(*account),
+                // A minter needs to see its own authorisation change, and a
+                // freezer needs to see that it has been handed the power.
+                Message::SetMinterAllowance { minter, .. } => out.push(*minter),
+                Message::SetFreezer { freezer, .. } => out.extend(freezer.iter().copied()),
                 Message::AttestContact { address, .. } => out.push(*address),
                 Message::RequestRebind { new_address, .. } => out.push(*new_address),
                 // The account gaining the binding should see the transaction
@@ -759,6 +884,9 @@ impl Transaction {
                 | Message::SetAccountFlag { .. }
                 | Message::SetRegularKey { .. }
                 | Message::SetSignerList { .. }
+                | Message::Burn { .. }
+                | Message::SetIssuerPaused { .. }
+                | Message::SetSupplyCap { .. }
                 | Message::Bond { .. }
                 | Message::AddStake { .. }
                 | Message::Unbond { .. }
@@ -1065,6 +1193,52 @@ impl Encode for Message {
                 out.push(29);
                 group.encode(out);
             }
+            Self::Mint { denom, to, amount } => {
+                out.push(30);
+                denom.encode(out);
+                to.encode(out);
+                amount.encode(out);
+            }
+            Self::Burn { denom, amount } => {
+                out.push(31);
+                denom.encode(out);
+                amount.encode(out);
+            }
+            Self::SetMinterAllowance {
+                denom,
+                minter,
+                allowance,
+            } => {
+                out.push(32);
+                denom.encode(out);
+                minter.encode(out);
+                allowance.encode(out);
+            }
+            Self::SetIssuerPaused { denom, paused } => {
+                out.push(33);
+                denom.encode(out);
+                paused.encode(out);
+            }
+            Self::SetSupplyCap { denom, cap } => {
+                out.push(34);
+                denom.encode(out);
+                cap.encode(out);
+            }
+            Self::SetFreezer { denom, freezer } => {
+                out.push(35);
+                denom.encode(out);
+                freezer.encode(out);
+            }
+            Self::SetFrozen {
+                denom,
+                account,
+                frozen,
+            } => {
+                out.push(36);
+                denom.encode(out);
+                account.encode(out);
+                frozen.encode(out);
+            }
         }
     }
 }
@@ -1175,6 +1349,37 @@ impl Decode for Message {
             }),
             29 => Ok(Self::ShareOut {
                 group: Address::decode(r)?,
+            }),
+            30 => Ok(Self::Mint {
+                denom: Denom::decode(r)?,
+                to: Address::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            31 => Ok(Self::Burn {
+                denom: Denom::decode(r)?,
+                amount: Amount::decode(r)?,
+            }),
+            32 => Ok(Self::SetMinterAllowance {
+                denom: Denom::decode(r)?,
+                minter: Address::decode(r)?,
+                allowance: Amount::decode(r)?,
+            }),
+            33 => Ok(Self::SetIssuerPaused {
+                denom: Denom::decode(r)?,
+                paused: bool::decode(r)?,
+            }),
+            34 => Ok(Self::SetSupplyCap {
+                denom: Denom::decode(r)?,
+                cap: Amount::decode(r)?,
+            }),
+            35 => Ok(Self::SetFreezer {
+                denom: Denom::decode(r)?,
+                freezer: Option::<Address>::decode(r)?,
+            }),
+            36 => Ok(Self::SetFrozen {
+                denom: Denom::decode(r)?,
+                account: Address::decode(r)?,
+                frozen: bool::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,

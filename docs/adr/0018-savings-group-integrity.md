@@ -153,6 +153,13 @@ and a denom with no issuer has no units for anyone to spend. The check is what
 keeps that true once issuers can be registered by transaction, which the roadmap
 intends.
 
+*Update, [ADR-0020](0020-sovereign-issuance.md):* half of that reasoning has
+expired. Minting by transaction now works, so a registered issuer really can put
+units into circulation — the check has stopped being latent and started being
+load-bearing. What still holds it up is that **registering an issuer** remains
+genesis-only, which is the governance gap ADR-0020 names as the largest one
+left.
+
 **Decision.** A fee denomination must be the native coin or have a registered
 issuer. The issuer registry *is* the whitelist.
 

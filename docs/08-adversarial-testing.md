@@ -79,8 +79,9 @@ through a convenience.
 The suite that asks the *second* question, written because §8–15 proved the
 first one was not enough. It generates sequences of well-formed, correctly
 signed transactions from a seed — transfers, group creation, contributions,
-payouts, bonding, unbonding, flag changes, and sponsored fees both genuine and
-forged — and asserts after **every block** that:
+payouts, share purchases, loans and share-outs, minting, burning and freezing,
+bonding, unbonding, flag changes, and sponsored fees both genuine and forged —
+and asserts after **every block** that:
 
 | Invariant | What it would have caught |
 |---|---|
@@ -90,17 +91,36 @@ forged — and asserts after **every block** that:
 | A group's members are within bounds and its rotation index is in range | §13 |
 | No member is credited more cycles than the group has had | §10 |
 | A history pointer never names a future block | A broken ADR-0015 chain |
+| A vikoba's social fund never exceeds its balance | Insurance the group has already spent |
+| No loan falls due after the round that settles it | §16, found here |
+| Supply never exceeds a declared cap | An issuer quietly outrunning a promise holders can verify ([ADR-0020](adr/0020-sovereign-issuance.md)) |
 
 **Writing down "who may lose money" was itself the point.** That model did not
 exist anywhere before, which is precisely why §7 could happen: nothing in the
 code or the docs said which accounts a block is entitled to debit.
 
-The suite also **tests itself**. A property run whose inputs are all rejected
-passes every invariant and proves nothing, and fails silently — the run still
-goes green. So it counts what actually applied and asserts on it: at present
-about a third of generated transactions apply, across seven distinct result
-codes. If a change makes the generator degenerate into an endless run of
-rejections, the run fails rather than quietly stopping to test anything.
+The suite also **tests itself**, in two ways, and both have since earned their
+keep.
+
+A property run whose inputs are all rejected passes every invariant and proves
+nothing, and fails silently — the run still goes green. So it counts what
+actually applied and asserts on it: at present about a third of generated
+transactions apply, across eight distinct result codes.
+
+That is not enough on its own, because a generator can be busy and still never
+walk a *particular* path. Reaching a share-out means founding an accumulating
+group, buying shares, closing every cycle of a round and then asking; reaching a
+mint means holding a minter allowance. So the suite also names the twelve
+messages it claims to cover and requires each to have applied at least once.
+Wiring that up caught four silent false-greens in a row, each on a different
+message — four runs that would have shipped as "passing" while testing nothing
+about the code they were written for.
+
+Some of the generator therefore **aims** rather than guesses: it answers a
+proposal it knows is open, repays a debt it knows the sender carries, shares out
+a round it knows is complete. That is not marking its own homework — every
+invariant still runs against whatever the executor actually did. It is the
+difference between a suite that reaches the arithmetic and one that never does.
 
 ### 4. `crates/node/tests/adversarial.rs` — a hostile scheduler
 

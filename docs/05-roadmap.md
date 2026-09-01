@@ -87,6 +87,14 @@ the transaction path is not.)*
       ends in a share-out proportional to what each member saved — so a member
       takes out more than they paid in. `Quorum` finally governs something
       *([ADR-0019](adr/0019-vikoba-accumulating-savings.md))*
+- [x] **Sovereign issuance** — mint, burn, freeze, pause and a supply cap, as
+      messages. Before this the chain could not create money at all: the bank
+      module was written and tested and reachable from nothing but genesis, so
+      every denomination's supply was fixed forever at block zero. The keys are
+      split — a cold authority that configures and never issues, hot minters
+      with finite allowances, a separate compliance key — so a stolen minting
+      key costs a bounded amount
+      *([ADR-0020](adr/0020-sovereign-issuance.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature
@@ -182,7 +190,15 @@ without talking to the core team.
 
 ## Phase 4 — The money layer
 
-- [ ] Sovereign issuance module: mint, burn, freeze, caps, audit trail
+- [x] Sovereign issuance: mint, burn, freeze, caps, audit trail — built early
+      because without it the chain's whole purpose was unreachable
+      *([ADR-0020](adr/0020-sovereign-issuance.md))*
+- [ ] **Clawback**, if a central bank asks for it as a condition of issuing.
+      Deliberately absent: freeze plus a court order plus a holder-signed
+      transfer covers the same ground and leaves the consent on the chain
+      *(ADR-0020)*
+- [ ] **Per-period mint ceilings** — the allowance bounds total damage, not
+      damage per day *(ADR-0020)*
 - [ ] Proof-of-reserve attestation framework
 - [ ] Agent registry, bonding, liquidity mining, ratings
 - [ ] USSD gateway *(feature phones — R10)*

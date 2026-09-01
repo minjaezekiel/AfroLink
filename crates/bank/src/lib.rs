@@ -38,7 +38,7 @@
 
 pub mod issuer;
 
-pub use issuer::Issuer;
+pub use issuer::{Issuer, IssuerError, MAX_MINTERS, Minter};
 
 use afrolink_crypto::Address;
 use afrolink_primitives::{Amount, Denom};
@@ -67,6 +67,30 @@ pub enum BankError {
     /// The signer is not the registered issuer for this denomination.
     #[error("account is not the authorised issuer of {0}")]
     NotIssuer(String),
+    /// The signer is not an authorised minter of this denomination.
+    #[error("account is not an authorised minter of {0}")]
+    NotMinter(String),
+    /// The mint would draw more than the minter's remaining allowance.
+    ///
+    /// Its own error rather than a shade of [`Self::NotMinter`]: the two are
+    /// fixed by different people. A non-minter needs authorising; a minter out
+    /// of allowance needs topping up, and telling them apart is what lets an
+    /// operator page the right person at three in the morning.
+    #[error("minting {amount} of {denom} exceeds this minter's remaining allowance of {allowance}")]
+    MintAllowanceExceeded {
+        /// Asset involved.
+        denom: String,
+        /// Amount requested.
+        amount: String,
+        /// What the minter had left.
+        allowance: String,
+    },
+    /// The signer may not freeze holders of this denomination.
+    #[error("account may not freeze holders of {0}")]
+    NotFreezer(String),
+    /// The issuer record could not be changed as asked.
+    #[error(transparent)]
+    Issuer(#[from] IssuerError),
     /// No issuer has been registered for this denomination.
     #[error("no issuer registered for {0}")]
     NoIssuer(String),
@@ -275,18 +299,52 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         Ok(())
     }
 
+    /// Load an issuer record, or say why this denomination has none.
+    fn require_issuer(&self, denom: &Denom) -> Result<Issuer> {
+        if denom.is_native() {
+            return Err(BankError::NativeNotIssuable);
+        }
+        self.issuer(denom)?
+            .ok_or_else(|| BankError::NoIssuer(denom.to_string()))
+    }
+
+    /// Load an issuer record that `authority` governs.
+    fn require_authority(&self, authority: &Address, denom: &Denom) -> Result<Issuer> {
+        let issuer = self.require_issuer(denom)?;
+        if !issuer.is_authority(authority) {
+            return Err(BankError::NotIssuer(denom.to_string()));
+        }
+        Ok(issuer)
+    }
+
+    fn write_issuer(&mut self, denom: &Denom, issuer: &Issuer) {
+        self.store.set_encoded(&StoreKey::issuer(denom), issuer);
+    }
+
     /// Create `amount` of `denom` and credit it to `to`, raising total supply.
     ///
-    /// `authority` must be the registered issuer. The native coin is never
-    /// issuable this way — it is created only by protocol emission.
+    /// `minter` must hold a minter authorisation with at least `amount`
+    /// remaining, and the draw is **deducted here**. That is what makes the
+    /// allowance a total rather than a per-transaction limit: a hundred small
+    /// mints in one block consume what they add up to, which is the exact
+    /// bypass a stablecoin audit looks for.
+    ///
+    /// The authority deliberately cannot mint. A key that both authorises
+    /// issuance and performs it is the single point of failure this whole record
+    /// exists to avoid; if a central bank wants to issue directly it gives
+    /// itself a minter allowance, and that act is on the chain.
+    ///
+    /// The native coin is never issuable this way — it is created only by
+    /// protocol emission.
     ///
     /// # Errors
     /// Returns [`BankError::NativeNotIssuable`], [`BankError::NoIssuer`],
-    /// [`BankError::NotIssuer`], [`BankError::IssuerPaused`],
+    /// [`BankError::NotMinter`], [`BankError::MintAllowanceExceeded`],
+    /// [`BankError::IssuerPaused`], [`BankError::AccountFrozen`],
     /// [`BankError::SupplyCapExceeded`] or [`BankError::Overflow`].
     pub fn mint(
         &mut self,
-        authority: &Address,
+        minter: &Address,
         to: &Address,
         denom: &Denom,
         amount: Amount,
@@ -294,18 +352,18 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         if amount.is_zero() {
             return Err(BankError::ZeroAmount);
         }
-        if denom.is_native() {
-            return Err(BankError::NativeNotIssuable);
-        }
-
-        let issuer = self
-            .issuer(denom)?
-            .ok_or_else(|| BankError::NoIssuer(denom.to_string()))?;
-        if &issuer.authority != authority {
-            return Err(BankError::NotIssuer(denom.to_string()));
+        let mut issuer = self.require_issuer(denom)?;
+        if issuer.minter(minter).is_none() {
+            return Err(BankError::NotMinter(denom.to_string()));
         }
         if issuer.paused {
             return Err(BankError::IssuerPaused(denom.to_string()));
+        }
+        // Crediting a frozen holder is a change to a balance the issuer has
+        // declared immobile. Refusing it here means a freeze means one thing
+        // rather than two.
+        if self.is_frozen(to, denom) {
+            return Err(BankError::AccountFrozen(denom.to_string()));
         }
 
         let supply = self.total_supply(denom)?;
@@ -327,37 +385,55 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
             .checked_add(amount)
             .map_err(|_| BankError::Overflow("mint/credit"))?;
 
+        if !issuer.spend_allowance(minter, amount) {
+            return Err(BankError::MintAllowanceExceeded {
+                denom: denom.to_string(),
+                amount: amount.units().to_string(),
+                allowance: issuer.allowance_of(minter).units().to_string(),
+            });
+        }
+
+        // Everything succeeded; only now do we write.
         self.write_balance(to, denom, new_balance);
         self.write_supply(denom, new_supply);
+        self.write_issuer(denom, &issuer);
         Ok(())
     }
 
-    /// Destroy `amount` of `denom` held by `from`, lowering total supply.
+    /// Destroy `amount` of `denom` **from the minter's own balance**, lowering
+    /// total supply.
+    ///
+    /// # Why there is no `from`
+    ///
+    /// Burning somebody else's holdings is confiscation with an accounting name
+    /// on it, and an issuer that can do it silently makes every balance of that
+    /// asset conditional. Redemption does not need it: a holder who wants cash
+    /// **transfers to the minter and the minter burns what it now owns**, which
+    /// is Circle's shape and leaves the holder's consent on the chain as a
+    /// signed transfer. An issuer that must take funds without consent has
+    /// [`Self::freeze`], which is visible, reversible and attributable.
+    ///
+    /// A burn does **not** restore the minter's allowance. Getting more room to
+    /// issue is a deliberate act by the authority, and letting a mint-then-burn
+    /// cycle refill it would make the allowance a rate limit on net issuance
+    /// rather than a ceiling on the damage a stolen key can do.
     ///
     /// # Errors
-    /// Returns [`BankError::InsufficientFunds`] or an authority error, as [`Self::mint`].
-    pub fn burn(
-        &mut self,
-        authority: &Address,
-        from: &Address,
-        denom: &Denom,
-        amount: Amount,
-    ) -> Result<()> {
+    /// Returns [`BankError::InsufficientFunds`], [`BankError::NotMinter`],
+    /// [`BankError::AccountFrozen`], or the issuer errors of [`Self::mint`].
+    pub fn burn(&mut self, minter: &Address, denom: &Denom, amount: Amount) -> Result<()> {
         if amount.is_zero() {
             return Err(BankError::ZeroAmount);
         }
-        if denom.is_native() {
-            return Err(BankError::NativeNotIssuable);
+        let issuer = self.require_issuer(denom)?;
+        if issuer.minter(minter).is_none() {
+            return Err(BankError::NotMinter(denom.to_string()));
+        }
+        if self.is_frozen(minter, denom) {
+            return Err(BankError::AccountFrozen(denom.to_string()));
         }
 
-        let issuer = self
-            .issuer(denom)?
-            .ok_or_else(|| BankError::NoIssuer(denom.to_string()))?;
-        if &issuer.authority != authority {
-            return Err(BankError::NotIssuer(denom.to_string()));
-        }
-
-        let balance = self.balance(from, denom)?;
+        let balance = self.balance(minter, denom)?;
         let new_balance = balance
             .checked_sub(amount)
             .map_err(|_| Self::insufficient(denom, amount, balance))?;
@@ -367,8 +443,74 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
             .checked_sub(amount)
             .map_err(|_| BankError::Overflow("burn/supply"))?;
 
-        self.write_balance(from, denom, new_balance);
+        self.write_balance(minter, denom, new_balance);
         self.write_supply(denom, new_supply);
+        Ok(())
+    }
+
+    // -- issuer configuration, by the authority ---------------------------
+
+    /// Authorise `minter` for exactly `allowance`, or revoke it at zero.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NotIssuer`], [`BankError::NoIssuer`] or
+    /// [`BankError::Issuer`].
+    pub fn set_minter_allowance(
+        &mut self,
+        authority: &Address,
+        denom: &Denom,
+        minter: &Address,
+        allowance: Amount,
+    ) -> Result<()> {
+        let mut issuer = self.require_authority(authority, denom)?;
+        issuer.set_minter(*minter, allowance)?;
+        self.write_issuer(denom, &issuer);
+        Ok(())
+    }
+
+    /// Name, or clear, the key permitted to freeze holders.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NotIssuer`] or [`BankError::NoIssuer`].
+    pub fn set_freezer(
+        &mut self,
+        authority: &Address,
+        denom: &Denom,
+        freezer: Option<Address>,
+    ) -> Result<()> {
+        let mut issuer = self.require_authority(authority, denom)?;
+        issuer.freezer = freezer;
+        self.write_issuer(denom, &issuer);
+        Ok(())
+    }
+
+    /// Stop or resume new issuance, leaving existing money alone.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NotIssuer`] or [`BankError::NoIssuer`].
+    pub fn set_paused(&mut self, authority: &Address, denom: &Denom, paused: bool) -> Result<()> {
+        let mut issuer = self.require_authority(authority, denom)?;
+        issuer.paused = paused;
+        self.write_issuer(denom, &issuer);
+        Ok(())
+    }
+
+    /// Bind this denomination to a cap no looser than its current one.
+    ///
+    /// See [`Issuer::tighten_cap`] for why this only goes one way.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NotIssuer`], [`BankError::NoIssuer`] or
+    /// [`BankError::Issuer`] when the cap would rise.
+    pub fn tighten_supply_cap(
+        &mut self,
+        authority: &Address,
+        denom: &Denom,
+        cap: Amount,
+    ) -> Result<()> {
+        let mut issuer = self.require_authority(authority, denom)?;
+        issuer.tighten_cap(cap)?;
+        self.write_issuer(denom, &issuer);
         Ok(())
     }
 
@@ -481,20 +623,18 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         Ok(())
     }
 
-    /// Freeze `address` for `denom`, on the authority of its issuer.
+    /// Freeze `address` for `denom`, on the authority of its issuer's freezer.
     ///
     /// Scoped deliberately: an issuer may freeze holdings of *its own* asset and
     /// can never reach AFRI, another country's currency, or anything else the
     /// account holds. Every freeze is an on-chain, attributable event.
     ///
     /// # Errors
-    /// Returns [`BankError::NotIssuer`] or [`BankError::NoIssuer`].
-    pub fn freeze(&mut self, authority: &Address, address: &Address, denom: &Denom) -> Result<()> {
-        let issuer = self
-            .issuer(denom)?
-            .ok_or_else(|| BankError::NoIssuer(denom.to_string()))?;
-        if &issuer.authority != authority {
-            return Err(BankError::NotIssuer(denom.to_string()));
+    /// Returns [`BankError::NotFreezer`] or [`BankError::NoIssuer`].
+    pub fn freeze(&mut self, caller: &Address, address: &Address, denom: &Denom) -> Result<()> {
+        let issuer = self.require_issuer(denom)?;
+        if !issuer.may_freeze(caller) {
+            return Err(BankError::NotFreezer(denom.to_string()));
         }
         self.store
             .set_encoded(&StoreKey::frozen(denom, address), &1u8);
@@ -504,18 +644,11 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
     /// Lift a freeze.
     ///
     /// # Errors
-    /// Returns [`BankError::NotIssuer`] or [`BankError::NoIssuer`].
-    pub fn unfreeze(
-        &mut self,
-        authority: &Address,
-        address: &Address,
-        denom: &Denom,
-    ) -> Result<()> {
-        let issuer = self
-            .issuer(denom)?
-            .ok_or_else(|| BankError::NoIssuer(denom.to_string()))?;
-        if &issuer.authority != authority {
-            return Err(BankError::NotIssuer(denom.to_string()));
+    /// Returns [`BankError::NotFreezer`] or [`BankError::NoIssuer`].
+    pub fn unfreeze(&mut self, caller: &Address, address: &Address, denom: &Denom) -> Result<()> {
+        let issuer = self.require_issuer(denom)?;
+        if !issuer.may_freeze(caller) {
+            return Err(BankError::NotFreezer(denom.to_string()));
         }
         self.store.delete(&StoreKey::frozen(denom, address));
         Ok(())
@@ -541,12 +674,23 @@ mod tests {
         addr(100)
     }
 
+    /// A licensed intermediary holding the hot minting key.
+    ///
+    /// Separate from [`cbk`] on purpose: the authority configures and never
+    /// issues, which is the whole shape of the record.
+    fn treasury() -> Address {
+        addr(101)
+    }
+
     fn setup() -> MemoryStore {
         let mut store = MemoryStore::new();
         let mut bank = Bank::new(&mut store);
-        bank.register_issuer(&kes(), &Issuer::new(cbk()))
-            .expect("registers");
-        bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1_000))
+        bank.register_issuer(
+            &kes(),
+            &Issuer::new(cbk()).with_minter(treasury(), Amount::from_afri(1_000_000)),
+        )
+        .expect("registers");
+        bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1_000))
             .expect("mints");
         store
     }
@@ -596,9 +740,14 @@ mod tests {
                 .expect("t1");
             bank.transfer(&addr(2), &addr(3), &kes(), Amount::from_afri(100))
                 .expect("t2");
-            bank.mint(&cbk(), &addr(3), &kes(), Amount::from_afri(500))
+            bank.mint(&treasury(), &addr(3), &kes(), Amount::from_afri(500))
                 .expect("mint");
-            bank.burn(&cbk(), &addr(1), &kes(), Amount::from_afri(200))
+            // Redemption, in the two steps it actually takes: the holder signs
+            // the money back to the minter, and the minter burns what it now
+            // owns. There is no path that destroys a holder's balance directly.
+            bank.transfer(&addr(1), &treasury(), &kes(), Amount::from_afri(200))
+                .expect("redeem");
+            bank.burn(&treasury(), &kes(), Amount::from_afri(200))
                 .expect("burn");
         }
         let bank = BankView::new(&store);
@@ -649,14 +798,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_registered_issuer_can_mint() {
+    fn only_an_authorised_minter_can_mint() {
         let mut store = setup();
         let mut bank = Bank::new(&mut store);
         let impostor = addr(66);
         let err = bank
             .mint(&impostor, &impostor, &kes(), Amount::from_afri(1_000_000))
             .expect_err("must fail");
-        assert!(matches!(err, BankError::NotIssuer(_)));
+        assert!(matches!(err, BankError::NotMinter(_)));
         assert_eq!(bank.balance(&impostor, &kes()).expect("read"), Amount::ZERO);
     }
 
@@ -667,7 +816,16 @@ mod tests {
         let mut store = setup();
         let mut bank = Bank::new(&mut store);
         assert_eq!(
-            bank.mint(&cbk(), &addr(1), &Denom::native(), Amount::from_afri(1)),
+            bank.mint(
+                &treasury(),
+                &addr(1),
+                &Denom::native(),
+                Amount::from_afri(1)
+            ),
+            Err(BankError::NativeNotIssuable)
+        );
+        assert_eq!(
+            bank.burn(&treasury(), &Denom::native(), Amount::from_afri(1)),
             Err(BankError::NativeNotIssuable)
         );
         assert_eq!(
@@ -696,13 +854,15 @@ mod tests {
     fn a_supply_cap_is_enforced() {
         let mut store = MemoryStore::new();
         let mut bank = Bank::new(&mut store);
-        let capped = Issuer::new(cbk()).with_cap(Amount::from_afri(1_000));
+        let capped = Issuer::new(cbk())
+            .with_cap(Amount::from_afri(1_000))
+            .with_minter(treasury(), Amount::from_afri(1_000_000));
         bank.register_issuer(&kes(), &capped).expect("registers");
 
-        bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1_000))
+        bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1_000))
             .expect("at the cap");
         let err = bank
-            .mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1))
+            .mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1))
             .expect_err("over the cap");
         assert!(matches!(err, BankError::SupplyCapExceeded { .. }));
     }
@@ -711,10 +871,15 @@ mod tests {
     fn a_paused_issuer_cannot_mint() {
         let mut store = MemoryStore::new();
         let mut bank = Bank::new(&mut store);
-        bank.register_issuer(&kes(), &Issuer::new(cbk()).paused())
-            .expect("registers");
+        bank.register_issuer(
+            &kes(),
+            &Issuer::new(cbk())
+                .with_minter(treasury(), Amount::from_afri(100))
+                .paused(),
+        )
+        .expect("registers");
         assert!(matches!(
-            bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1)),
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1)),
             Err(BankError::IssuerPaused(_))
         ));
     }
@@ -744,7 +909,7 @@ mod tests {
         let mut bank = Bank::new(&mut store);
         assert!(matches!(
             bank.freeze(&addr(66), &addr(1), &kes()),
-            Err(BankError::NotIssuer(_))
+            Err(BankError::NotFreezer(_))
         ));
         bank.freeze(&cbk(), &addr(1), &kes()).expect("freezes");
         assert!(bank.is_frozen(&addr(1), &kes()));
@@ -793,7 +958,7 @@ mod tests {
         let mut store = setup();
         let mut bank = Bank::new(&mut store);
         assert!(matches!(
-            bank.burn(&cbk(), &addr(1), &kes(), Amount::from_afri(2_000)),
+            bank.burn(&treasury(), &kes(), Amount::from_afri(2_000)),
             Err(BankError::InsufficientFunds { .. })
         ));
     }
@@ -803,8 +968,213 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut bank = Bank::new(&mut store);
         assert!(matches!(
-            bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1)),
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1)),
             Err(BankError::NoIssuer(_))
         ));
+    }
+
+    // -- Sovereign issuance (ADR-0020) ------------------------------------
+
+    #[test]
+    fn the_authority_cannot_itself_mint() {
+        // The point of splitting the roles. A key that both authorises issuance
+        // and performs it is the most valuable target on the network, and it is
+        // the highest-severity finding in any review of a stablecoin.
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        assert!(matches!(
+            bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(1)),
+            Err(BankError::NotMinter(_))
+        ));
+        // It may of course grant itself an allowance — and that act is on the
+        // chain, which is the difference that matters.
+        bank.set_minter_allowance(&cbk(), &kes(), &cbk(), Amount::from_afri(5))
+            .expect("authority may authorise anyone, itself included");
+        bank.mint(&cbk(), &addr(1), &kes(), Amount::from_afri(5))
+            .expect("now it may mint");
+    }
+
+    #[test]
+    fn a_minter_cannot_mint_past_its_allowance_however_it_splits_the_mints() {
+        // The bypass a stablecoin audit looks for: many small mints in one block
+        // adding up to more than the ceiling. The allowance is a total, not a
+        // per-transaction limit.
+        let mut store = MemoryStore::new();
+        let mut bank = Bank::new(&mut store);
+        bank.register_issuer(
+            &kes(),
+            &Issuer::new(cbk()).with_minter(treasury(), Amount::from_afri(100)),
+        )
+        .expect("registers");
+
+        for _ in 0..10 {
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(10))
+                .expect("within the allowance");
+        }
+        assert!(
+            matches!(
+                bank.mint(&treasury(), &addr(1), &kes(), Amount::from_units(1)),
+                Err(BankError::NotMinter(_))
+            ),
+            "a fully spent minter is no longer a minter"
+        );
+        assert_eq!(
+            bank.total_supply(&kes()).expect("read"),
+            Amount::from_afri(100),
+            "exactly the allowance reached circulation, and not a unit more"
+        );
+    }
+
+    #[test]
+    fn a_burn_does_not_refill_the_allowance() {
+        // Otherwise a mint-and-burn cycle turns a ceiling on the damage a stolen
+        // key can do into a rate limit on net issuance, which is not the same
+        // promise at all.
+        let mut store = MemoryStore::new();
+        let mut bank = Bank::new(&mut store);
+        bank.register_issuer(
+            &kes(),
+            &Issuer::new(cbk()).with_minter(treasury(), Amount::from_afri(100)),
+        )
+        .expect("registers");
+        bank.mint(&treasury(), &treasury(), &kes(), Amount::from_afri(100))
+            .expect("spends the whole allowance");
+        bank.burn(&treasury(), &kes(), Amount::from_afri(100))
+            .expect_err("a spent minter is not a minter, so it cannot burn either");
+        assert_eq!(
+            bank.issuer(&kes()).expect("read").expect("exists").minters,
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_supply_cap_cannot_be_raised_or_removed_by_the_issuer_that_set_it() {
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        bank.tighten_supply_cap(&cbk(), &kes(), Amount::from_afri(5_000))
+            .expect("a first cap");
+        assert!(matches!(
+            bank.tighten_supply_cap(&cbk(), &kes(), Amount::from_afri(5_001)),
+            Err(BankError::Issuer(IssuerError::CapWouldRise))
+        ));
+        bank.tighten_supply_cap(&cbk(), &kes(), Amount::from_afri(1_200))
+            .expect("lowering is always allowed");
+        assert!(matches!(
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(500)),
+            Err(BankError::SupplyCapExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cap_below_current_supply_stops_issuance_without_touching_holders() {
+        // How a currency is wound down: no more may be created, and everything
+        // already in circulation keeps working.
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        bank.tighten_supply_cap(&cbk(), &kes(), Amount::ZERO)
+            .expect("winding down is tightening");
+        assert!(matches!(
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_units(1)),
+            Err(BankError::SupplyCapExceeded { .. })
+        ));
+        bank.transfer(&addr(1), &addr(2), &kes(), Amount::from_afri(10))
+            .expect("existing money still moves");
+    }
+
+    #[test]
+    fn pausing_stops_new_money_without_freezing_existing_money() {
+        // The response to a suspected key compromise must not be a payments
+        // outage for everyone holding the currency.
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        bank.set_paused(&cbk(), &kes(), true).expect("authority");
+        assert!(matches!(
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1)),
+            Err(BankError::IssuerPaused(_))
+        ));
+        bank.transfer(&addr(1), &addr(2), &kes(), Amount::from_afri(10))
+            .expect("transfers continue");
+        bank.mint(&treasury(), &treasury(), &kes(), Amount::from_afri(1))
+            .expect_err("still paused");
+        bank.set_paused(&cbk(), &kes(), false).expect("authority");
+        bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1))
+            .expect("resumed");
+    }
+
+    #[test]
+    fn only_the_named_freezer_may_freeze_once_one_exists() {
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        // With no freezer named the authority holds the power, so a
+        // denomination is never left unable to answer a court order.
+        bank.freeze(&cbk(), &addr(1), &kes()).expect("authority");
+        bank.unfreeze(&cbk(), &addr(1), &kes()).expect("authority");
+
+        bank.set_freezer(&cbk(), &kes(), Some(addr(50)))
+            .expect("authority names a compliance key");
+        assert!(matches!(
+            bank.freeze(&cbk(), &addr(1), &kes()),
+            Err(BankError::NotFreezer(_))
+        ));
+        bank.freeze(&addr(50), &addr(1), &kes()).expect("freezer");
+        assert!(bank.is_frozen(&addr(1), &kes()));
+        assert!(
+            !bank.is_frozen(&addr(1), &Denom::native()),
+            "a freeze reaches one denomination and no other"
+        );
+    }
+
+    #[test]
+    fn a_frozen_holder_can_be_neither_credited_nor_drained() {
+        // A freeze must mean one thing. If minting could still credit a frozen
+        // account, an issuer could inflate a balance it has declared immobile.
+        let mut store = setup();
+        let mut bank = Bank::new(&mut store);
+        bank.freeze(&cbk(), &addr(1), &kes()).expect("authority");
+        assert!(matches!(
+            bank.mint(&treasury(), &addr(1), &kes(), Amount::from_afri(1)),
+            Err(BankError::AccountFrozen(_))
+        ));
+        assert!(matches!(
+            bank.transfer(&addr(1), &addr(2), &kes(), Amount::from_afri(1)),
+            Err(BankError::AccountFrozen(_))
+        ));
+    }
+
+    #[test]
+    fn a_stranger_can_change_nothing_about_a_denomination_it_does_not_issue() {
+        let mut store = setup();
+        let root_before = store.root();
+        let mut bank = Bank::new(&mut store);
+        let thief = addr(66);
+        assert!(matches!(
+            bank.mint(&thief, &thief, &kes(), Amount::from_afri(1)),
+            Err(BankError::NotMinter(_))
+        ));
+        assert!(matches!(
+            bank.set_minter_allowance(&thief, &kes(), &thief, Amount::from_afri(1)),
+            Err(BankError::NotIssuer(_))
+        ));
+        assert!(matches!(
+            bank.set_paused(&thief, &kes(), true),
+            Err(BankError::NotIssuer(_))
+        ));
+        assert!(matches!(
+            bank.tighten_supply_cap(&thief, &kes(), Amount::ZERO),
+            Err(BankError::NotIssuer(_))
+        ));
+        assert!(matches!(
+            bank.set_freezer(&thief, &kes(), Some(thief)),
+            Err(BankError::NotIssuer(_))
+        ));
+        assert!(matches!(
+            bank.freeze(&thief, &addr(1), &kes()),
+            Err(BankError::NotFreezer(_))
+        ));
+        assert_eq!(
+            store.root(),
+            root_before,
+            "and none of it left a mark on the ledger"
+        );
     }
 }

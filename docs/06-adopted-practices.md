@@ -196,6 +196,21 @@ adopted practice than any other single source, in both directions.
 
 ---
 
+## Stablecoin issuance — [ADR-0020](adr/0020-sovereign-issuance.md)
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| Circle's **role separation** — owner, masterMinter, minters, pauser, blacklister as distinct keys | Taken, condensed to three: authority, minter, freezer. A single all-powerful issuer address is the finding every stablecoin audit opens with | `crates/bank/src/issuer.rs` | **In code** |
+| Circle's **minter allowance** — a finite, spend-down authorisation per hot key | Taken, and it is the most valuable single idea here: it converts "a stolen minting key is unbounded" into "a stolen minting key costs what was left on it" | `Issuer::spend_allowance` | **In code** |
+| Circle's **burn from the caller's own balance** — no `from` argument | Taken. Redemption is a holder-signed transfer followed by a burn, so consent is on the chain; there is no message that destroys a holder's balance | `Bank::burn` | **In code** |
+| Stellar and XRPL's **one-way issuer flags** — a power over holders may be renounced but never granted | Taken as a general principle and applied to the supply cap, which ratchets. A promise the promiser can revoke is not a promise | `Issuer::tighten_cap` | **In code** |
+| XRPL/Stellar **clawback** — an issuer reclaiming a holder's tokens | **Deferred, not rejected.** Freeze plus a court order plus a holder-signed transfer covers the ground while leaving consent on the chain. If added, the ratchet rule says it must be declared before issuance and be renounceable but not grantable | ADR-0020 | **Open** |
+| **Per-period mint ceilings** as a circuit breaker | **Open.** The allowance bounds total damage, not damage per day; a window needs a clock the issuer record does not carry | ADR-0020 | **Open** |
+| **Two-tier CBDC distribution** — the central bank runs the ledger, licensed intermediaries reach end users | Taken, expressed in keys rather than institutions: the authority is the central bank, minters are the intermediaries | `crates/bank` | **In code** |
+| **Proof of reserve** | **Open.** The chain proves how much exists and cannot prove what backs it. A cap narrows the gap without closing it | Phase 4 | **Open** |
+
+---
+
 ## Cryptographic standards
 
 | Practice | Decision | Where it lives | Status |

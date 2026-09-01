@@ -1043,6 +1043,61 @@ impl Executor {
                 Ok(())
             }
 
+            // -- Sovereign issuance (ADR-0020) -------------------------------
+            //
+            // The bank holds every rule; these arms only carry the signer
+            // through to it. That is deliberate — the authority checks, the
+            // allowance arithmetic and the supply cap all live next to the
+            // supply invariant they protect, rather than being re-stated here
+            // where a second copy could drift from the first.
+            Message::Mint { denom, to, amount } => {
+                Bank::new(store).mint(&sender, to, denom, *amount)?;
+                Ok(())
+            }
+
+            Message::Burn { denom, amount } => {
+                Bank::new(store).burn(&sender, denom, *amount)?;
+                Ok(())
+            }
+
+            Message::SetMinterAllowance {
+                denom,
+                minter,
+                allowance,
+            } => {
+                Bank::new(store).set_minter_allowance(&sender, denom, minter, *allowance)?;
+                Ok(())
+            }
+
+            Message::SetIssuerPaused { denom, paused } => {
+                Bank::new(store).set_paused(&sender, denom, *paused)?;
+                Ok(())
+            }
+
+            Message::SetSupplyCap { denom, cap } => {
+                Bank::new(store).tighten_supply_cap(&sender, denom, *cap)?;
+                Ok(())
+            }
+
+            Message::SetFreezer { denom, freezer } => {
+                Bank::new(store).set_freezer(&sender, denom, *freezer)?;
+                Ok(())
+            }
+
+            Message::SetFrozen {
+                denom,
+                account,
+                frozen,
+            } => {
+                let mut bank = Bank::new(store);
+                if *frozen {
+                    bank.freeze(&sender, account, denom)?;
+                } else {
+                    bank.unfreeze(&sender, account, denom)?;
+                }
+                Ok(())
+            }
+
             // -- Human-readable addressing (ADR-0008) ------------------------
             //
             // Every arm below is a registry write. None of them move value, and
@@ -1327,8 +1382,15 @@ mod tests {
     fn funded_store() -> MemoryStore {
         let mut store = MemoryStore::new();
         let mut bank = Bank::new(&mut store);
-        bank.register_issuer(&kes(), &Issuer::new(cbk()))
-            .expect("registers");
+        // The authority also holds a minter allowance here, which a real chain
+        // would keep on a different key — see ADR-0020. One key keeps the
+        // fixture short; the separation is tested in `crates/bank` and in
+        // `tests/issuance.rs`.
+        bank.register_issuer(
+            &kes(),
+            &Issuer::new(cbk()).with_minter(cbk(), Amount::from_afri(1_000_000_000)),
+        )
+        .expect("registers");
         for i in 1..=4u8 {
             bank.mint(&cbk(), &addr(i), &kes(), Amount::from_afri(10_000))
                 .expect("mints");
