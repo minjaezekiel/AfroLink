@@ -97,6 +97,12 @@ pub enum IssuerError {
     /// The ratchet. See [`Issuer::tighten_cap`].
     #[error("a supply cap may only be lowered, never raised or removed")]
     CapWouldRise,
+    /// An acceptance from an account the authority did not name.
+    #[error("this denomination's authority has not been offered to {0}")]
+    NotPendingAuthority(Address),
+    /// A handover offered to the account already holding the role.
+    #[error("the authority is already held by this account")]
+    AuthorityUnchanged,
 }
 
 /// The authority record for one sovereign denomination.
@@ -131,6 +137,17 @@ pub struct Issuer {
     /// something if it cannot be taken back, which is why [`Self::tighten_cap`]
     /// is a ratchet.
     pub max_supply: Option<Amount>,
+    /// An account offered the authority, which has not yet accepted.
+    ///
+    /// **The handover is two steps**, and the second one is what makes it safe.
+    /// A one-step transfer to a mistyped address, or to one whose key nobody
+    /// holds, ends the currency's governance permanently: nothing on the chain
+    /// can mint it, unpause it, or name a new minter, ever. Requiring the
+    /// recipient to accept proves the key exists and is reachable before the
+    /// role moves. OpenZeppelin's `Ownable2Step` exists for precisely this
+    /// mistake, and setting the offer back to `None` withdraws it, as it does
+    /// there.
+    pub pending_authority: Option<Address>,
     /// While true, minting is refused. Burning and transfers continue.
     ///
     /// The circuit breaker: it stops new money without freezing money that
@@ -145,6 +162,7 @@ impl Issuer {
     pub const fn new(authority: Address) -> Self {
         Self {
             authority,
+            pending_authority: None,
             minters: Vec::new(),
             freezer: None,
             max_supply: None,
@@ -285,6 +303,38 @@ impl Issuer {
         true
     }
 
+    /// Offer the authority role to `to`, or withdraw a standing offer with
+    /// `None`.
+    ///
+    /// Nothing changes until [`Self::accept_authority`]. Until then the current
+    /// authority keeps every power it had, so an offer that is never accepted
+    /// costs the currency nothing.
+    ///
+    /// # Errors
+    /// Returns [`IssuerError::AuthorityUnchanged`] if offered to the account
+    /// already holding the role — a redundant spelling of doing nothing.
+    pub fn offer_authority(&mut self, to: Option<Address>) -> Result<(), IssuerError> {
+        if to.is_some_and(|to| to == self.authority) {
+            return Err(IssuerError::AuthorityUnchanged);
+        }
+        self.pending_authority = to;
+        Ok(())
+    }
+
+    /// Take up an offered authority role.
+    ///
+    /// # Errors
+    /// Returns [`IssuerError::NotPendingAuthority`] unless `caller` is the
+    /// account the current authority named.
+    pub fn accept_authority(&mut self, caller: &Address) -> Result<(), IssuerError> {
+        if self.pending_authority != Some(*caller) {
+            return Err(IssuerError::NotPendingAuthority(*caller));
+        }
+        self.authority = *caller;
+        self.pending_authority = None;
+        Ok(())
+    }
+
     /// Bind this denomination to a supply cap no looser than the current one.
     ///
     /// **A ratchet, and that is the whole value of it.** A cap is a promise to
@@ -318,6 +368,7 @@ impl Issuer {
 impl Encode for Issuer {
     fn encode(&self, out: &mut Vec<u8>) {
         self.authority.encode(out);
+        self.pending_authority.encode(out);
         self.minters.encode(out);
         self.freezer.encode(out);
         self.max_supply.encode(out);
@@ -329,6 +380,7 @@ impl Decode for Issuer {
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
         let issuer = Self {
             authority: Address::decode(r)?,
+            pending_authority: Option::<Address>::decode(r)?,
             minters: Vec::<Minter>::decode(r)?,
             freezer: Option::<Address>::decode(r)?,
             max_supply: Option::<Amount>::decode(r)?,
@@ -343,6 +395,13 @@ impl Decode for Issuer {
         // Refused, never repaired — see the field's own documentation. A repeat
         // is the dangerous case: sorting it away would merge two authorisations
         // into one and silently pick which allowance survives.
+        if issuer.pending_authority == Some(issuer.authority) {
+            return Err(CodecError::Invalid(
+                "an offer of the authority to the account already holding it is a second \
+                 spelling of no offer at all"
+                    .into(),
+            ));
+        }
         if !issuer.minters.is_sorted_by(|a, b| a.address < b.address) {
             return Err(CodecError::Invalid(
                 "issuer minters must be sorted by address and unique".into(),
@@ -368,6 +427,63 @@ mod tests {
 
     fn addr(seed: u8) -> Address {
         Address::from_public_key(&SecretKey::from_bytes(&[seed; 32]).public_key())
+    }
+
+    #[test]
+    fn the_authority_moves_only_when_the_successor_accepts() {
+        // A one-step transfer to a mistyped address, or to one whose key nobody
+        // holds, ends a currency's governance permanently: nothing could ever
+        // mint it, unpause it or name a minter again. The acceptance is the
+        // proof that the key on the other end exists.
+        let mut issuer = Issuer::new(addr(1));
+        issuer.offer_authority(Some(addr(2))).expect("offers");
+        assert!(
+            issuer.is_authority(&addr(1)),
+            "the outgoing authority keeps every power until the offer is taken up"
+        );
+
+        assert_eq!(
+            issuer.accept_authority(&addr(3)),
+            Err(IssuerError::NotPendingAuthority(addr(3))),
+            "only the named account may accept"
+        );
+
+        issuer.accept_authority(&addr(2)).expect("accepts");
+        assert!(issuer.is_authority(&addr(2)));
+        assert!(!issuer.is_authority(&addr(1)));
+        assert_eq!(issuer.pending_authority, None);
+    }
+
+    #[test]
+    fn an_offer_can_be_withdrawn_and_is_never_to_oneself() {
+        let mut issuer = Issuer::new(addr(1));
+        issuer.offer_authority(Some(addr(2))).expect("offers");
+        issuer.offer_authority(None).expect("withdraws");
+        assert_eq!(issuer.pending_authority, None);
+        assert_eq!(
+            issuer.accept_authority(&addr(2)),
+            Err(IssuerError::NotPendingAuthority(addr(2))),
+            "a withdrawn offer cannot be taken up afterwards"
+        );
+
+        // A redundant spelling of doing nothing, refused like every other one.
+        assert_eq!(
+            issuer.offer_authority(Some(addr(1))),
+            Err(IssuerError::AuthorityUnchanged)
+        );
+    }
+
+    #[test]
+    fn an_offer_to_the_sitting_authority_does_not_decode() {
+        // Two spellings of "no offer" would be two state roots for one issuer.
+        let mut bytes = Vec::new();
+        addr(1).encode(&mut bytes);
+        Some(addr(1)).encode(&mut bytes);
+        Vec::<Minter>::new().encode(&mut bytes);
+        None::<Address>.encode(&mut bytes);
+        None::<Amount>.encode(&mut bytes);
+        false.encode(&mut bytes);
+        assert!(decode_exact::<Issuer>(&bytes).is_err());
     }
 
     #[test]

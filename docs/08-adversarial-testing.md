@@ -365,6 +365,67 @@ a counter incremented but never balanced. Canonicality testing cannot see that
 gap, because both sides of it are well-formed. What finds it is writing down
 what a feature is supposed to guarantee and then trying to violate it.
 
+### 17. A vote that could have disarmed the light client
+
+Not found by a fuzzer. Found by reading, while writing
+[ADR-0022](adr/0022-governance.md), and it is the reason that ADR has a section
+on floors rather than a paragraph.
+
+Governance moved six compile-time constants into state, one of which was the
+staking module's `unbonding_ms`. A light client does not read that value. It
+compiles in `TRUSTING_PERIOD_MS`, derived from `UNBONDING_MS` — two thirds of
+21 days — and refuses to verify a header older than that, which is the entire
+long-range defence of [ADR-0010](adr/0010-long-range-attacks.md).
+
+So a council able to set `unbonding_ms` to an hour would not have broken any
+invariant the suite checks. It would have left every phone already in the field
+verifying headers signed by validators whose stake was long since withdrawn and
+unslashable — the exact attack ADR-0010 exists to prevent, arrived at by a
+lawful vote instead of by force, with nothing on the chain looking wrong at any
+point.
+
+The fix is a floor: `ChainParams::validate` refuses any unbonding period below
+the constant clients compile in. Lengthening stays allowed, because that only
+makes a deployed client more conservative than it needs to be. The general rule
+that came out of it is in ADR-0022 §5: **a tunable safety margin that may be
+tuned to zero is a switch that turns the safety property off.**
+
+Two more of the same shape were closed at the same time. `rebind_delay_blocks`
+is the SIM-swap defence, and at zero it is not a defence. The council's own
+jurisdiction cap is a ratchet rather than a floor — it may be tightened and never
+loosened — because a cap the capped party can widen is not a cap.
+
+### 18. A governance suite that would have held for the worst reason
+
+The property suite grew governance invariants: the parameters in force always
+clear their floors, the sitting council always satisfies the cap in force, the
+proposal queue is bounded and canonical, and a scheduled proposal is never
+executable before it was opened.
+
+Every one of them passed on the first run, and every one of them was vacuous.
+
+A voting period and a timelock are measured in thousands of blocks. The money
+runs advance one height per block over forty blocks, so no proposal in any seed
+ever closed its voting period, nothing was ever scheduled, and nothing was ever
+executed. The invariants were checked against a governance module that had never
+done anything.
+
+That is the same failure `assert_every_path_ran` was added to catch on the vikoba
+paths in §16, in a new place. The fix is the same shape: a separate
+`GOV_KINDS` guard insisting `ExecuteGovAction` actually applied, and a run with a
+large height stride so a generated sequence can outlast a voting period. The
+group arithmetic degenerates at that stride — every cycle closes each block —
+which is why it is a second run rather than a wider setting on the first.
+
+Two attempts were needed to satisfy the new guard, both because a threshold needs
+*three different seats to answer the same question inside one voting period* and a
+uniform generator lands three on one about never. The generator now aims at open
+proposals the way it already aims at open group proposals, and the invariants
+still run against whatever the executor actually did.
+
+**An invariant that is never reached always holds.** This is the third time that
+sentence has earned its place in this document.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -417,6 +478,12 @@ Named gaps, so they are not mistaken for coverage:
 - **The mempool is not fuzzed.** Its limits are unit-tested and its insert path
   runs full stateless verification, but nobody has thrown a hostile sequence of
   submissions at it under the scheduler.
+- **Governance is fuzzed for structure, not for capture.** The suite checks that
+  a council cannot vote itself into a shape its own rules refuse and that no
+  proposal moves money. It says nothing about whether the *seated body* is
+  trustworthy — against a genuinely captured two-thirds, the timelock buys notice
+  and nothing else, which [ADR-0022](adr/0022-governance.md) states plainly
+  rather than tests around.
 
 ## Where this goes
 

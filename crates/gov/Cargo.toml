@@ -1,20 +1,18 @@
 [package]
-name = "afrolink-staking"
+name = "afrolink-gov"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Bonding, unbonding and slashing — the economic half of the security argument the light client already assumes."
+description = "On-chain governance: the council, the parameters it may tune, and the timelock every change passes through."
 
 [dependencies]
 afrolink-primitives.workspace = true
 afrolink-crypto.workspace = true
 afrolink-state.workspace = true
-afrolink-bank.workspace = true
-afrolink-consensus.workspace = true
-afrolink-gov.workspace = true
+afrolink-alias.workspace = true
 thiserror.workspace = true
 
 [lints]

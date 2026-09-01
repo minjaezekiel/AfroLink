@@ -94,6 +94,9 @@ pub enum BankError {
     /// No issuer has been registered for this denomination.
     #[error("no issuer registered for {0}")]
     NoIssuer(String),
+    /// A denomination proposed for admission that already has an issuer.
+    #[error("{0} already has a registered issuer")]
+    IssuerExists(String),
     /// The issuer has paused this denomination.
     #[error("issuance of {0} is paused")]
     IssuerPaused(String),
@@ -468,6 +471,46 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         Ok(())
     }
 
+    /// Offer this denomination's authority role to another account, or withdraw
+    /// a standing offer with `None`.
+    ///
+    /// Step one of two. Nothing changes until the named account accepts with
+    /// [`Self::accept_issuer_authority`] — see [`Issuer::pending_authority`] for
+    /// why a one-step handover is how a currency loses its governance forever.
+    ///
+    /// **This is the only way an issuer authority ever changes.** Governance
+    /// cannot do it: the council can admit a currency the chain has never seen,
+    /// and from that moment the currency governs itself.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NotIssuer`], [`BankError::NoIssuer`] or
+    /// [`BankError::Issuer`].
+    pub fn transfer_issuer_authority(
+        &mut self,
+        authority: &Address,
+        denom: &Denom,
+        to: Option<Address>,
+    ) -> Result<()> {
+        let mut issuer = self.require_authority(authority, denom)?;
+        issuer.offer_authority(to)?;
+        self.write_issuer(denom, &issuer);
+        Ok(())
+    }
+
+    /// Take up an offered authority role.
+    ///
+    /// Step two of two, sent by the incoming authority itself. That signature is
+    /// the proof the role is moving to a key somebody actually holds.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NoIssuer`] or [`BankError::Issuer`].
+    pub fn accept_issuer_authority(&mut self, caller: &Address, denom: &Denom) -> Result<()> {
+        let mut issuer = self.require_issuer(denom)?;
+        issuer.accept_authority(caller)?;
+        self.write_issuer(denom, &issuer);
+        Ok(())
+    }
+
     /// Name, or clear, the key permitted to freeze holders.
     ///
     /// # Errors
@@ -621,6 +664,23 @@ impl<'a, S: KeyValueStore> Bank<'a, S> {
         }
         self.store.set_encoded(&StoreKey::issuer(denom), issuer);
         Ok(())
+    }
+
+    /// Admit a denomination the chain has never seen, naming its authority.
+    ///
+    /// The governance path, and it registers only. Re-admitting a denomination
+    /// that already has an issuer is refused, because that would be a way for
+    /// the council to replace a sovereign's authority without the sovereign's
+    /// consent — the one thing the split between the two tracks promises it
+    /// cannot do. See `afrolink_gov::Action::AdmitDenom`.
+    ///
+    /// # Errors
+    /// Returns [`BankError::NativeNotIssuable`] or [`BankError::IssuerExists`].
+    pub fn admit_issuer(&mut self, denom: &Denom, authority: Address) -> Result<()> {
+        if self.issuer(denom)?.is_some() {
+            return Err(BankError::IssuerExists(denom.to_string()));
+        }
+        self.register_issuer(denom, &Issuer::new(authority))
     }
 
     /// Freeze `address` for `denom`, on the authority of its issuer's freezer.

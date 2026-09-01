@@ -37,13 +37,14 @@ pub mod genesis;
 pub use block::{
     Block, BlockContext, BlockHeader, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSACTIONS, ValidatorSets,
 };
-pub use genesis::{Allocation, Genesis, GenesisError, GenesisLimits};
+pub use genesis::{Allocation, ChainParams, Council, Genesis, GenesisError, GenesisLimits};
 
 use afrolink_alias::{BindError, Bindings, Registry, RegistryError};
 use afrolink_bank::{Bank, BankError};
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::{Domain, Hash32};
 use afrolink_crypto::merkle::MerkleTree;
+use afrolink_gov::{Action, GovError, GovView, Governance};
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 use afrolink_primitives::{Amount, ChainId, Height, Timestamp};
 use afrolink_staking::{Staking, StakingError};
@@ -144,6 +145,9 @@ pub enum ExecError {
     /// A contact binding operation failed.
     #[error(transparent)]
     Bind(#[from] BindError),
+    /// A governance operation failed.
+    #[error(transparent)]
+    Gov(#[from] GovError),
     /// Corrupt state.
     #[error(transparent)]
     State(#[from] StateError),
@@ -181,6 +185,8 @@ pub enum ResultCode {
     Registry,
     /// A contact binding refused.
     Binding,
+    /// Governance refused: no seat, no proposal, a closed vote, a live timelock.
+    Governance,
     /// State was corrupt. Never a client's fault.
     State,
     /// The recipient requires a payment reference and none was carried.
@@ -213,6 +219,7 @@ impl ResultCode {
             Self::State => 9,
             Self::Reference => 10,
             Self::Authorisation => 11,
+            Self::Governance => 12,
         }
     }
 
@@ -232,6 +239,7 @@ impl ResultCode {
             9 => Self::State,
             10 => Self::Reference,
             11 => Self::Authorisation,
+            12 => Self::Governance,
             _ => return None,
         })
     }
@@ -264,6 +272,7 @@ impl From<&ExecError> for ResultCode {
             | ExecError::RegularKeyIsMasterKey => Self::Authorisation,
             ExecError::Registry(_) => Self::Registry,
             ExecError::Bind(_) => Self::Binding,
+            ExecError::Gov(_) => Self::Governance,
             ExecError::State(_) => Self::State,
         }
     }
@@ -1098,6 +1107,41 @@ impl Executor {
                 Ok(())
             }
 
+            // -- The sovereign handover (ADR-0022) ---------------------------
+            //
+            // No vote anywhere. A currency's authority is passed by its current
+            // holder to a successor who has to accept, and governance cannot
+            // reach either half.
+            Message::TransferIssuerAuthority { denom, to } => {
+                Bank::new(store).transfer_issuer_authority(&sender, denom, *to)?;
+                if let Some(to) = to {
+                    ensure_account(store, to);
+                }
+                Ok(())
+            }
+
+            Message::AcceptIssuerAuthority { denom } => {
+                Bank::new(store).accept_issuer_authority(&sender, denom)?;
+                Ok(())
+            }
+
+            // -- Governance (ADR-0022) ---------------------------------------
+            Message::ProposeGovAction { action } => {
+                Governance::new(store).propose(&sender, action.as_ref().clone(), ctx.height)?;
+                Ok(())
+            }
+
+            Message::VoteGovAction { proposal } => {
+                Governance::new(store).vote(&sender, *proposal, ctx.height)?;
+                Ok(())
+            }
+
+            Message::ExecuteGovAction { proposal } => {
+                // Permissionless: the vote is taken and the timelock has run.
+                let action = Governance::new(store).execute(*proposal, ctx.height)?;
+                apply_gov_action(store, &action)
+            }
+
             // -- Human-readable addressing (ADR-0008) ------------------------
             //
             // Every arm below is a registry write. None of them move value, and
@@ -1138,7 +1182,10 @@ impl Executor {
                 commitment,
                 new_address,
             } => {
-                Bindings::new(store).request_rebind(
+                // The delay is a governed parameter with a floor under it, not a
+                // constant: see `afrolink_gov::params`.
+                let delay = params_of(store)?.rebind_delay_blocks;
+                Bindings::with_delay(store, delay).request_rebind(
                     commitment,
                     *new_address,
                     sender,
@@ -1189,12 +1236,12 @@ impl Executor {
                 country,
                 amount,
             } => {
-                Staking::new(store).bond(&sender, *public_key, *country, *amount)?;
+                staking(store)?.bond(&sender, *public_key, *country, *amount)?;
                 Ok(())
             }
 
             Message::AddStake { amount } => {
-                Staking::new(store).add_stake(&sender, *amount)?;
+                staking(store)?.add_stake(&sender, *amount)?;
                 Ok(())
             }
 
@@ -1202,12 +1249,12 @@ impl Executor {
                 // Both parts of the context matter here: the height is what a
                 // later slash measures the entry against, and the time is what
                 // decides when it may be withdrawn.
-                Staking::new(store).unbond(&sender, *amount, ctx.height, ctx.time)?;
+                staking(store)?.unbond(&sender, *amount, ctx.height, ctx.time)?;
                 Ok(())
             }
 
             Message::WithdrawUnbonded => {
-                Staking::new(store).withdraw(&sender, ctx.time)?;
+                staking(store)?.withdraw(&sender, ctx.time)?;
                 Ok(())
             }
 
@@ -1217,11 +1264,59 @@ impl Executor {
                 // by lying and no privileged reporter to capture. The reporter
                 // is not paid — see `Bank::slash_native` for why nobody should
                 // profit from a slash.
-                let set = Staking::new(store).active_set()?;
-                Staking::new(store).slash_equivocation(evidence, &set, ctx.height)?;
+                let set = staking(store)?.active_set()?;
+                staking(store)?.slash_equivocation(evidence, &set, ctx.height)?;
                 Ok(())
             }
         }
+    }
+}
+
+/// The governance parameters in force.
+fn params_of<S: KeyValueStore>(store: &S) -> Result<afrolink_gov::ChainParams, ExecError> {
+    Ok(GovView::new(store).params()?)
+}
+
+/// Open the staking module with the parameters governance has set.
+///
+/// Every staking path goes through here rather than through `Staking::new`. A
+/// parameter written to state and read by nothing is the same defect as code
+/// reachable from no transaction — see
+/// [ADR-0021](../../../docs/adr/0021-licensing-attestors.md) — and the whole
+/// point of moving these numbers out of `const` was that a vote should change
+/// what the chain does.
+fn staking<S: KeyValueStore>(store: &mut S) -> Result<Staking<'_, S>, ExecError> {
+    let params = params_of(store)?.staking;
+    Ok(Staking::with_params(store, params))
+}
+
+/// Carry out a decision the council has taken.
+///
+/// The one place a governance action becomes a state change, and an exhaustive
+/// match so a new [`Action`] variant cannot be added without someone deciding
+/// what it does. `Cancel` never arrives here: a withdrawal is applied the moment
+/// it passes, so it is never scheduled and never executed.
+fn apply_gov_action<S: KeyValueStore>(store: &mut S, action: &Action) -> Result<(), ExecError> {
+    match action {
+        Action::SetCouncil(council) => Ok(Governance::new(store).set_council(council)?),
+        Action::SetParams(params) => Ok(Governance::new(store).set_params(params)?),
+        Action::LicenseAttestor { address, attestor } => {
+            Bindings::new(store).register_attestor(address, attestor);
+            ensure_account(store, address);
+            Ok(())
+        }
+        Action::SetAttestorActive { address, active } => {
+            Bindings::new(store).set_attestor_active(address, *active)?;
+            Ok(())
+        }
+        Action::AdmitDenom { denom, authority } => {
+            Bank::new(store).admit_issuer(denom, *authority)?;
+            ensure_account(store, authority);
+            Ok(())
+        }
+        // Unreachable by construction: `Governance::vote` applies a withdrawal
+        // at once and removes the proposal, so nothing is left to execute.
+        Action::Cancel { proposal } => Err(ExecError::Gov(GovError::NotScheduled(*proposal))),
     }
 }
 

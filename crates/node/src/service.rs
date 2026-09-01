@@ -120,6 +120,8 @@ mod tests {
             // never again, which is what `NativeNotIssuable` enforces.
             issuers: Vec::new(),
             attestors: Vec::new(),
+            council: afrolink_executor::Council::devnet(account(50)),
+            params: afrolink_executor::ChainParams::devnet(),
             allocations: vec![Allocation {
                 address: account(50),
                 denom: Denom::native(),

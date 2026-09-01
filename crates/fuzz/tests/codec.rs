@@ -40,6 +40,10 @@ fn key(seed: u8) -> SecretKey {
     SecretKey::from_bytes(&[seed; 32])
 }
 
+fn country(code: &str) -> CountryCode {
+    CountryCode::new(code).expect("valid country")
+}
+
 fn addr(seed: u8) -> Address {
     Address::from_public_key(&key(seed).public_key())
 }
@@ -85,6 +89,8 @@ fn genesis_block() -> (MemoryStore, Block) {
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(addr(100)))],
         attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(addr(1)),
+        params: afrolink_executor::ChainParams::devnet(),
         allocations: vec![Allocation {
             address: addr(50),
             denom: kes(),
@@ -244,6 +250,20 @@ fn every_message_variant_stays_canonical_under_attack() {
             flag: AccountFlag::RequireReference,
             enabled: true,
         },
+        // The governance messages. `ProposeGovAction` is the largest thing a
+        // stranger can put in front of a decoder here: it carries a whole
+        // council, and a council that decodes two ways is a state root that
+        // decodes two ways.
+        Message::ProposeGovAction {
+            action: Box::new(afrolink_gov::Action::Cancel { proposal: 3 }),
+        },
+        Message::VoteGovAction { proposal: 3 },
+        Message::ExecuteGovAction { proposal: 3 },
+        Message::TransferIssuerAuthority {
+            denom: kes(),
+            to: Some(addr(101)),
+        },
+        Message::AcceptIssuerAuthority { denom: kes() },
     ];
     for (i, m) in variants.iter().enumerate() {
         hammer::<Message>(&format!("Message[{i}]"), m, ROUNDS);
@@ -464,6 +484,87 @@ fn witness_decoders_stay_canonical_under_attack() {
 }
 
 #[test]
+fn governance_decoders_stay_canonical_under_attack() {
+    // A council and a set of parameters are hashed into the state root, so a
+    // value with two encodings is two roots for one chain. `Council::decode`
+    // re-runs its own validation for that reason: seats out of order, or one
+    // account seated twice, are refused rather than sorted — sorting a repeat
+    // away would silently pick which weight an account votes with.
+    let mut seats = vec![
+        afrolink_gov::Seat::new(addr(1), 10, country("ke")),
+        afrolink_gov::Seat::new(addr(2), 10, country("ng")),
+        afrolink_gov::Seat::new(addr(3), 10, country("za")),
+        afrolink_gov::Seat::new(addr(4), 10, country("gh")),
+    ];
+    seats.sort_by_key(|seat| seat.holder);
+    let council = afrolink_gov::Council::new(seats, afrolink_gov::MIN_COUNCIL_THRESHOLD_BPS)
+        .expect("valid council");
+
+    hammer::<afrolink_gov::Council>("Council", &council, ROUNDS);
+    hammer::<afrolink_gov::ChainParams>(
+        "ChainParams",
+        &afrolink_gov::ChainParams::default(),
+        ROUNDS,
+    );
+
+    for (label, action) in [
+        (
+            "Action::SetCouncil",
+            afrolink_gov::Action::SetCouncil(council.clone()),
+        ),
+        (
+            "Action::SetParams",
+            afrolink_gov::Action::SetParams(afrolink_gov::ChainParams::default()),
+        ),
+        (
+            "Action::LicenseAttestor",
+            afrolink_gov::Action::LicenseAttestor {
+                address: addr(20),
+                attestor: afrolink_alias::contact::Attestor {
+                    country: country("ke"),
+                    name: "Safaricom".to_owned(),
+                    active: true,
+                },
+            },
+        ),
+        (
+            "Action::AdmitDenom",
+            afrolink_gov::Action::AdmitDenom {
+                denom: kes(),
+                authority: addr(100),
+            },
+        ),
+        (
+            "Action::Cancel",
+            afrolink_gov::Action::Cancel { proposal: 7 },
+        ),
+    ] {
+        hammer::<afrolink_gov::Action>(label, &action, ROUNDS);
+    }
+
+    // A proposal carries the tally, so its vote list is refused rather than
+    // sorted for the same reason an issuer's minter list is: a repeat would let
+    // one seat count twice toward a threshold.
+    hammer::<afrolink_gov::Proposal>(
+        "Proposal",
+        &afrolink_gov::Proposal {
+            id: 3,
+            proposer: addr(1),
+            action: afrolink_gov::Action::Cancel { proposal: 2 },
+            opened: Height(10),
+            voting_ends: Height(3_610),
+            votes: {
+                let mut votes = vec![addr(1), addr(2)];
+                votes.sort_unstable();
+                votes
+            },
+            scheduled_for: Some(Height(7_210)),
+        },
+        ROUNDS,
+    );
+}
+
+#[test]
 fn a_genesis_file_stays_canonical_under_attack() {
     // Genesis is the one input every node ingests before it can check anything
     // against a chain, so a decoder bug here is a bug nothing else catches.
@@ -486,6 +587,8 @@ fn a_genesis_file_stays_canonical_under_attack() {
             validators: validators(),
             issuers: vec![(kes(), Issuer::new(addr(100)))],
             attestors: Vec::new(),
+            council: afrolink_executor::Council::devnet(addr(1)),
+            params: afrolink_executor::ChainParams::devnet(),
             allocations: vec![Allocation {
                 address: addr(50),
                 denom: kes(),

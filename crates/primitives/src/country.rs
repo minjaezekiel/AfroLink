@@ -26,6 +26,14 @@ use crate::error::{Error, Result};
 pub struct CountryCode([u8; 2]);
 
 impl CountryCode {
+    /// The ISO 3166-1 user-assigned code `zz`, meaning "no real jurisdiction".
+    ///
+    /// The standard reserves `aa`, `qm`–`qz`, `xa`–`xz` and `zz` for private
+    /// use precisely so that a system needing a placeholder does not invent one
+    /// that collides with a country later. Used for a local devnet, where the
+    /// single operator is not standing in for anywhere.
+    pub const UNSPECIFIED: Self = Self(*b"zz");
+
     /// Validate and wrap a two-letter code.
     ///
     /// # Errors

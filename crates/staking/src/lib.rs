@@ -105,41 +105,13 @@ pub fn staking_account() -> Address {
 }
 
 /// Tunable limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StakingParams {
-    /// Smallest bond that may join the active set.
-    pub min_bond: Amount,
-    /// Largest active set.
-    pub max_validators: usize,
-    /// Ceiling on one validator's share of voting power, in basis points.
-    pub max_single_share_bps: u32,
-    /// Largest number of operators that may hold a bond at once.
-    pub max_candidates: usize,
-    /// Largest number of queued unbonding entries per operator.
-    pub max_unbonding_entries: usize,
-    /// How long stake stays slashable after unbonding begins.
-    pub unbonding_ms: u64,
-}
-
-impl Default for StakingParams {
-    /// Mainnet limits, matching [ADR-0002](../../../docs/adr/0002-consensus.md)
-    /// and [ADR-0007](../../../docs/adr/0007-distribution-and-sybil-resistance.md).
-    fn default() -> Self {
-        Self {
-            min_bond: Amount::from_afri(10_000),
-            max_validators: 100,
-            max_single_share_bps: 1_000,
-            // A cap is needed because the candidate list is a single state value
-            // rather than a scan. `min_bond` is what makes filling it expensive:
-            // squatting every slot costs `max_candidates * min_bond`.
-            max_candidates: 1_000,
-            // Bounds the work a slash has to do, and stops an operator making
-            // their own queue too expensive to process.
-            max_unbonding_entries: 16,
-            unbonding_ms: UNBONDING_MS,
-        }
-    }
-}
+///
+/// Defined in `crates/gov` and re-exported here. It moved when governance
+/// arrived: a number the network votes on is a value shared between modules,
+/// not a private detail of the one module that reads it — the same move
+/// [`CountryCode`](afrolink_primitives::CountryCode) made when a second user
+/// appeared. Every existing import keeps working.
+pub use afrolink_gov::StakingParams;
 
 /// Why a staking operation failed.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

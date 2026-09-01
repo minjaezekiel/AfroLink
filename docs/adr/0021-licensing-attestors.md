@@ -103,6 +103,11 @@ added, or revoked.** An issuer authority whose key is lost stays lost. An
 attestor whose licence is withdrawn by its regulator stays licensed on-chain.
 That is a governance decision the project has not yet made.
 
+> **Closed by [ADR-0022](0022-governance.md).** A seated council licenses and
+> suspends attestors behind a timelock, and `Attestor::active` finally has a
+> writer. The messages named as missing above are `Action::LicenseAttestor` and
+> `Action::SetAttestorActive`.
+
 ## Consequences
 
 **Good.** The whole of [ADR-0008](0008-human-readable-addressing.md)'s contact
@@ -121,9 +126,10 @@ attestor's pepper.
 
 **Bad, and worth being clear about.**
 
-- **Attestors cannot be added, suspended or replaced after genesis.** The
-  governance gap above. Until it is closed, a network's attestor set is whatever
-  its founders wrote down.
+- ~~**Attestors cannot be added, suspended or replaced after genesis.**~~ The
+  governance gap above, **closed by [ADR-0022](0022-governance.md)**. What
+  remains true is the sentence after it: a network's *founding* attestor set is
+  whatever its founders wrote down.
 - **A licensed attestor is trusted completely within its scope.** It can bind any
   commitment to any address, and request a rebind of any binding it made. The
   defences against that are the veto window and the fact that an alias never
@@ -138,8 +144,8 @@ attestor's pepper.
 
 ## Revisit if
 
-- Governance arrives, at which point `RegisterAttestor` and `SuspendAttestor`
-  become writable and `Attestor::active` starts earning its keep
+- ~~Governance arrives~~ — it has ([ADR-0022](0022-governance.md)), and
+  `Attestor::active` now earns its keep
 - A regulator requires that a withdrawn licence take effect within a fixed
   window, which would make on-chain suspension urgent rather than merely correct
 

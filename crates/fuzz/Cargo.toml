@@ -24,6 +24,7 @@ afrolink-alias.workspace = true
 afrolink-pay.workspace = true
 afrolink-witness.workspace = true
 afrolink-staking.workspace = true
+afrolink-gov.workspace = true
 # The query protocol is what a hostile client actually sends.
 afrolink-rpc.workspace = true
 # The HTTP parser is the first thing an anonymous peer reaches, before any

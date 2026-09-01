@@ -213,6 +213,8 @@ mod tests {
                     active: true,
                 },
             )],
+            council: afrolink_executor::Council::devnet(addr(1)),
+            params: afrolink_executor::ChainParams::devnet(),
             allocations: vec![Allocation {
                 address: addr(50),
                 denom: kes(),

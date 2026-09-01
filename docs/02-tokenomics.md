@@ -125,7 +125,13 @@ An honest statement of why AFRI should be worth anything:
    block.
 2. **Fee burn.** 30% of every fee is destroyed; usage reduces supply.
 3. **Governance.** Control over stablecoin issuer admission, reward splits, and
-   basket weights is a genuinely valuable right.
+   basket weights is a genuinely valuable right — but **it is not an AFRI right
+   today, and this document should not have implied it was**. Those decisions
+   belong to a seated council ([ADR-0022](adr/0022-governance.md)), because a
+   token vote at launch, when the founders hold nearly everything, is a vote
+   whose result is known in advance. Opening the network track to a
+   stake-weighted vote is on the roadmap and is the moment this claim starts
+   being true. Until then, AFRI's value rests on the two items above.
 
 And what should *not* be claimed: AFRI is not backed by anything, it is not a
 claim on the foundation, and its price will be volatile. The stable instruments

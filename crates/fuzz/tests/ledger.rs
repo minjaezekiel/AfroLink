@@ -61,6 +61,10 @@ use afrolink_crypto::hash::Domain;
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{BlockContext, Executor, fee_collector_address};
 use afrolink_fuzz::Rng;
+use afrolink_gov::params::{
+    MIN_REBIND_DELAY_BLOCKS, MIN_TIMELOCK_BLOCKS, MIN_VOTING_PERIOD_BLOCKS,
+};
+use afrolink_gov::{Action, ChainParams, Council, GovView, Governance, MAX_OPEN_PROPOSALS, Seat};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
 use afrolink_types::group::{
@@ -74,6 +78,9 @@ const ACTORS: u8 = 6;
 const OUTSIDERS: u8 = 4;
 /// Group addresses per actor kept in the universe from the start.
 const GROUP_SLOTS: u64 = 3;
+/// Council seats, one per jurisdiction. Three of the four pass a proposal.
+const COUNCIL: [u8; 4] = [0, 1, 2, 3];
+const COUNCIL_COUNTRIES: [&str; 4] = ["ke", "ng", "za", "gh"];
 
 fn sk(seed: u8) -> SecretKey {
     SecretKey::from_bytes(&[seed; 32])
@@ -138,9 +145,44 @@ fn denoms() -> &'static [Denom; 2] {
     &DENOMS
 }
 
+/// The founding council: four actors, one jurisdiction each.
+///
+/// Deliberately overlapping with the issuer roles — actor(0) is both a seat and
+/// the currency's authority — because that is the interesting case. A seat that
+/// also governs a currency must not be able to use the council to reach it.
+fn council() -> Council {
+    let mut seats: Vec<Seat> = COUNCIL
+        .iter()
+        .zip(COUNCIL_COUNTRIES)
+        .map(|(who, country)| {
+            Seat::new(
+                actor(*who),
+                10,
+                afrolink_primitives::CountryCode::new(country).unwrap(),
+            )
+        })
+        .collect();
+    seats.sort_by_key(|seat| seat.holder);
+    Council::new(seats, afrolink_gov::MIN_COUNCIL_THRESHOLD_BPS).unwrap()
+}
+
+/// Parameters at their floors, so a generated run can actually reach the end of
+/// a voting period and a timelock.
+fn opening_params() -> ChainParams {
+    ChainParams {
+        voting_period_blocks: MIN_VOTING_PERIOD_BLOCKS,
+        timelock_blocks: MIN_TIMELOCK_BLOCKS,
+        rebind_delay_blocks: MIN_REBIND_DELAY_BLOCKS,
+        ..ChainParams::default()
+    }
+}
+
 /// Genesis: every actor funded in both denominations.
 fn opening_state() -> MemoryStore {
     let mut store = MemoryStore::new();
+    Governance::new(&mut store)
+        .install(&council(), &opening_params())
+        .unwrap();
     let mut bank = Bank::new(&mut store);
     // actor(0) governs and never issues; actor(1) holds the hot key. The split
     // is the point of ADR-0020, so the generator has to live with it.
@@ -399,6 +441,85 @@ fn check_invariants(
             }
         }
     }
+
+    check_governance_invariants(seed, height, store);
+}
+
+/// What must be true of the governance module after any block.
+///
+/// Governance is the one module that can change the rules the other invariants
+/// are checked against, so it needs its own: a body that has voted itself into a
+/// shape its own rules refuse, or a parameter that has drifted under a floor, is
+/// a chain whose other guarantees have quietly stopped meaning anything.
+fn check_governance_invariants(seed: u64, height: u64, store: &MemoryStore) {
+    let gov = GovView::new(store);
+
+    // 1. The parameters in force always clear every floor. If they ever did not,
+    //    a vote would have disarmed something the chain depends on — the
+    //    unbonding period a light client compiles in, or the delay that is the
+    //    whole SIM-swap defence.
+    let params = gov.params().expect("parameters decode");
+    assert_eq!(
+        params.validate(),
+        Ok(()),
+        "seed {seed} height {height}: the parameters in force break their own floors"
+    );
+
+    // 2. The seated council always satisfies the concentration cap in force. Not
+    //    merely the cap it was seated under: a vote can tighten the cap, and a
+    //    vote that tightens it past the sitting body would leave the chain
+    //    governed by a council its own rules reject.
+    let council = gov.council().expect("council decodes").expect("seated");
+    assert_eq!(
+        council.check_concentration(params.max_council_country_share_bps),
+        Ok(()),
+        "seed {seed} height {height}: the sitting council breaches the cap in force"
+    );
+
+    // 3. The proposal queue is bounded, canonical, and every id in it points at
+    //    a record. An id with nothing behind it holds a slot forever.
+    let open = gov.open_proposals().expect("queue decodes");
+    assert!(
+        open.len() <= MAX_OPEN_PROPOSALS,
+        "seed {seed} height {height}: {} proposals open, cap is {MAX_OPEN_PROPOSALS}",
+        open.len()
+    );
+    assert!(
+        open.windows(2).all(|w| w[0] < w[1]),
+        "seed {seed} height {height}: the proposal queue is out of order or repeats an id"
+    );
+
+    for id in open {
+        let proposal = gov
+            .proposal(id)
+            .expect("proposal decodes")
+            .unwrap_or_else(|| panic!("seed {seed} height {height}: queued proposal {id} is gone"));
+        assert_eq!(proposal.id, id);
+        assert!(
+            proposal.votes.windows(2).all(|w| w[0] < w[1]),
+            "seed {seed} height {height}: proposal {id} counts a seat twice"
+        );
+        assert!(
+            proposal.votes.iter().all(|seat| council.is_seated(seat)),
+            "seed {seed} height {height}: a stranger's vote sits on proposal {id}"
+        );
+        // 4. A scheduled proposal is scheduled *after* the vote that passed it,
+        //    by at least the timelock. A decision that could be executed the
+        //    moment it passed would have no notice period at all, which is the
+        //    entire reason a timelock exists.
+        if let Some(at) = proposal.scheduled_for {
+            assert!(
+                at > proposal.opened,
+                "seed {seed} height {height}: proposal {id} is executable before it was opened"
+            );
+        }
+        // 5. Nothing that bypasses the timelock is ever left sitting in the
+        //    queue: a withdrawal is applied the moment it passes.
+        assert!(
+            !(proposal.action.bypasses_timelock() && proposal.scheduled_for.is_some()),
+            "seed {seed} height {height}: a withdrawal was scheduled instead of applied"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +560,21 @@ struct World {
     /// ask. Waiting for a uniform generator to walk that by chance is waiting
     /// for a suite whose most consequential arithmetic is never run.
     sharable: Vec<Address>,
+    /// Proposals open for votes.
+    ///
+    /// Aimed at for the same reason a group's quorum is: three of four seats
+    /// have to answer *the same* question before its voting period ends, and a
+    /// generator emitting proposal ids at random never lands three on one.
+    votable: Vec<u64>,
+    /// Proposals that have passed and whose timelock has run.
+    executable: Vec<u64>,
+    /// Proposals that have passed and are still inside their timelock.
+    ///
+    /// The only thing a withdrawal can name, and the state the "cannot execute
+    /// early" invariant is about.
+    withdrawable: Vec<u64>,
+    /// Whether the currency has a standing offer of its authority.
+    offered_authority: Option<Address>,
 }
 
 impl World {
@@ -451,6 +587,10 @@ impl World {
             debts: Vec::new(),
             closable: Vec::new(),
             sharable: Vec::new(),
+            votable: Vec::new(),
+            executable: Vec::new(),
+            withdrawable: Vec::new(),
+            offered_authority: None,
         }
     }
 
@@ -461,6 +601,27 @@ impl World {
         self.debts.clear();
         self.closable.clear();
         self.sharable.clear();
+        self.votable.clear();
+        self.executable.clear();
+        self.withdrawable.clear();
+
+        let gov = GovView::new(store);
+        for id in gov.open_proposals().unwrap_or_default() {
+            let Ok(Some(proposal)) = gov.proposal(id) else {
+                continue;
+            };
+            match proposal.scheduled_for {
+                None if Height(next_height) <= proposal.voting_ends => self.votable.push(id),
+                Some(at) if Height(next_height) >= at => self.executable.push(id),
+                Some(_) => self.withdrawable.push(id),
+                None => {}
+            }
+        }
+        self.offered_authority = afrolink_bank::BankView::new(store)
+            .issuer(&kes())
+            .ok()
+            .flatten()
+            .and_then(|issuer| issuer.pending_authority);
         for address in &self.groups {
             let Some(bytes) = store.get(&StoreKey::account(address)) else {
                 continue;
@@ -543,6 +704,26 @@ impl World {
                 },
             };
         }
+        // Governance, aimed for the same reason the quorum paths are: a
+        // proposal needs three of four seats inside one voting period, and a
+        // decision needs somebody to come back after the timelock. Both are
+        // sequences a uniform generator walks past.
+        if !self.votable.is_empty() && rng.below(3) != 0 {
+            return Message::VoteGovAction {
+                proposal: self.votable[rng.below(self.votable.len())],
+            };
+        }
+        if !self.executable.is_empty() && rng.below(2) == 0 {
+            return Message::ExecuteGovAction {
+                proposal: self.executable[rng.below(self.executable.len())],
+            };
+        }
+        if self.offered_authority.is_some() && rng.below(2) == 0 {
+            // Sent by whoever the generator picked, not by the offeree: the
+            // acceptance must be refused for everyone but the named account,
+            // and that refusal is the property worth generating.
+            return Message::AcceptIssuerAuthority { denom: kes() };
+        }
         if !self.sharable.is_empty() && rng.below(2) == 0 {
             return Message::ShareOut {
                 group: self.sharable[rng.below(self.sharable.len())],
@@ -573,7 +754,7 @@ impl World {
                 },
             };
         }
-        match rng.below(23) {
+        match rng.below(25) {
             0..=3 => Message::Transfer {
                 to: self.destination(rng),
                 denom: if rng.below(4) == 0 {
@@ -776,12 +957,77 @@ impl World {
                 }
             }
 
+            // -- Governance. The council can license attestors, admit
+            //    currencies and tune parameters; it can move no money at all,
+            //    and the invariants are what say so.
+            23 => Message::ProposeGovAction {
+                action: Box::new(self.action(rng)),
+            },
+            24 => Message::TransferIssuerAuthority {
+                denom: kes(),
+                // Usually a real offer, sometimes a withdrawal of one.
+                to: if rng.below(4) == 0 {
+                    None
+                } else {
+                    Some(actor(u8::try_from(rng.below(ACTORS as usize)).unwrap()))
+                },
+            },
+
             _ => Message::Transfer {
                 to: self.destination(rng),
                 denom: kes(),
                 amount: Amount::from_units(u128::from(rng.next_u64() % 5_000) + 1),
                 reference: None,
             },
+        }
+    }
+
+    /// A decision to put to the council.
+    ///
+    /// Every variant of [`Action`] is generated, including ones that must be
+    /// refused when the proposal is opened: a suspended licence, a currency that
+    /// already has an authority, a cap looser than the one in force.
+    fn action(&self, rng: &mut Rng) -> Action {
+        match rng.below(6) {
+            0 => Action::LicenseAttestor {
+                address: outsider(u8::try_from(rng.below(OUTSIDERS as usize)).unwrap()),
+                attestor: afrolink_alias::contact::Attestor {
+                    country: afrolink_primitives::CountryCode::new("ke").unwrap(),
+                    name: "an mno".to_owned(),
+                    // Sometimes suspended, which must be refused: a registry row
+                    // nothing could ever turn on.
+                    active: rng.below(4) != 0,
+                },
+            },
+            1 => Action::SetAttestorActive {
+                address: outsider(u8::try_from(rng.below(OUTSIDERS as usize)).unwrap()),
+                active: rng.below(2) == 0,
+            },
+            2 => Action::AdmitDenom {
+                // Half the time the currency this world already has, which must
+                // be refused: re-admission would be a way for the council to
+                // take a currency from its sovereign.
+                denom: if rng.below(2) == 0 {
+                    kes()
+                } else {
+                    Denom::sovereign("ng", "ngn").unwrap()
+                },
+                authority: actor(u8::try_from(rng.below(ACTORS as usize)).unwrap()),
+            },
+            3 => Action::SetParams(ChainParams {
+                // Above the floor, so this is a change the chain accepts, and
+                // one whose effect is visible in the next rebinding scheduled.
+                rebind_delay_blocks: MIN_REBIND_DELAY_BLOCKS + u64::from(rng.byte()) * 100,
+                // Sometimes tighter than the sitting council can survive, which
+                // must be refused rather than leave the chain governed by a body
+                // its own rules reject.
+                max_council_country_share_bps: 1_000 + u32::from(rng.byte()) * 6,
+                ..opening_params()
+            }),
+            4 if !self.withdrawable.is_empty() => Action::Cancel {
+                proposal: self.withdrawable[rng.below(self.withdrawable.len())],
+            },
+            _ => Action::SetCouncil(council()),
         }
     }
 
@@ -849,6 +1095,12 @@ struct Coverage {
     /// can drift away from a path that long without any invariant noticing,
     /// because an invariant that is never reached always holds.
     tracked: [u64; TRACKED_KINDS.len()],
+    /// Applied messages on the governance paths — see [`GOV_KINDS`].
+    ///
+    /// Counted separately because they are reachable on a different timescale:
+    /// a voting period and a timelock are measured in thousands of blocks, so
+    /// only the governance run insists on them.
+    gov: [u64; GOV_KINDS.len()],
 }
 
 /// Messages this suite refuses to pass without having actually executed.
@@ -871,6 +1123,28 @@ const TRACKED_KINDS: [&str; 12] = [
     "SetSupplyCap",
     "SetFrozen",
 ];
+
+/// Governance messages the governance run refuses to pass without.
+///
+/// `ExecuteGovAction` is the one that matters: everything before it is a
+/// decision nobody has acted on, and a suite that never executes one has never
+/// run the code that turns a vote into a state change.
+const GOV_KINDS: [&str; 4] = [
+    "ProposeGovAction",
+    "VoteGovAction",
+    "ExecuteGovAction",
+    "TransferIssuerAuthority",
+];
+
+fn gov_slot(message: &Message) -> Option<usize> {
+    Some(match message {
+        Message::ProposeGovAction { .. } => 0,
+        Message::VoteGovAction { .. } => 1,
+        Message::ExecuteGovAction { .. } => 2,
+        Message::TransferIssuerAuthority { .. } => 3,
+        _ => return None,
+    })
+}
 
 fn tracked_slot(message: &Message) -> Option<usize> {
     Some(match message {
@@ -907,6 +1181,9 @@ impl Coverage {
             for message in &tx.body.messages {
                 if let Some(slot) = tracked_slot(message) {
                     self.tracked[slot] = self.tracked[slot].saturating_add(1);
+                }
+                if let Some(slot) = gov_slot(message) {
+                    self.gov[slot] = self.gov[slot].saturating_add(1);
                 }
             }
         }
@@ -961,16 +1238,39 @@ impl Coverage {
             );
         }
     }
+
+    /// The same guard for the governance family.
+    fn assert_governance_ran(&self) {
+        for (kind, count) in GOV_KINDS.iter().zip(self.gov) {
+            assert!(
+                count > 0,
+                "no {kind} ever applied: the governance invariants are vacuous ({:?})",
+                self.gov
+            );
+        }
+    }
 }
 
 /// Run one seeded chain, checking every invariant after every block.
-fn run(seed: u64, blocks: u64, coverage: &mut Coverage) -> afrolink_crypto::hash::Hash32 {
+///
+/// `stride` is how many heights a block advances. It is 1 for the money runs,
+/// where a group's cycle is three blocks long and anything larger would close
+/// every cycle instantly. The governance run uses a large stride instead,
+/// because a voting period and a timelock are thousands of blocks and a chain
+/// that never reaches the end of one never executes a decision.
+fn run_with_stride(
+    seed: u64,
+    blocks: u64,
+    stride: u64,
+    coverage: &mut Coverage,
+) -> afrolink_crypto::hash::Hash32 {
     let mut rng = Rng::new(seed);
     let mut store = opening_state();
     let mut world = World::new();
     let exec = Executor::new(chain());
 
-    for height in 1..=blocks {
+    for block in 1..=blocks {
+        let height = block * stride;
         let count = 1 + rng.below(4);
         let transactions: Vec<Transaction> =
             (0..count).map(|_| world.transaction(&mut rng)).collect();
@@ -1001,10 +1301,15 @@ fn run(seed: u64, blocks: u64, coverage: &mut Coverage) -> afrolink_crypto::hash
                 }
             }
         }
-        world.refresh(&store, height + 1);
+        world.refresh(&store, height + stride);
         coverage.record(&outcome, &transactions);
     }
     store.root()
+}
+
+/// The money runs: one height per block.
+fn run(seed: u64, blocks: u64, coverage: &mut Coverage) -> afrolink_crypto::hash::Hash32 {
+    run_with_stride(seed, blocks, 1, coverage)
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1339,25 @@ fn a_sequence_that_broke_once_stays_fixed() {
         run(seed, 60, &mut coverage);
     }
     coverage.assert_not_degenerate();
+}
+
+#[test]
+fn the_governance_machine_holds_together_across_voting_periods() {
+    // The same generator and the same invariants, run on governance's clock. At
+    // one height per block a voting period never closes and a timelock never
+    // runs, so nothing is ever executed and every governance invariant holds
+    // vacuously — which is exactly the failure `assert_every_path_ran` was added
+    // to catch on the money paths.
+    //
+    // The group arithmetic degenerates at this stride (every cycle closes each
+    // block), which is why this is a separate run with its own guard rather than
+    // a wider setting on the one above.
+    let mut coverage = Coverage::default();
+    for seed in 0..12u64 {
+        run_with_stride(seed, 60, MIN_VOTING_PERIOD_BLOCKS / 8, &mut coverage);
+    }
+    coverage.assert_not_degenerate();
+    coverage.assert_governance_ran();
 }
 
 #[test]

@@ -101,6 +101,8 @@ fn genesis_with(attestors: Vec<(Address, Attestor)>) -> Genesis {
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(addr(100)))],
         attestors,
+        council: afrolink_executor::Council::devnet(addr(1)),
+        params: afrolink_executor::ChainParams::devnet(),
         allocations: [MNO, OWNER, ATTACKER, NEW_PHONE, 3]
             .iter()
             .map(|w| Allocation {

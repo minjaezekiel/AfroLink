@@ -17,6 +17,7 @@ afrolink-bank.workspace = true
 afrolink-alias.workspace = true
 afrolink-consensus.workspace = true
 afrolink-staking.workspace = true
+afrolink-gov.workspace = true
 thiserror.workspace = true
 
 # Only the tests need to *construct* a payment reference. Execution merely asks

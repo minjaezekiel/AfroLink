@@ -194,6 +194,8 @@ fn chain_on_disk(name: &str) -> (std::path::PathBuf, ChainStore, MemoryStore, Li
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(account(100)))],
         attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(account(1)),
+        params: afrolink_executor::ChainParams::devnet(),
         allocations: vec![Allocation {
             address: account(50),
             denom: kes(),
@@ -1075,6 +1077,8 @@ fn live_node() -> afrolink_node::SharedNode {
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(account(100)))],
         attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(account(1)),
+        params: afrolink_executor::ChainParams::devnet(),
         allocations: vec![Allocation {
             address: account(50),
             denom: kes(),

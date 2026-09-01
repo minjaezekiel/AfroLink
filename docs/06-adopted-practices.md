@@ -119,7 +119,10 @@ mistakes the absence of ERC-4337 for a gap.
 
 | Practice | Decision | Where it lives | Status |
 |---|---|---|---|
-| **Forkless runtime upgrades** — the runtime is on-chain WASM, swapped by governance | Taken. A flag-day upgrade stops every mobile-money agent in a corridor at once | [ADR-0009](adr/0009-developer-payment-surface.md) §2 | **Open** (Phase 3) |
+| **Forkless runtime upgrades** — the runtime is on-chain WASM, swapped by governance | Taken. A flag-day upgrade stops every mobile-money agent in a corridor at once. *Parameters are now governed without a fork; the runtime code is not yet* | [ADR-0009](adr/0009-developer-payment-surface.md) §2, [ADR-0022](adr/0022-governance.md) | **Partly in code** (Phase 3) |
+| **OpenGov's arc** — a Council and Technical Committee first, stake-weighted referenda once a distribution exists to vote with | Taken, including the honesty about which stage we are at. A token vote at launch, when the founders hold nearly everything, is a vote whose result is known in advance | [ADR-0022](adr/0022-governance.md) §2 | **In code** (council); **Open** (opening it) |
+| The **Fellowship** — an expert body with no power to change parameters or move assets | Convergent, and taken further: *our* council changes parameters but can move no assets either, and the list of what it may do is a six-item enum with no escape hatch | `crates/gov/src/proposal.rs` | **In code** |
+| Governance dispatching an arbitrary runtime `Call` | **Rejected.** It makes "what can governance do?" answer "anything the chain can do". A seventh power here is a code change that must be argued for, not a proposal that must be noticed | `Action` | **Rejected** |
 | **Pallets** — a runtime composed of modules owning their own namespace and invariants | Convergent: our `bank` / `alias` / `consensus` split is the same shape, reached independently | `crates/*` | **In code** |
 | Parachains and shared security | **Rejected.** Excellent for renting security to many chains; we are one chain, and the slot economy is a capital barrier of the kind ADR-0005 rejects | [ADR-0001](adr/0001-sovereign-rust-l1.md) | **Rejected** |
 
@@ -159,6 +162,8 @@ adopted practice than any other single source, in both directions.
 | **21-day unbonding period** (Cosmos Hub) | Taken as the economic root the trusting period is derived from | `crates/light` (`UNBONDING_MS`) | **In code** (parameter) / **Open** (enforcement, Phase 2) |
 | CosmWasm as the contract VM | Taken (ink! unmaintained since Jan 2026) | ADR-0003 | **Decided** |
 | IBC for interop | Taken | ADR-0001, Phase 4 | **Open** |
+| **`x/gov`'s quorum, threshold and voting period** | Taken in shape, not in electorate: a threshold in basis points and a deadline, over a seated council rather than bonded stake. Cosmos's own documented failure mode — low turnout making a coordinated minority decisive — is an argument against stake-weighting *at this stage*, not against voting | [ADR-0022](adr/0022-governance.md), `crates/gov` | **In code** |
+| `NoWithVeto` and an explicit vote against | **Rejected.** With a threshold to clear and a deadline to clear it by, silence already means no. A proposal nobody answers lapses, which is the same shape a savings group's quorum takes | `crates/gov/src/proposal.rs` | **Rejected** |
 | The Cosmos SDK itself | **Rejected** — Go, and the monetary modules we need cannot live at application layer | ADR-0001 | **Rejected** |
 
 ---
@@ -208,6 +213,9 @@ adopted practice than any other single source, in both directions.
 | **Per-period mint ceilings** as a circuit breaker | **Open.** The allowance bounds total damage, not damage per day; a window needs a clock the issuer record does not carry | ADR-0020 | **Open** |
 | **Two-tier CBDC distribution** — the central bank runs the ledger, licensed intermediaries reach end users | Taken, expressed in keys rather than institutions: the authority is the central bank, minters are the intermediaries | `crates/bank` | **In code** |
 | **Proof of reserve** | **Open.** The chain proves how much exists and cannot prove what backs it. A cap narrows the gap without closing it | Phase 4 | **Open** |
+| OpenZeppelin's **`Ownable2Step`** — the successor must accept before the role moves | Taken for issuer authority. A one-step transfer to a mistyped address ends a currency's governance permanently; the acceptance is proof a key exists on the other end | `Issuer::accept_authority`, [ADR-0022](adr/0022-governance.md) §6 | **In code** |
+| OpenZeppelin's **`TimelockController`** — a delay between a governance decision and its effect | Taken. The delay is notice, not deliberation: everyone who has to live with the decision learns of it while it is still reversible. Cancellation is a vote at the same threshold rather than a guardian key, because a key that can cancel anything can deny governance entirely | `crates/gov`, ADR-0022 §3 | **In code** |
+| BIS **mBridge** — a shared multi-CBDC platform where each central bank is the exclusive issuer of its own currency and a separate committee sets platform rules | Taken as the organising principle of the whole governance design: the platform is governed collectively, the money on it is not | ADR-0022 §1 | **In code** |
 
 ---
 
@@ -238,8 +246,10 @@ Writing the ledger exposed gaps that reading the research had not:
    and three spread across three others passed every check while a single
    country could halt the chain. Now measured, with that exact case as a test:
    `crates/consensus/src/decentralization.rs`.
-2. **We have no upgrade governance at all.** XRPL's amendment process is the
-   model worth copying, and nothing in the roadmap named it. Phase 3.
+2. **We had no governance at all.** XRPL's amendment process is the model worth
+   copying, and nothing in the roadmap named it. *Parameter and role governance
+   landed in [ADR-0022](adr/0022-governance.md); amending the runtime code is
+   still Phase 3.*
 3. **TRON's free bandwidth quota is a better answer to R2 than we have.** Fee
    abstraction and sponsored fees let *someone else* pay; a free tier means
    nobody has to. Phase 2.

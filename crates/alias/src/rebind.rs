@@ -88,12 +88,29 @@ pub enum BindError {
 /// Reads and writes contact bindings over any state store.
 pub struct Bindings<'a, S: KeyValueStore> {
     store: &'a mut S,
+    delay_blocks: u64,
 }
 
 impl<'a, S: KeyValueStore> Bindings<'a, S> {
-    /// Borrow a store as a binding registry.
+    /// Borrow a store as a binding registry, using the default delay.
     pub fn new(store: &'a mut S) -> Self {
-        Self { store }
+        Self {
+            store,
+            delay_blocks: REBIND_DELAY_BLOCKS,
+        }
+    }
+
+    /// Borrow a store with an explicit rebinding delay.
+    ///
+    /// The delay is a governed parameter (`afrolink_gov::ChainParams`), so the
+    /// node passes whatever is in force rather than the compile-time default.
+    /// Governance cannot set it below `MIN_REBIND_DELAY_BLOCKS`, because at zero
+    /// the SIM-swap defence is not a defence.
+    pub fn with_delay(store: &'a mut S, delay_blocks: u64) -> Self {
+        Self {
+            store,
+            delay_blocks,
+        }
     }
 
     /// Resolve a contact commitment to the account it currently points at.
@@ -112,12 +129,45 @@ impl<'a, S: KeyValueStore> Bindings<'a, S> {
             .map_err(|e| BindError::Corrupt(e.to_string()))
     }
 
+    /// Read one attestor's registry record.
+    ///
+    /// # Errors
+    /// Returns [`BindError::Corrupt`] if stored bytes do not decode.
+    pub fn attestor(&self, address: &Address) -> Result<Option<Attestor>, BindError> {
+        self.store
+            .get_decoded::<Attestor>(&StoreKey::attestor(address))
+            .map_err(|e| BindError::Corrupt(e.to_string()))
+    }
+
     /// Register a party as licensed to attest bindings.
     ///
     /// Governance-gated at the message layer; this is the state write.
     pub fn register_attestor(&mut self, address: &Address, attestor: &Attestor) {
         self.store
             .set_encoded(&StoreKey::attestor(address), attestor);
+    }
+
+    /// Withdraw or restore an attestor's licence.
+    ///
+    /// **Suspends rather than deletes**, which is why `Attestor::active` exists:
+    /// bindings the attestor already made keep a resolvable provenance after its
+    /// licence lapses, so a phone number does not stop resolving because its
+    /// telco lost a licence. It simply cannot make new ones.
+    ///
+    /// # Errors
+    /// Returns [`BindError::NotAnAttestor`] if there is no record to change.
+    pub fn set_attestor_active(
+        &mut self,
+        address: &Address,
+        active: bool,
+    ) -> Result<(), BindError> {
+        let mut attestor = self
+            .attestor(address)?
+            .ok_or(BindError::NotAnAttestor(*address))?;
+        attestor.active = active;
+        self.store
+            .set_encoded(&StoreKey::attestor(address), &attestor);
+        Ok(())
     }
 
     /// Bind a contact to an account for the first time.
@@ -164,7 +214,7 @@ impl<'a, S: KeyValueStore> Bindings<'a, S> {
             return Err(BindError::RebindPending);
         }
 
-        let effective_at = Height(now.0.saturating_add(REBIND_DELAY_BLOCKS));
+        let effective_at = Height(now.0.saturating_add(self.delay_blocks));
         record.rebind = Some(PendingRebind {
             new_address,
             issuer,
@@ -253,9 +303,7 @@ impl<'a, S: KeyValueStore> Bindings<'a, S> {
 
     fn require_active_attestor(&self, address: &Address) -> Result<(), BindError> {
         let attestor = self
-            .store
-            .get_decoded::<Attestor>(&StoreKey::attestor(address))
-            .map_err(|e| BindError::Corrupt(e.to_string()))?
+            .attestor(address)?
             .ok_or(BindError::NotAnAttestor(*address))?;
         if !attestor.active {
             return Err(BindError::AttestorSuspended(*address));

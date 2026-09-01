@@ -102,6 +102,15 @@ the transaction path is not.)*
       way it licenses issuers, and `CountryCode` moved to `crates/primitives` so
       a jurisdiction has one spelling rather than three
       *([ADR-0021](adr/0021-licensing-attestors.md))*
+- [x] **Governance** — until this, every trusted role on the chain was fixed at
+      genesis and could not be rotated, added or revoked: a lost issuer key
+      stayed lost, a withdrawn attestor licence stayed licensed on-chain, and
+      every parameter was a `const` whose change meant a flag day. A seated
+      council decides network questions at two thirds behind a timelock, with no
+      jurisdiction able to block and no two able to decide. It can license
+      attestors, admit a currency and tune parameters — and it can reach nobody's
+      money: a currency's authority moves only by a two-step handover signed at
+      both ends *([ADR-0022](adr/0022-governance.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature
@@ -187,9 +196,15 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
 - [ ] Sponsored fees
 - [ ] Contract templates: savings, escrow, payroll, rotating savings (chama/susu)
 - [ ] SDKs: Rust, TypeScript, Kotlin, Flutter
-- [ ] **Upgrade governance** — XRPL-style amendment voting over a Polkadot-style
-      on-chain WASM runtime: no flag day, because a flag day stops every agent in
+- [ ] **Runtime upgrade governance** — parameter governance is built
+      *([ADR-0022](adr/0022-governance.md))*; what remains is amending the
+      *code*: XRPL-style amendment voting over a Polkadot-style on-chain WASM
+      runtime, so a change of rules is not a flag day that stops every agent in
       a corridor at once *(ADR-0009 §2)*
+- [ ] **Open the network track to a stake-weighted vote**, once there is a real
+      distribution to vote with. The council is the honest answer at launch and
+      says so; Polkadot ran one for years before OpenGov, and skipping that
+      stage does not skip it *(ADR-0022, "Revisit if")*
 - [ ] Name the funding model for the public-goods side of the network.
       [ADR-0007](adr/0007-distribution-and-sybil-resistance.md) rules out Pi's
       answer (monetising users' attention) without yet naming ours
@@ -209,6 +224,15 @@ without talking to the core team.
       *(ADR-0020)*
 - [ ] **Per-period mint ceilings** — the allowance bounds total damage, not
       damage per day *(ADR-0020)*
+- [x] **A currency's authority can be handed on** — two steps, both signed, so a
+      transfer to a mistyped address does not end a currency's governance
+      forever. Governance cannot do it: the council admits currencies the chain
+      has never seen, and from that moment each currency governs itself
+      *([ADR-0022](adr/0022-governance.md))*
+- [ ] **Delisting a currency** — deliberately not expressible. A rogue authority
+      can pause and freeze its own denomination and reach nothing else; what
+      happens to holders of a denomination the network stops accepting is a
+      harder question than the mechanism *(ADR-0022)*
 - [ ] Proof-of-reserve attestation framework
 - [ ] Agent registry, bonding, liquidity mining, ratings
 - [ ] USSD gateway *(feature phones — R10)*

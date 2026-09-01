@@ -154,10 +154,16 @@ was built ahead of need.
 - **No rate limit per period.** The allowance bounds total damage, not damage per
   day. A daily ceiling is the obvious next control and needs a clock the issuer
   record does not have.
-- **Nothing can register an issuer after genesis**, and nothing can change an
-  authority key that is lost or compromised. That is the governance gap, and it
-  is now the largest one left: the roles above are only as good as the ability to
-  rotate them.
+- ~~**Nothing can register an issuer after genesis**, and nothing can change an
+  authority key that is lost or compromised.~~ **Closed by
+  [ADR-0022](0022-governance.md)**, and closed in two different places on
+  purpose: the council may *admit* a denomination the chain has never seen, and
+  may never touch one it already has, while the authority of an existing currency
+  moves only by a two-step handover signed at both ends. A key that is simply
+  *lost*, with nobody to sign the handover, is not a governance problem — an
+  authority is an account, and an account already carries an M-of-N signer list
+  ([ADR-0017](0017-key-rotation-and-signer-lists.md)). That is why the field is
+  an address rather than a public key.
 - **The `paused` flag is not a ratchet** and should not be — pausing must be
   reversible or it is a kill switch rather than a circuit breaker.
 
@@ -165,9 +171,8 @@ was built ahead of need.
 
 - A central bank asks for clawback as a condition of issuing, at which point the
   Stellar shape (declared up front, renounceable, never grantable) is the design
-- Governance arrives, making issuer registration and authority rotation possible
-  and turning the roles above into something operable rather than fixed at
-  genesis
+- ~~Governance arrives~~ — it has ([ADR-0022](0022-governance.md)), and the roles
+  above are now operable rather than fixed at genesis
 - A per-period mint ceiling is wanted, which needs the issuer record to carry a
   window
 

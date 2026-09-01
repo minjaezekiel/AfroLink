@@ -74,6 +74,8 @@ fn network(n: u8) -> (Network, ValidatorSet) {
         validators: validators.clone(),
         issuers: vec![(kes(), Issuer::new(addr(100)))],
         attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(addr(1)),
+        params: afrolink_executor::ChainParams::devnet(),
         allocations: vec![Allocation {
             address: addr(50),
             denom: kes(),

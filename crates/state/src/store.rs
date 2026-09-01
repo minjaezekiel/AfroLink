@@ -40,7 +40,8 @@ pub enum Namespace {
     Validator = 0x05,
     /// Delegation records, keyed by (delegator, validator).
     Delegation = 0x06,
-    /// Governance parameters.
+    /// Governance parameters: the single [`Namespace::Params`] entry holding
+    /// every chain-wide number governance may change.
     Params = 0x07,
     /// Smart-contract code and instance storage.
     Contract = 0x08,
@@ -77,6 +78,17 @@ pub enum Namespace {
     /// set has to be derivable identically on every node, so the candidate list
     /// has to be state rather than a traversal.
     BondIndex = 0x10,
+    /// The seated governance council. A single entry.
+    Council = 0x11,
+    /// Governance proposals, keyed by id.
+    Proposal = 0x12,
+    /// The ids of every proposal not yet executed, withdrawn or pruned.
+    ///
+    /// A single key rather than a scan, for the same reason as
+    /// [`Self::BondIndex`]. It is also what bounds the state a council can
+    /// create: without a list to count, nothing could refuse the thousandth open
+    /// proposal.
+    ProposalIndex = 0x13,
 }
 
 /// A namespaced state key.
@@ -184,6 +196,30 @@ impl StoreKey {
     #[must_use]
     pub fn bond_index() -> Self {
         Self::new(Namespace::BondIndex, &[])
+    }
+
+    /// The key for the chain-wide governance parameters.
+    #[must_use]
+    pub fn params() -> Self {
+        Self::new(Namespace::Params, &[])
+    }
+
+    /// The key for the seated council.
+    #[must_use]
+    pub fn council() -> Self {
+        Self::new(Namespace::Council, &[])
+    }
+
+    /// The key for one governance proposal.
+    #[must_use]
+    pub fn proposal(id: u64) -> Self {
+        Self::new(Namespace::Proposal, &[&id.to_le_bytes()])
+    }
+
+    /// The key for the list of open proposal ids.
+    #[must_use]
+    pub fn proposal_index() -> Self {
+        Self::new(Namespace::ProposalIndex, &[])
     }
 
     /// The raw key bytes.

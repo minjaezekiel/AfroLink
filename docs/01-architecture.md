@@ -41,7 +41,7 @@ is the layer where novelty is punished. See [ADR-0002](adr/0002-consensus.md).
 | Block time | 1s |
 | Finality | **deterministic, 1 block** |
 | Fault tolerance | < 1/3 of stake Byzantine |
-| Validator set | 100 → 150 by governance |
+| Validator set | 100 → 150 by governance *(a stored parameter since [ADR-0022](adr/0022-governance.md), with a floor of 4: below that a set has a quorum but no fault tolerance)* |
 | Throughput target | 3,000–5,000 TPS sustained |
 
 **Why deterministic finality is non-negotiable here.** A market trader handing
@@ -81,7 +81,10 @@ acquire the native gas token. That is a second onboarding, a second exchange
 account, a second KYC, and a second thing to understand. It is the largest single
 cause of drop-off in crypto payments, and it is entirely self-inflicted.
 
-**The design.** Fees are payable in any governance-whitelisted denomination.
+**The design.** Fees are payable in any governance-whitelisted denomination —
+concretely, any denomination with a registered issuer, which is now a set
+governance can add to ([ADR-0022](adr/0022-governance.md) admits a currency; the
+currency's own authority takes it from there).
 A transaction names its fee denom; validators accept it, and the protocol swaps
 to AFRI through a module-owned liquidity pool at settlement. Validators are still
 paid in AFRI; the user never learns AFRI exists.

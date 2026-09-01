@@ -43,11 +43,14 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Seventeen crates, **686 tests passing**. A working
+**Phase 2 in progress.** Eighteen crates, **831 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
-over HTTP, trusting nothing about the node it is talking to.
+over HTTP, trusting nothing about the node it is talking to. A sovereign issues
+its own currency and hands the role on; a council licenses the attestors and
+tunes the parameters, and can reach nobody's money
+([ADR-0022](docs/adr/0022-governance.md)).
 
 ```bash
 curl 'localhost:8080/v1/accounts/afri1…/balance?denom=sov/ke/kes'  # proved
@@ -63,12 +66,13 @@ built first anyway.
 
 ```
 crates/
-  primitives/   canonical consensus codec, checked amounts, denoms      25 tests ✅
+  primitives/   canonical consensus codec, checked amounts, denoms      28 tests ✅
   crypto/       BLAKE3 + Ed25519, bech32m, RFC 6962 Merkle + consistency 38 tests ✅
   state/        sparse Merkle state, membership + absence proofs        26 tests ✅
-  types/        accounts, signing authority, transactions, fees            71 tests ✅
-  bank/         balances, supply invariant, sovereign issuance          18 tests ✅
-  executor/     block execution, genesis, and attacks on the money         69 tests ✅
+  types/        accounts, signing authority, transactions, fees            84 tests ✅
+  bank/         balances, supply invariant, sovereign issuance          37 tests ✅
+  gov/          the council, the parameters it may tune, the timelock       36 tests ✅
+  executor/     block execution, genesis, and attacks on the money        141 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
   node/         consensus driver, mempool, proposals, simulator          41 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
@@ -77,7 +81,7 @@ crates/
   alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
   pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         adversarial inputs, and ledger invariants under load       39 tests ✅
+  fuzz/         adversarial inputs, and ledger invariants under load       41 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
   http/         strict HTTP/1.1 transport around the query protocol         83 tests ✅
 ```
@@ -86,7 +90,7 @@ Adversarial testing is not a separate job nobody looks at — it is `cargo test`
 Every case is a pure function of a `u64` seed, so a failure names the seed that
 produced it and reproduces forever. Three suites:
 
-* **~232 000 hostile byte strings** across 58 decoder fixtures, asserting that
+* **~284 000 hostile byte strings** across 71 decoder fixtures, asserting that
   anything which decodes re-encodes to *exactly* the bytes it came from. Two
   encodings of one value is a chain split — and since a transaction receipt is
   hashed into a block header, that now includes refusing an out-of-order
@@ -101,11 +105,14 @@ produced it and reproduces forever. Three suites:
   that request ended. The last one is the property request smuggling violates.
 * **Seeded sequences of *valid* transactions**, asserting after every block that
   balances still sum to supply, that no account lost money without a transaction
-  naming it, and that no savings group has reached a state it could not have
-  reached honestly. This is the suite that asks whether an input should have
-  been *obeyed*, rather than whether it could be *read two ways* — and it tests
+  naming it, that no savings group has reached a state it could not have reached
+  honestly, and that the council has not voted itself into a shape its own rules
+  refuse. This is the suite that asks whether an input should have been
+  *obeyed*, rather than whether it could be *read two ways* — and it tests
   itself, failing if the generator ever degenerates into inputs that are all
-  rejected.
+  rejected. Governance gets its own run, on its own clock: a voting period and a
+  timelock are thousands of blocks, and at one height per block every governance
+  invariant would hold for the worst reason — nothing ever reached it.
 
 It found five real defects on its first run, and the same root cause has since
 turned up at a sixth place — every one of them a value that was not uniquely

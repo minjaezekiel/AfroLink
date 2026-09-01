@@ -10,8 +10,14 @@ use afrolink_alias::contact::Attestor;
 use afrolink_alias::rebind::Bindings;
 use afrolink_bank::{Bank, BankError, Issuer};
 use afrolink_consensus::ValidatorSet;
+use afrolink_gov::{CouncilError, GovError, Governance};
+
+// Re-exported because they are fields of `Genesis`: anything that can build a
+// genesis file needs to name them, and making every such crate depend on
+// `afrolink-gov` directly would spread the dependency for two type names.
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::Hash32;
+pub use afrolink_gov::{ChainParams, Council};
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::{KeyValueStore, StoreKey};
@@ -58,9 +64,25 @@ pub enum GenesisError {
     /// and governance does not exist yet.
     #[error("attestor {0} is registered suspended, and nothing can reactivate it")]
     SuspendedAttestor(String),
+    /// The council breaches the jurisdiction cap, or the cap itself is looser
+    /// than mainnet permits.
+    #[error("governance: {0}")]
+    Governance(String),
     /// A bank operation failed while applying allocations.
     #[error(transparent)]
     Bank(#[from] BankError),
+}
+
+impl From<GovError> for GenesisError {
+    fn from(error: GovError) -> Self {
+        Self::Governance(error.to_string())
+    }
+}
+
+impl From<CouncilError> for GenesisError {
+    fn from(error: CouncilError) -> Self {
+        Self::Governance(error.to_string())
+    }
 }
 
 /// One account's opening balance in one denomination.
@@ -94,6 +116,21 @@ pub struct Genesis {
     /// exist, so `AttestContact` always fails, so no phone number ever resolves
     /// and the SIM-swap defence protects a feature nobody can turn on.
     pub attestors: Vec<(Address, Attestor)>,
+    /// The founding governance council.
+    ///
+    /// Not optional. A chain that launches without one has every trusted role
+    /// fixed at genesis forever — no attestor can be licensed or suspended, no
+    /// currency admitted, no parameter tuned without a flag day — which is the
+    /// state [ADR-0022](../../../docs/adr/0022-governance.md) exists to end.
+    /// `Council::new` already refuses an empty body, so the type carries the
+    /// rule and this field cannot be a placeholder.
+    pub council: Council,
+    /// The chain-wide parameters in force from block 0.
+    ///
+    /// Written into state, so they are part of the genesis app hash that
+    /// operators compare before launch: two nodes that disagree about the
+    /// unbonding period are two nodes on different chains.
+    pub params: ChainParams,
     /// Opening balances.
     pub allocations: Vec<Allocation>,
 }
@@ -105,6 +142,14 @@ pub struct GenesisLimits {
     pub min_countries: usize,
     /// Maximum share of voting power one validator may hold, in basis points.
     pub max_single_share_bps: u32,
+    /// Maximum share of council weight one jurisdiction may hold, in basis
+    /// points.
+    ///
+    /// The validator distribution rule applied to the body that governs the
+    /// validators. A network whose consensus cannot be captured by one
+    /// jurisdiction, but whose governance can, is capturable by one
+    /// jurisdiction.
+    pub max_council_country_share_bps: u32,
 }
 
 impl Default for GenesisLimits {
@@ -114,6 +159,7 @@ impl Default for GenesisLimits {
         Self {
             min_countries: 15,
             max_single_share_bps: 1_000,
+            max_council_country_share_bps: afrolink_gov::params::MAX_COUNCIL_COUNTRY_SHARE_BPS,
         }
     }
 }
@@ -125,6 +171,7 @@ impl GenesisLimits {
         Self {
             min_countries: 1,
             max_single_share_bps: 10_000,
+            max_council_country_share_bps: 10_000,
         }
     }
 }
@@ -190,6 +237,23 @@ impl Genesis {
             });
         }
 
+        // Governance: the parameters must clear their own floors, the council
+        // must sit inside the cap those parameters name, and on mainnet that cap
+        // must itself be no looser than the network rule. Checked here rather
+        // than only in `apply`, so an operator can validate a file without
+        // building a store.
+        self.params
+            .validate()
+            .map_err(|e| GenesisError::Governance(e.to_string()))?;
+        if self.params.max_council_country_share_bps > limits.max_council_country_share_bps {
+            return Err(GenesisError::Governance(format!(
+                "a council country cap of {} bps is looser than the limit of {}",
+                self.params.max_council_country_share_bps, limits.max_council_country_share_bps
+            )));
+        }
+        self.council
+            .check_concentration(self.params.max_council_country_share_bps)?;
+
         Ok(())
     }
 
@@ -213,6 +277,8 @@ impl Genesis {
                 bank.genesis_allocate(&alloc.address, &alloc.denom, alloc.amount)?;
             }
         }
+
+        Governance::new(store).install(&self.council, &self.params)?;
 
         {
             let mut bindings = Bindings::new(store);
@@ -307,6 +373,8 @@ impl Encode for Genesis {
             address.encode(out);
             attestor.encode(out);
         }
+        self.council.encode(out);
+        self.params.encode(out);
         self.allocations.encode(out);
     }
 }
@@ -332,6 +400,8 @@ impl Decode for Genesis {
             validators,
             issuers,
             attestors,
+            council: Council::decode(r)?,
+            params: ChainParams::decode(r)?,
             allocations: Vec::<Allocation>::decode(r)?,
         })
     }
@@ -371,6 +441,38 @@ mod tests {
         .expect("valid set")
     }
 
+    /// A council of `n` equally weighted seats, each in its own jurisdiction.
+    ///
+    /// Four is the smallest that clears a 3333 bps cap: three equal countries
+    /// hold a third each, and a third is enough to block a two-thirds threshold.
+    fn council(countries: &[&str]) -> Council {
+        let mut seats: Vec<afrolink_gov::Seat> = countries
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                #[expect(clippy::cast_possible_truncation, reason = "test fixtures are small")]
+                let seed = (i + 200) as u8;
+                afrolink_gov::Seat::new(addr(seed), 10, CountryCode::new(c).expect("valid"))
+            })
+            .collect();
+        seats.sort_by_key(|seat| seat.holder);
+        Council::new(seats, afrolink_gov::MIN_COUNCIL_THRESHOLD_BPS).expect("valid council")
+    }
+
+    /// A genesis file that satisfies every mainnet rule.
+    fn mainnet_genesis() -> Genesis {
+        let countries = [
+            "ke", "ng", "za", "gh", "tz", "ug", "rw", "et", "sn", "ci", "cm", "zm", "bw", "na",
+            "mz", "ml", "bf", "ne", "td", "so",
+        ];
+        Genesis {
+            validators: validators(&countries),
+            council: council(&["ke", "ng", "za", "gh"]),
+            params: ChainParams::default(),
+            ..genesis()
+        }
+    }
+
     fn genesis() -> Genesis {
         Genesis {
             chain_id: ChainId::new("afrolink-1").expect("valid"),
@@ -378,6 +480,8 @@ mod tests {
             validators: validators(&["ke", "ng", "za"]),
             issuers: vec![(kes(), Issuer::new(addr(100)))],
             attestors: Vec::new(),
+            council: Council::devnet(addr(1)),
+            params: ChainParams::devnet(),
             allocations: vec![
                 Allocation {
                     address: addr(1),
@@ -564,19 +668,85 @@ mod tests {
 
     #[test]
     fn a_well_formed_mainnet_genesis_passes() {
-        let mut g = genesis();
-        let countries = [
-            "ke", "ng", "za", "gh", "tz", "ug", "rw", "et", "sn", "ci", "cm", "zm", "bw", "na",
-            "mz", "ml", "bf", "ne", "td", "so",
-        ];
-        g.validators = validators(&countries);
+        let g = mainnet_genesis();
         assert_eq!(g.validators.countries_represented(), 20);
         assert_eq!(
             g.validators.max_single_share_bps(),
             500,
             "20 equal validators = 5% each"
         );
+        assert_eq!(
+            g.council.max_country_share_bps(),
+            2_500,
+            "4 equal seats in 4 jurisdictions = 25% each"
+        );
         assert_eq!(g.validate(GenesisLimits::default()), Ok(()));
+    }
+
+    #[test]
+    fn mainnet_limits_reject_a_council_one_jurisdiction_can_block() {
+        // The validator distribution rule, applied to the body that governs the
+        // validators. A devnet council is a single seat holding every basis
+        // point, which is exactly the shape mainnet must refuse.
+        let g = Genesis {
+            council: Council::devnet(addr(1)),
+            ..mainnet_genesis()
+        };
+        assert!(matches!(
+            g.validate(GenesisLimits::default()),
+            Err(GenesisError::Governance(_))
+        ));
+
+        // And three equal jurisdictions is still one short: a third each, and a
+        // third is enough to block a two-thirds threshold.
+        let g = Genesis {
+            council: council(&["ke", "ng", "za"]),
+            ..mainnet_genesis()
+        };
+        assert_eq!(g.council.max_country_share_bps(), 3_334);
+        assert!(matches!(
+            g.validate(GenesisLimits::default()),
+            Err(GenesisError::Governance(_))
+        ));
+    }
+
+    #[test]
+    fn a_genesis_cannot_start_with_parameters_that_break_a_floor() {
+        // The one that matters most: an unbonding period shorter than the
+        // trusting period every deployed light client compiles in.
+        let mut g = mainnet_genesis();
+        g.params.staking.unbonding_ms = 1;
+        assert!(matches!(
+            g.validate(GenesisLimits::default()),
+            Err(GenesisError::Governance(_))
+        ));
+    }
+
+    #[test]
+    fn a_mainnet_genesis_cannot_launch_with_a_loose_council_cap() {
+        // Satisfying the cap today is not enough: the *cap itself* has to be at
+        // or under the network rule, because it is a ratchet from wherever the
+        // file sets it and nothing later can tighten it back on the council's
+        // behalf.
+        let mut g = mainnet_genesis();
+        g.params.max_council_country_share_bps = 10_000;
+        assert!(matches!(
+            g.validate(GenesisLimits::default()),
+            Err(GenesisError::Governance(_))
+        ));
+    }
+
+    #[test]
+    fn the_council_and_parameters_are_readable_from_state_after_genesis() {
+        // A parameter written to state and read by nothing is the same defect as
+        // code reachable from no transaction.
+        let g = genesis();
+        let mut store = MemoryStore::new();
+        g.apply(&mut store, GenesisLimits::devnet())
+            .expect("applies");
+        let gov = Governance::new(&mut store);
+        assert_eq!(gov.council(), Ok(Some(g.council.clone())));
+        assert_eq!(gov.params(), Ok(g.params.clone()));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use afrolink_alias::{ContactCommitment, Username};
 use afrolink_consensus::{CountryCode, Equivocation};
 use afrolink_crypto::hash::{Domain, Hash32, hash};
 use afrolink_crypto::{Address, CryptoError, PublicKey, SecretKey, Signature};
+use afrolink_gov::Action;
 use afrolink_pay::PaymentReference;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exact};
 use afrolink_primitives::{Amount, ChainId, Denom, Height};
@@ -529,6 +530,68 @@ pub enum Message {
         frozen: bool,
     },
 
+    /// Offer this denomination's authority role to another account.
+    ///
+    /// **Step one of two**, and the second step is what makes it safe: nothing
+    /// changes until the named account sends [`Self::AcceptIssuerAuthority`].
+    /// A one-step handover to a mistyped address, or to one whose key nobody
+    /// holds, would end a currency's governance permanently — nothing could ever
+    /// mint it, unpause it or name a minter again.
+    ///
+    /// `None` withdraws a standing offer.
+    ///
+    /// This is the **only** way an issuer authority ever changes. Governance
+    /// cannot reach it: the council admits currencies the chain has never seen,
+    /// and from that moment each currency governs itself.
+    TransferIssuerAuthority {
+        /// The denomination.
+        denom: Denom,
+        /// Who is offered the role, or `None` to withdraw the offer.
+        to: Option<Address>,
+    },
+
+    /// Take up an offered authority role.
+    ///
+    /// Step two of two. The incoming authority's own signature is the proof that
+    /// the role is moving to a key somebody actually holds.
+    AcceptIssuerAuthority {
+        /// The denomination.
+        denom: Denom,
+    },
+
+    /// Put a decision to the governance council.
+    ///
+    /// The sender must hold a seat. The proposer's own vote is **not** counted
+    /// automatically — opening a question and answering it are different acts.
+    ProposeGovAction {
+        /// What it would do.
+        action: Box<Action>,
+    },
+
+    /// Vote a council seat in favour of an open proposal.
+    ///
+    /// There is no vote against. A seat that does not want a proposal declines
+    /// to vote and it lapses at the end of its voting period, which is the same
+    /// shape a savings group's quorum takes: with a threshold to clear and a
+    /// deadline to clear it by, silence already means no.
+    VoteGovAction {
+        /// The proposal.
+        proposal: u64,
+    },
+
+    /// Carry out a proposal that has passed and waited out its timelock.
+    ///
+    /// **Permissionless on purpose**, exactly like [`Self::ApplyRebind`]: the
+    /// vote is taken and the timelock has run, so the outcome is settled and
+    /// whoever pays the fee to finish the job changes nothing about it.
+    /// Requiring a seat would leave a decided question unexecuted forever if the
+    /// council moved on, or if the seat that would have sent it was removed in
+    /// the meantime.
+    ExecuteGovAction {
+        /// The proposal.
+        proposal: u64,
+    },
+
     /// Lock AFRI and register as a validator candidate.
     Bond {
         /// The consensus key this operator will sign blocks with.
@@ -718,6 +781,16 @@ impl TxBody {
                 | Message::SetRegularKey { .. }
                 | Message::SetSignerList { .. }
                 | Message::ApplyRebind { .. }
+                | Message::TransferIssuerAuthority { .. }
+                | Message::AcceptIssuerAuthority { .. }
+                // A proposal's contents are checked against chain state when it
+                // is opened — a council is measured against the cap in force, a
+                // parameter change against the ratchet — so there is nothing
+                // stateless left to say about it beyond what `Action::decode`
+                // already refused.
+                | Message::ProposeGovAction { .. }
+                | Message::VoteGovAction { .. }
+                | Message::ExecuteGovAction { .. }
                 | Message::ReleaseName { .. } => {}
             }
         }
@@ -871,6 +944,25 @@ impl Transaction {
                 // most important thing that can happen to a validator's account,
                 // and they did not send the report.
                 Message::ReportEquivocation { evidence } => out.push(evidence.validator),
+                // The incoming authority has to *see* the offer to accept it,
+                // and it did not send the transaction that made it. Without this
+                // a handover would depend on the two parties talking off-chain
+                // about a message the chain already recorded.
+                Message::TransferIssuerAuthority { to, .. } => out.extend(to.iter().copied()),
+                // An account named by a governance proposal — a new attestor, a
+                // suspended one, an incoming issuer authority — should find the
+                // decision in its own history. The proposal is where the naming
+                // happens; execution merely carries it out, and by then whoever
+                // pays the fee is nobody in particular.
+                Message::ProposeGovAction { action } => match action.as_ref() {
+                    Action::LicenseAttestor { address, .. }
+                    | Action::SetAttestorActive { address, .. } => out.push(*address),
+                    Action::AdmitDenom { authority, .. } => out.push(*authority),
+                    Action::SetCouncil(council) => {
+                        out.extend(council.seats().iter().map(|seat| seat.holder));
+                    }
+                    Action::SetParams(_) | Action::Cancel { .. } => {}
+                },
 
                 // Sender-only. Named individually rather than caught by a
                 // wildcard, so a future variant does not join them by accident.
@@ -890,6 +982,9 @@ impl Transaction {
                 | Message::Bond { .. }
                 | Message::AddStake { .. }
                 | Message::Unbond { .. }
+                | Message::AcceptIssuerAuthority { .. }
+                | Message::VoteGovAction { .. }
+                | Message::ExecuteGovAction { .. }
                 | Message::WithdrawUnbonded => {}
             }
         }
@@ -1239,6 +1334,28 @@ impl Encode for Message {
                 account.encode(out);
                 frozen.encode(out);
             }
+
+            Self::TransferIssuerAuthority { denom, to } => {
+                out.push(37);
+                denom.encode(out);
+                to.encode(out);
+            }
+            Self::AcceptIssuerAuthority { denom } => {
+                out.push(38);
+                denom.encode(out);
+            }
+            Self::ProposeGovAction { action } => {
+                out.push(39);
+                action.encode(out);
+            }
+            Self::VoteGovAction { proposal } => {
+                out.push(40);
+                proposal.encode(out);
+            }
+            Self::ExecuteGovAction { proposal } => {
+                out.push(41);
+                proposal.encode(out);
+            }
         }
     }
 }
@@ -1380,6 +1497,22 @@ impl Decode for Message {
                 denom: Denom::decode(r)?,
                 account: Address::decode(r)?,
                 frozen: bool::decode(r)?,
+            }),
+            37 => Ok(Self::TransferIssuerAuthority {
+                denom: Denom::decode(r)?,
+                to: Option::<Address>::decode(r)?,
+            }),
+            38 => Ok(Self::AcceptIssuerAuthority {
+                denom: Denom::decode(r)?,
+            }),
+            39 => Ok(Self::ProposeGovAction {
+                action: Box::new(Action::decode(r)?),
+            }),
+            40 => Ok(Self::VoteGovAction {
+                proposal: u64::decode(r)?,
+            }),
+            41 => Ok(Self::ExecuteGovAction {
+                proposal: u64::decode(r)?,
             }),
             tag => Err(CodecError::UnknownDiscriminant {
                 tag,
