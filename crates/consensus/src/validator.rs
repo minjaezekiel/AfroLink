@@ -38,42 +38,10 @@ pub enum ValidatorError {
     InvalidCountry,
 }
 
-/// An ISO 3166-1 alpha-2 country code.
-///
-/// Carried per validator so the geographic distribution requirement in
-/// [ADR-0002](../../../docs/adr/0002-consensus.md) can be enforced by the
-/// protocol rather than hoped for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CountryCode([u8; 2]);
-
-impl CountryCode {
-    /// Validate and wrap a two-letter code.
-    ///
-    /// # Errors
-    /// Returns [`ValidatorError::InvalidCountry`] unless the input is exactly
-    /// two lowercase ASCII letters.
-    pub fn new(s: &str) -> Result<Self, ValidatorError> {
-        let bytes = s.as_bytes();
-        if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_lowercase) {
-            return Err(ValidatorError::InvalidCountry);
-        }
-        let mut out = [0u8; 2];
-        out.copy_from_slice(bytes);
-        Ok(Self(out))
-    }
-
-    /// The code as a string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.0).unwrap_or("??")
-    }
-}
-
-impl core::fmt::Display for CountryCode {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// `CountryCode` now lives in `crates/primitives`: the attestor registry needs
+// one too, and a jurisdiction is not a consensus concept. Re-exported here so
+// every existing import keeps working.
+pub use afrolink_primitives::CountryCode;
 
 /// One validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,24 +281,6 @@ impl ValidatorSet {
             }
         }
         self.validators.last()
-    }
-}
-
-impl Encode for CountryCode {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0);
-    }
-}
-
-impl Decode for CountryCode {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
-        let bytes = r.take_array::<2>()?;
-        if !bytes.iter().all(u8::is_ascii_lowercase) {
-            return Err(CodecError::Invalid(
-                "country code must be lowercase ASCII".to_owned(),
-            ));
-        }
-        Ok(Self(bytes))
     }
 }
 

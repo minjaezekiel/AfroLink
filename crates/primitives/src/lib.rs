@@ -23,12 +23,14 @@
 
 pub mod amount;
 pub mod codec;
+pub mod country;
 pub mod denom;
 pub mod error;
 pub mod ids;
 
 pub use amount::Amount;
 pub use codec::{CodecError, Decode, Encode, Reader};
+pub use country::CountryCode;
 pub use denom::Denom;
 pub use error::{Error, Result};
 pub use ids::{ChainId, Height, Round, Timestamp};

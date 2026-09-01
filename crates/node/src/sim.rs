@@ -385,6 +385,7 @@ mod tests {
             genesis_time: Timestamp::from_millis(1_700_000_000_000),
             validators: validators.clone(),
             issuers: vec![(kes(), Issuer::new(addr(100)))],
+            attestors: Vec::new(),
             allocations: vec![
                 Allocation {
                     address: addr(50),

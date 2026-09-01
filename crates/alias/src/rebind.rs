@@ -269,6 +269,7 @@ mod tests {
     use super::*;
     use crate::contact::ContactKind;
     use afrolink_crypto::SecretKey;
+    use afrolink_primitives::CountryCode;
     use afrolink_state::MemoryStore;
 
     const PEPPER: &[u8] = b"a-sixteen-byte-pepper-or-longer";
@@ -284,7 +285,7 @@ mod tests {
 
     fn safaricom() -> Attestor {
         Attestor {
-            country: *b"ke",
+            country: CountryCode::new("ke").expect("valid country"),
             name: "Safaricom".to_owned(),
             active: true,
         }

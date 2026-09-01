@@ -193,6 +193,7 @@ fn chain_on_disk(name: &str) -> (std::path::PathBuf, ChainStore, MemoryStore, Li
         genesis_time: Timestamp::from_millis(1_700_000_000_000),
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(account(100)))],
+        attestors: Vec::new(),
         allocations: vec![Allocation {
             address: account(50),
             denom: kes(),
@@ -1073,6 +1074,7 @@ fn live_node() -> afrolink_node::SharedNode {
         genesis_time: Timestamp::from_millis(1_700_000_000_000),
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(account(100)))],
+        attestors: Vec::new(),
         allocations: vec![Allocation {
             address: account(50),
             denom: kes(),

@@ -124,6 +124,7 @@ impl ChainView for ServedChain<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use afrolink_alias::Attestor;
     use afrolink_bank::Issuer;
     use afrolink_consensus::{Commit, CountryCode, Validator, ValidatorSet, Vote, VoteType};
     use afrolink_crypto::{Address, SecretKey};
@@ -204,6 +205,14 @@ mod tests {
             genesis_time: Timestamp::from_millis(1_700_000_000_000),
             validators: validators(),
             issuers: vec![(kes(), Issuer::new(addr(100)))],
+            attestors: vec![(
+                addr(10),
+                Attestor {
+                    country: CountryCode::new("ke").expect("valid country"),
+                    name: "Safaricom".to_owned(),
+                    active: true,
+                },
+            )],
             allocations: vec![Allocation {
                 address: addr(50),
                 denom: kes(),
@@ -541,24 +550,16 @@ mod tests {
     fn a_phone_number_resolves_without_the_chain_ever_holding_it() {
         // Resolution works from a commitment alone. The node answering the
         // query never sees the number, and neither does the state it serves.
-        use afrolink_alias::{Attestor, Bindings, ContactCommitment, ContactKind, ContactRecord};
+        use afrolink_alias::{Bindings, ContactCommitment, ContactKind, ContactRecord};
         use afrolink_primitives::codec::decode_exact;
         use afrolink_state::KeyValueStore;
 
         let path = temp_path("resolve-phone");
         let (store, mut state, tip, mut client) = chain_on_disk(&path);
 
-        // Licence an attestor directly in state: attestor registration is a
-        // governance action, and governance is not built yet.
-        Bindings::new(&mut state).register_attestor(
-            &addr(10),
-            &Attestor {
-                country: *b"ke",
-                name: "Safaricom".to_owned(),
-                active: true,
-            },
-        );
-
+        // The attestor is licensed by the genesis file, the way an issuer is —
+        // so this test now exercises a path a real chain can reach rather than
+        // one only a test could arrange.
         let pepper = b"a-sixteen-byte-pepper-or-longer";
         let commitment =
             ContactCommitment::new(ContactKind::Phone, "+254712345678", pepper).unwrap();

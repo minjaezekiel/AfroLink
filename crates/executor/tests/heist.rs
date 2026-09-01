@@ -21,7 +21,7 @@ use afrolink_bank::{Bank, Issuer};
 use afrolink_crypto::hash::Domain;
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{BlockContext, Executor, fee_collector_address};
-use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
+use afrolink_primitives::{Amount, ChainId, CountryCode, Denom, Height, Timestamp};
 use afrolink_state::MemoryStore;
 use afrolink_types::group::{Contribution, FoundingMember, PayoutPolicy, Quorum, Role, ShareRules};
 use afrolink_types::{Fee, Message, Transaction, TxBody};
@@ -535,18 +535,19 @@ fn no_sequence_of_transactions_changes_the_total_supply() {
 // The SIM-swap defence, exercised the way a chain would have to run it
 // ---------------------------------------------------------------------------
 
-/// Register an attestor directly, because no transaction can.
+/// Register an attestor directly, to keep this fixture short.
 ///
-/// That is itself a finding: `AttestContact` checks the attestor registry, and
-/// nothing populates it — not genesis, not any message — so on a real chain the
-/// whole contact-binding feature is inert. The library logic below is correct
-/// and reachable only from here.
+/// It used to be the only way: nothing populated the registry, so on a real
+/// chain the whole contact-binding feature was inert. Genesis licenses attestors
+/// now ([ADR-0021](../../../docs/adr/0021-licensing-attestors.md)), and
+/// `tests/contacts.rs` drives the lifecycle that way. These tests keep the
+/// direct write because they are about the *attack*, not the licensing.
 fn licensed_attestor(store: &mut MemoryStore, who: Address) {
     use afrolink_alias::{Attestor, Bindings};
     Bindings::new(store).register_attestor(
         &who,
         &Attestor {
-            country: *b"ke",
+            country: CountryCode::new("ke").expect("valid country"),
             name: "MNO".to_owned(),
             active: true,
         },

@@ -95,6 +95,13 @@ the transaction path is not.)*
       with finite allowances, a separate compliance key — so a stolen minting
       key costs a bounded amount
       *([ADR-0020](adr/0020-sovereign-issuance.md))*
+- [x] **Attestors licensed at genesis** — the contact half of `crates/alias`
+      was inert: `AttestContact` checks an attestor registry that nothing
+      populated, so no phone number could ever be bound and the SIM-swap defence
+      guarded a feature nobody could switch on. Genesis licenses attestors the
+      way it licenses issuers, and `CountryCode` moved to `crates/primitives` so
+      a jurisdiction has one spelling rather than three
+      *([ADR-0021](adr/0021-licensing-attestors.md))*
 - [ ] **Subscriptions** — a wallet polls today, which is tolerable at one-second
       blocks and is the next thing to want
 - [ ] Fee-based replacement and priority ordering in the mempool — premature
@@ -164,7 +171,10 @@ a partition and a deliberate 1/3-minus-one Byzantine coalition.
       time-locked, vetoable rebinding *(ADR-0008, `crates/alias` 44 tests, plus 8 end-to-end)*
 - [x] **`afri:` payment request URIs and payment references** — a merchant emits
       one string; any wallet understands it *(ADR-0009, `crates/pay`)*
-- [ ] Off-chain resolver service *(specified in [07](07-resolver-service.md))*
+- [ ] Off-chain resolver service *(specified in [07](07-resolver-service.md))* —
+      the chain-side half is now reachable, so what remains is the service that
+      turns a number a user types into the commitment the chain stores
+      *(ADR-0021)*
 - [x] **Key rotation and signer lists** — XRPL's regular key, master-key disable
       and M-of-N signer list. Rotation matters more here than elsewhere because
       the addressing layer is aliases people have already shared, and it is the

@@ -6,6 +6,8 @@
 //! strictly and its output is a single 32-byte commitment that operators can
 //! compare out of band before launch.
 
+use afrolink_alias::contact::Attestor;
+use afrolink_alias::rebind::Bindings;
 use afrolink_bank::{Bank, BankError, Issuer};
 use afrolink_consensus::ValidatorSet;
 use afrolink_crypto::Address;
@@ -46,6 +48,16 @@ pub enum GenesisError {
         /// Permitted cap, in basis points.
         cap: u32,
     },
+    /// The same account was named as an attestor twice.
+    #[error("duplicate attestor {0}")]
+    DuplicateAttestor(String),
+    /// An attestor was registered already suspended.
+    ///
+    /// Not merely odd: a network starting with a suspended attestor has an
+    /// entry nothing can ever activate, since suspension is governance's job
+    /// and governance does not exist yet.
+    #[error("attestor {0} is registered suspended, and nothing can reactivate it")]
+    SuspendedAttestor(String),
     /// A bank operation failed while applying allocations.
     #[error(transparent)]
     Bank(#[from] BankError),
@@ -73,6 +85,15 @@ pub struct Genesis {
     pub validators: ValidatorSet,
     /// Sovereign denominations and their authorised issuers.
     pub issuers: Vec<(Denom, Issuer)>,
+    /// Parties licensed to attest phone and email bindings.
+    ///
+    /// Registered here for the same reason issuers are: an attestor is a
+    /// licensed institution named by the people starting the network, and until
+    /// governance exists there is nowhere else to name one. Without this field
+    /// the whole contact half of `crates/alias` is unreachable — no attestor can
+    /// exist, so `AttestContact` always fails, so no phone number ever resolves
+    /// and the SIM-swap defence protects a feature nobody can turn on.
+    pub attestors: Vec<(Address, Attestor)>,
     /// Opening balances.
     pub allocations: Vec<Allocation>,
 }
@@ -138,6 +159,21 @@ impl Genesis {
             }
         }
 
+        let mut attestors: Vec<&Address> = self.attestors.iter().map(|(a, _)| a).collect();
+        attestors.sort_unstable();
+        let before = attestors.len();
+        attestors.dedup();
+        if attestors.len() != before {
+            return Err(GenesisError::DuplicateAttestor(
+                "one account named twice".to_owned(),
+            ));
+        }
+        for (address, attestor) in &self.attestors {
+            if !attestor.active {
+                return Err(GenesisError::SuspendedAttestor(address.to_string()));
+            }
+        }
+
         let countries = self.validators.countries_represented();
         if countries < limits.min_countries {
             return Err(GenesisError::InsufficientDistribution {
@@ -175,6 +211,13 @@ impl Genesis {
             }
             for alloc in &self.allocations {
                 bank.genesis_allocate(&alloc.address, &alloc.denom, alloc.amount)?;
+            }
+        }
+
+        {
+            let mut bindings = Bindings::new(store);
+            for (address, attestor) in &self.attestors {
+                bindings.register_attestor(address, attestor);
             }
         }
 
@@ -257,6 +300,13 @@ impl Encode for Genesis {
             denom.encode(out);
             issuer.encode(out);
         }
+        #[expect(clippy::cast_possible_truncation, reason = "attestor lists are small")]
+        let len = self.attestors.len() as u32;
+        len.encode(out);
+        for (address, attestor) in &self.attestors {
+            address.encode(out);
+            attestor.encode(out);
+        }
         self.allocations.encode(out);
     }
 }
@@ -271,11 +321,17 @@ impl Decode for Genesis {
         for _ in 0..count {
             issuers.push((Denom::decode(r)?, Issuer::decode(r)?));
         }
+        let count = r.take_len()?;
+        let mut attestors = Vec::new();
+        for _ in 0..count {
+            attestors.push((Address::decode(r)?, Attestor::decode(r)?));
+        }
         Ok(Self {
             chain_id,
             genesis_time,
             validators,
             issuers,
+            attestors,
             allocations: Vec::<Allocation>::decode(r)?,
         })
     }
@@ -321,6 +377,7 @@ mod tests {
             genesis_time: Timestamp::from_millis(1_700_000_000_000),
             validators: validators(&["ke", "ng", "za"]),
             issuers: vec![(kes(), Issuer::new(addr(100)))],
+            attestors: Vec::new(),
             allocations: vec![
                 Allocation {
                     address: addr(1),

@@ -37,8 +37,8 @@
 
 use afrolink_crypto::Address;
 use afrolink_crypto::hash::{Domain, Hash32, hash_parts};
-use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
+use afrolink_primitives::{CountryCode, Height};
 use thiserror::Error;
 
 /// Minimum acceptable pepper length.
@@ -212,7 +212,12 @@ impl ContactRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attestor {
     /// Which jurisdiction licensed this attestor.
-    pub country: [u8; 2],
+    ///
+    /// A validated [`CountryCode`] rather than two loose bytes. It was the
+    /// latter until attestors became reachable, which meant `"ke"`, `"KE"` and
+    /// any two bytes at all were three spellings of one jurisdiction — in a
+    /// record hashed into the state root.
+    pub country: CountryCode,
     /// A human-readable label for wallets to display.
     pub name: String,
     /// Whether the attestor is currently permitted to attest.
@@ -272,9 +277,16 @@ impl Decode for ContactRecord {
     }
 }
 
+/// Longest display name an attestor may carry.
+///
+/// The name is shown to a user deciding whether to trust a binding, so it is
+/// state a stranger would like to write: unbounded, it is a place to put a
+/// paragraph of text that every node stores and every wallet renders.
+pub const MAX_ATTESTOR_NAME: usize = 64;
+
 impl Encode for Attestor {
     fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.country);
+        self.country.encode(out);
         self.name.encode(out);
         self.active.encode(out);
     }
@@ -282,11 +294,17 @@ impl Encode for Attestor {
 
 impl Decode for Attestor {
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
-        Ok(Self {
-            country: r.take_array::<2>()?,
+        let attestor = Self {
+            country: CountryCode::decode(r)?,
             name: String::decode(r)?,
             active: bool::decode(r)?,
-        })
+        };
+        if attestor.name.is_empty() || attestor.name.len() > MAX_ATTESTOR_NAME {
+            return Err(CodecError::Invalid(format!(
+                "an attestor name must be 1..={MAX_ATTESTOR_NAME} bytes"
+            )));
+        }
+        Ok(attestor)
     }
 }
 
@@ -435,7 +453,7 @@ mod tests {
         );
 
         let attestor = Attestor {
-            country: *b"ke",
+            country: CountryCode::new("ke").expect("valid country"),
             name: "Safaricom".to_owned(),
             active: true,
         };

@@ -119,6 +119,7 @@ mod tests {
             // AFRI has no issuer by construction — it is minted at genesis and
             // never again, which is what `NativeNotIssuable` enforces.
             issuers: Vec::new(),
+            attestors: Vec::new(),
             allocations: vec![Allocation {
                 address: account(50),
                 denom: Denom::native(),

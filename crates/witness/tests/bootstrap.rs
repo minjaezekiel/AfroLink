@@ -72,6 +72,7 @@ fn run_chain(blocks: u64, funded: u64) -> (MemoryStore, Vec<(Block, Option<Commi
         genesis_time: Timestamp::from_millis(GENESIS_MS),
         validators: validators(),
         issuers: vec![(kes(), Issuer::new(addr(100)))],
+        attestors: Vec::new(),
         allocations: vec![Allocation {
             address: addr(50),
             denom: kes(),
