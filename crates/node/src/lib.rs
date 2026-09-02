@@ -34,22 +34,24 @@
 pub mod mempool;
 pub mod proposal;
 pub mod service;
+pub mod signing;
 pub mod sim;
 
 pub use mempool::{Mempool, MempoolLimits, Rejected};
 pub use proposal::{Proposal, SignedProposal};
 pub use service::SharedNode;
+pub use signing::{MemorySignRecord, SignRecord, SignRefusal};
 
 use afrolink_consensus::{
-    Commit, CommitError, Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet,
-    VoteType,
+    Commit, CommitError, Decision, Equivocation, RoundState, SignedVote, Step, ValidatorSet, Vote,
+    VoteOutcome, VoteSet, VoteType,
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{Block, BlockContext, Executor, TxReceipt, ValidatorSets};
-use afrolink_primitives::{ChainId, Height, Round, Timestamp};
+use afrolink_primitives::{Amount, ChainId, Denom, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
-use afrolink_types::{Account, Transaction};
+use afrolink_types::{Account, Fee, Message, Transaction, TxBody};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Something that happened to the node.
@@ -154,6 +156,19 @@ pub enum SyncError {
     AppHashMismatch,
 }
 
+/// What a node pays to report an equivocation.
+///
+/// Small, because the reporter is not rewarded — see `Bank::slash_native` for
+/// why nobody should profit from a slash — and a report that costs more than it
+/// is worth is a report nobody sends.
+pub const EVIDENCE_FEE: Amount = Amount::from_units(1_000);
+
+/// How long an evidence transaction stays includable.
+///
+/// Bounded, because evidence that cannot reach a block before the unbonding
+/// period ends is evidence about stake that has already left.
+pub const EVIDENCE_VALIDITY_BLOCKS: u64 = 10_000;
+
 /// An account's next expected nonce, or zero if it has never transacted.
 ///
 /// A free function rather than a method so a selection closure can borrow the
@@ -194,6 +209,22 @@ pub struct Node {
     /// Step timers already asked for, so a timer is not pushed further out by
     /// every vote that arrives after the one that armed it.
     waits: BTreeSet<(Round, Step)>,
+    /// What this node has already signed, so it cannot sign it twice.
+    ///
+    /// In memory by default, which is correct while a process runs and worth
+    /// nothing across a restart — the case that matters. A daemon replaces it
+    /// with one that reaches a disk.
+    signing: std::sync::Arc<dyn SignRecord>,
+    /// Validators already reported at this height, so one offence produces one
+    /// transaction rather than one per conflicting vote that follows it.
+    reported: BTreeSet<Address>,
+    /// Signatures this node refused to make, newest last.
+    ///
+    /// Kept rather than discarded because a refusal is the loudest thing a
+    /// validator can learn about itself: it means this node was about to sign
+    /// something it had already signed, which is either a restart from stale
+    /// state or a second process holding the same key.
+    refusals: Vec<SignRefusal>,
     /// The `(height, round)` this node has already begun.
     ///
     /// Beginning a round twice is not a harmless repeat. A proposer builds a
@@ -251,6 +282,9 @@ impl Node {
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
             waits: BTreeSet::new(),
+            reported: BTreeSet::new(),
+            signing: std::sync::Arc::new(MemorySignRecord::new()),
+            refusals: Vec::new(),
             begun: None,
             mempool: Mempool::new(MempoolLimits::default()),
             committed: Vec::new(),
@@ -258,6 +292,31 @@ impl Node {
             last_receipts: Vec::new(),
             decided: false,
         }
+    }
+
+    /// Keep the record of what has been signed somewhere durable.
+    ///
+    /// Without this a node is guarded only within one process, which protects
+    /// against a state-machine bug and not against the restart that is the actual
+    /// hazard.
+    #[must_use]
+    pub fn with_sign_record(mut self, record: std::sync::Arc<dyn SignRecord>) -> Self {
+        self.signing = record;
+        self
+    }
+
+    /// Signatures this node refused to make.
+    ///
+    /// Empty on a healthy validator. Anything here is worth waking somebody for.
+    #[must_use]
+    pub fn refusals(&self) -> &[SignRefusal] {
+        &self.refusals
+    }
+
+    /// What this node last signed, if anything.
+    #[must_use]
+    pub fn last_signed(&self) -> Option<(Height, Round, Step)> {
+        self.signing.last()
     }
 
     /// This node's address.
@@ -367,6 +426,14 @@ impl Node {
         let mut actions = Vec::new();
 
         if self.is_proposer(round) {
+            // Claimed before anything is signed. A proposal is a signature over a
+            // value for this `(height, round)` just as a vote is.
+            if let Err(refused) = self.signing.claim(self.height, round, Step::Propose) {
+                // Fail closed. Missing a turn to propose costs one round; signing
+                // a second value for a round already signed costs the stake.
+                self.refusals.push(refused);
+                return vec![Action::ScheduleTimeout(Step::Propose, round)];
+            }
             // Selected, not drained. A round that does not commit is ordinary,
             // and taking the transactions here would lose every one of them.
             let store = &self.store;
@@ -511,8 +578,27 @@ impl Node {
         .entry(round)
         .or_insert_with(|| VoteSet::new(self.chain_id.clone(), self.height, round, vote_type));
 
-        if set.add(&self.validators, signed).is_err() {
-            return Vec::new();
+        let outcome = match set.add(&self.validators, signed) {
+            Ok(outcome) => outcome,
+            Err(_) => return Vec::new(),
+        };
+
+        // **A validator signed two different values for one (height, round).**
+        //
+        // The vote set has always detected this and built the evidence; nothing
+        // ever collected it, so the only way a validator could be slashed was for
+        // a human to hand-craft the transaction. The whole economic security
+        // argument — equivocation costs 5% of stake and a jailing — sat behind a
+        // caller that did not exist.
+        //
+        // It is reported by turning the evidence into an ordinary transaction and
+        // submitting it to this node's own mempool: it then travels the path
+        // transactions already travel, is included by whoever proposes next, and
+        // is deduplicated by nonce and by the mempool's id set. Reporting is
+        // permissionless, so one honest observer is enough.
+        let mut actions = Vec::new();
+        if let VoteOutcome::Equivocated(evidence) = outcome {
+            actions.extend(self.report_equivocation(*evidence));
         }
 
         // Only the current round can drive this node's own progress.
@@ -520,9 +606,59 @@ impl Node {
             return Vec::new();
         }
 
-        match vote_type {
+        actions.extend(match vote_type {
             VoteType::Prevote => self.check_prevote_quorum(),
             VoteType::Precommit => self.check_precommit_quorum(),
+        });
+        actions
+    }
+
+    /// Turn an equivocation into a transaction this node submits and gossips.
+    ///
+    /// Once per equivocator per height. A second report of the same offence is
+    /// refused at execution — a jailed validator cannot be jailed again — but it
+    /// still costs a fee, and every honest node that saw the votes would send
+    /// one. CometBFT deduplicates by evidence hash across the whole pool; this
+    /// is the cheap half of that, and the rest is named as follow-up in
+    /// [10-network-hardening.md](../../../docs/10-network-hardening.md) §1.
+    ///
+    /// **The reporter pays.** A validator that cannot pay a fee cannot report,
+    /// which is a real weakness and is why evidence belongs in a block rather
+    /// than in a transaction. Changing that is a block-format change; funding
+    /// validators at genesis is the part that costs nothing.
+    fn report_equivocation(&mut self, evidence: Equivocation) -> Vec<Action> {
+        if !self.reported.insert(evidence.validator) {
+            return Vec::new();
+        }
+        // One nonce per report, counting from the committed one. Two offenders in
+        // a single height would otherwise produce two transactions with the same
+        // sender and nonce, and the mempool — correctly — holds only the first, so
+        // the second equivocator would go unreported. The mempool accepts a
+        // future nonce, which is what makes this work.
+        let filed = u64::try_from(self.reported.len().saturating_sub(1)).unwrap_or(0);
+        let nonce = account_record(&self.store, &self.address)
+            .nonce
+            .saturating_add(filed);
+        let report = TxBody {
+            chain_id: self.chain_id.clone(),
+            sender: self.address,
+            nonce,
+            // Generous, but bounded: evidence that cannot be included before the
+            // unbonding period ends is evidence about stake that has left.
+            valid_until: Height(self.height.0.saturating_add(EVIDENCE_VALIDITY_BLOCKS)),
+            fee: Fee::new(EVIDENCE_FEE, Denom::native()),
+            messages: vec![Message::ReportEquivocation {
+                evidence: Box::new(evidence),
+            }],
+            memo: String::new(),
+        }
+        .sign(&self.key);
+
+        match self.submit(report) {
+            Ok(accepted) => vec![Action::BroadcastTransaction(Box::new(accepted))],
+            // Already held, or this node cannot pay. Either way there is nothing
+            // to broadcast and nothing to be done about it here.
+            Err(_) => Vec::new(),
         }
     }
 
@@ -742,6 +878,7 @@ impl Node {
         self.prevotes.clear();
         self.precommits.clear();
         self.waits.clear();
+        self.reported.clear();
         self.decided = false;
         self.last_commit = Some(commit.clone());
 
@@ -793,6 +930,20 @@ impl Node {
     /// because `VoteSet` refuses a vote it already holds and because each step
     /// moves the round forward — prevote, precommit, commit — and never back.
     fn emit_vote(&mut self, vote_type: VoteType, block_id: Option<Hash32>) -> Vec<Action> {
+        let step = match vote_type {
+            VoteType::Prevote => Step::Prevote,
+            VoteType::Precommit => Step::Precommit,
+        };
+        if let Err(refused) = self
+            .signing
+            .claim(self.height, self.round_state.round, step)
+        {
+            // Fail closed: no vote, rather than a vote that might be this node's
+            // second at this point. The round will time out and move on, which is
+            // survivable; being slashed is not.
+            self.refusals.push(refused);
+            return Vec::new();
+        }
         let signed = Vote {
             chain_id: self.chain_id.clone(),
             height: self.height,

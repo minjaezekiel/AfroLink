@@ -171,6 +171,7 @@ dependencies = [
  "afrolink-light",
  "afrolink-primitives",
  "afrolink-rpc",
+ "afrolink-staking",
  "afrolink-state",
  "afrolink-types",
  "thiserror",

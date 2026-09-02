@@ -121,6 +121,10 @@ pub fn init(
         .apply(&mut trial, GenesisLimits::devnet())
         .map_err(|e| InitError::Refused(e.to_string()))?;
 
+    // Created with the consensus key, so the two can never be copied apart and
+    // get out of sync — Tendermint's documented mistake, avoided by construction.
+    std::fs::write(config.sign_state_path(), "").map_err(io(&config.sign_state_path()))?;
+
     let bytes = genesis.to_bytes();
     std::fs::write(config.genesis_path(), &bytes).map_err(io(&config.genesis_path()))?;
     let config_path = dir.join("config");

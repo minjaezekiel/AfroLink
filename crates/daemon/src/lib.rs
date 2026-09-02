@@ -24,3 +24,4 @@ pub mod config;
 pub mod identity;
 pub mod init;
 pub mod run;
+pub mod signing;

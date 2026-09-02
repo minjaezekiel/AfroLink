@@ -155,10 +155,20 @@ header it verified itself, trusting nothing about the node in between.
       mempool gossip, so a node whose link is saturated by transactions misses
       votes. CometBFT multiplexes with per-channel priority for exactly this
       *(ADR-0023)*
-- [ ] **Double-signing protection across a restart** — nothing records what this
-      node has already signed at a height, so a validator restarted from a stale
-      store could double-sign. Tendermint keeps a write-ahead log for exactly
-      this, and it is the most serious operational gap left *(ADR-0024)*
+- [x] **Double-signing protection across a restart** — the last signed
+      `(height, round, step)`, written and `fsync`ed *before* the signature is
+      released, refused if it is not strictly after the last, and fail-closed if
+      it cannot be written. Beside the consensus key so the two cannot be copied
+      apart *([10](10-network-hardening.md) §2)*
+- [x] **Equivocation reported by the network rather than by a human** — a node
+      that sees two conflicting votes files the `ReportEquivocation` transaction
+      itself. Until this, `Staking::slash` was reachable only from a
+      hand-crafted transaction, so the chain's economic security argument
+      described code that never ran *([10](10-network-hardening.md) §1)*
+- [x] **A joined harness** — N real nodes, N sockets, N databases, real
+      consensus. Agreement, catch-up after a healed partition, a late joiner from
+      genesis, and a restart rejoining. Found four defects in its first hour
+      *([10](10-network-hardening.md) §15)*
 - [ ] **Seed nodes and peer exchange in crawler mode** — no longer blocked on
       block sync, which now exists; what is missing is the crawler mode itself
       *(ADR-0023)*
@@ -179,6 +189,10 @@ header it verified itself, trusting nothing about the node in between.
       *([ADR-0012](adr/0012-staking-and-slashing.md))*
 - [ ] Downtime slashing — needs the per-block vote history a networked node has.
       No longer blocked: the votes now arrive over a wire *(ADR-0023)*
+- [ ] **Network hardening, the rest** — inbound eviction, anchor connections, ban
+      decay, address advertisement, channel priority, retention, a metrics
+      endpoint, state sync and validator set rotation, each with its reference
+      design and its reasoning *([10](10-network-hardening.md))*
 - [ ] Delegation — stake through another operator. Deliberately deferred:
       reward accounting and slashing across delegators is the largest addition
       to the staking surface *(ADR-0012)*

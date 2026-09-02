@@ -611,6 +611,51 @@ measure the rate, because ticking more often means more refusals for the same
 load, and refusals cost reputation. What is invariant is the verdict, not the
 count.
 
+### 25. A driver that made an honest proposer equivocate
+
+The worst defect in this document, and it was not in the protocol.
+
+`start_round` builds a block from the current time. A driver that called it twice
+in one round — and every polling driver does — got two blocks with two timestamps,
+two headers and **two block ids**, both signed, both for the same
+`(height, round)`. That is the definition of equivocation, and this chain slashes
+5% of stake and jails for it. An honest validator would have done it to itself,
+because of its own timer.
+
+It presented as something else entirely: a four-node cluster losing liveness when
+one node went down. The node's own vote set detected the conflict, withdrew its
+power from the tally exactly as it should, and a three-of-four majority could no
+longer reach a quorum. Every symptom pointed at consensus; the cause was in the
+loop above it.
+
+Guarded now the way CometBFT guards `enterNewRound`: **a round is begun once.**
+And it is worth naming what would have happened without the harness — equivocation
+reporting (§1 of [10-network-hardening.md](10-network-hardening.md)) shipped in
+the same session, so the next thing built would have started slashing honest
+validators for a bug in their own driver.
+
+### 26. Two ways to say "I have gone away", neither of which worked
+
+Found by the same harness, in the same hour.
+
+**A dropped peer kept its socket.** `drop_peer` removed the outbox and the
+manager entry and left the connection open, with a thread parked on it. A banned
+peer kept a file descriptor and a thread for as long as it liked, kept sending
+frames this node paid to decrypt and discard, and — the part that mattered — never
+learned it had been dropped. Neither side would re-establish, so a partition was
+permanent. A disconnect the other end cannot observe is not a disconnect.
+
+**And then closing it banned the peer.** With the socket properly closed, the
+other end saw a reset — which the read loop scored as `Misbehaviour::Unforgivable`,
+a permanent ban, because I/O errors had been lumped in with failed authentication
+tags. A failed tag means somebody edited a frame in flight and one is enough; a
+reset means a router rebooted. On links where connectivity is *assumed* to be
+intermittent ([ADR-0005](adr/0005-african-first-design.md)), a node would have
+banned the entire network over the course of a bad afternoon.
+
+The two are one lesson: the states "gone", "misbehaving" and "unreachable" had
+been collapsed into fewer states than the network actually has.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -701,6 +746,13 @@ transition — the delivery rules in `sim.rs` are the same abstraction a real
 network needs faults injected through. Block sync now exists
 ([ADR-0024](adr/0024-block-sync-and-the-node-binary.md)), so the blocker is gone:
 a node can be partitioned, fall behind, and catch up again.
+
+That harness now exists, as `crates/daemon/tests/cluster.rs`: N real nodes on N
+loopback sockets, each with its own database, running real consensus. It found
+four defects in its first hour (§25, §26), including the most dangerous one in
+this document. Neither of the older suites could have: the first was in the driver
+above consensus, and the second was in the seam between the transport and the
+peer state it was reporting to.
 
 Defect 22 sharpens what that harness has to be. The simulator and the transport
 disagreed about a consensus rule for as long as both existed, and the disagreement

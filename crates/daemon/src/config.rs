@@ -250,6 +250,16 @@ impl Config {
         self.data_dir.join("consensus_key")
     }
 
+    /// The file recording what this validator has already signed.
+    ///
+    /// Beside the consensus key, and created with it. Tendermint splitting the
+    /// key from its state into files that could be copied separately is exactly
+    /// how the two get out of sync, and an out-of-sync pair is a double-sign.
+    #[must_use]
+    pub fn sign_state_path(&self) -> PathBuf {
+        self.data_dir.join("consensus_key.state")
+    }
+
     /// The file the genesis document lives in.
     #[must_use]
     pub fn genesis_path(&self) -> PathBuf {

@@ -22,6 +22,7 @@ afrolink-consensus.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+afrolink-staking.workspace = true
 afrolink-light.workspace = true
 
 [lints]

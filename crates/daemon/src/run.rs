@@ -40,6 +40,7 @@ use afrolink_consensus::Step;
 use afrolink_crypto::hash::{Domain, hash};
 use afrolink_executor::GenesisLimits;
 use afrolink_http::{Config as HttpConfig, Server};
+use afrolink_node::SignRecord;
 use afrolink_node::{Action, Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
@@ -65,6 +66,9 @@ pub enum RunError {
     /// The data directory holds no genesis document.
     #[error("no genesis in {0}: run `afrolinkd init` first")]
     NoGenesis(String),
+    /// The signing record could not be opened.
+    #[error("{0}")]
+    Signing(String),
     /// The genesis file is not a genesis document.
     #[error("{0} is not a genesis document")]
     BadGenesis(String),
@@ -193,13 +197,26 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
         }
     ));
 
+    // Opened before the node runs, and fatal if it cannot be read: a validator
+    // whose signing history is unknown must not sign.
+    let signing = Arc::new(
+        crate::signing::FileSignRecord::open(config.sign_state_path())
+            .map_err(RunError::Signing)?,
+    );
+    if let Some((height, round, step)) = signing.last() {
+        log(&format!(
+            "last signed  height {} round {} {step:?}",
+            height.0, round.0
+        ));
+    }
     let node = Node::new(
         chain_id.clone(),
         consensus_key,
         validators,
         state.clone(),
         &tip,
-    );
+    )
+    .with_sign_record(signing);
     let is_validator = node.is_proposer(afrolink_primitives::Round(0))
         || node.address() != afrolink_crypto::Address::from_public_key(&node_key.public_key());
     let _ = is_validator;

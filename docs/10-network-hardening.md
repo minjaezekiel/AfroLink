@@ -43,7 +43,7 @@ below has to end at something that runs in `afrolinkd`, not at a passing test.
 
 # P0 — The economic argument does not currently run
 
-## 1. Equivocation evidence is built, then dropped
+## 1. Equivocation evidence is built, then dropped — **done**
 
 **What is wrong.** `VoteSet::add` already detects a validator signing two
 different values for one `(height, round, type)` and returns
@@ -94,12 +94,25 @@ is not a transaction. Ours is. Adding a channel would mean a second gossip path,
 a second dedup set and a second bound to get wrong, for no property we do not
 already have.
 
-**Cost.** Small. One `Action` variant, one match arm, one transaction builder,
-and the tests that prove a Byzantine validator actually loses money end to end.
+**Cost.** Small. One match arm, one transaction builder, and
+`crates/node/tests/evidence.rs`.
+
+**Built.** `Node::on_vote` now keeps the `VoteOutcome` it used to throw away and
+`report_equivocation` files the transaction. Two things surfaced while building
+it that the plan above had not accounted for:
+
+* **Two offenders in one height collided on a nonce.** Both reports were built
+  with the node's committed nonce, so the mempool — correctly — held only the
+  first, and the second equivocator went unreported. Reports are now numbered
+  from the committed nonce, which the mempool accepts as a future nonce.
+* **The reporter must be funded.** A validator with no balance cannot pay the fee
+  and therefore cannot report, which makes the chain's security depend on
+  somebody's bank balance. Validators are funded at genesis for now; the real fix
+  is evidence in the block, as Cosmos does it, and that is a block-format change.
 
 ---
 
-## 2. A restarted validator can double-sign against itself
+## 2. A restarted validator can double-sign against itself — **done**
 
 **What is wrong.** Nothing records what this validator has already signed. A node
 restarted from a stale store — a rolled-back disk, a restored snapshot, a
@@ -131,6 +144,19 @@ the same place the vote is counted, so there is one door and it is guarded.
   documented mistake, avoided by construction.
 
 **Cost.** Small, and it is the highest-value small thing in this document.
+
+**Built.** `crates/node/src/signing.rs` holds the rule and an in-memory record —
+so a `Node` is never *unguarded* — and `crates/daemon/src/signing.rs` holds the
+durable one: temp file, `fsync`, rename, written before the signature is
+released. `init` creates it beside the consensus key so the two cannot be copied
+apart.
+
+A file that exists and cannot be parsed **stops the node**. The tempting reading
+is "no usable record, so assume nothing was signed", and that assumption is
+precisely what produces a double-sign.
+
+Verified live: a validator run to height 4 left `4 0 2` on disk, and the restart
+logged `last signed height 4 round 0 Precommit` before carrying on.
 
 ---
 
@@ -409,25 +435,50 @@ binary finds what the tests do not.
 
 **This is built first**, before P0, so that every fix below it is validated by it.
 
+**Built**, as `crates/daemon/tests/cluster.rs`, and it earned its place inside an
+hour. Four defects, none of which 987 tests had seen:
+
+1. **A driver could make an honest proposer equivocate.** `start_round` built a
+   fresh block on every call — new timestamp, new header, new block id — so a
+   polling driver signed two values for one `(height, round)`. The node's own
+   vote set detected it, withdrew its power, and a three-of-four majority could no
+   longer reach quorum: it presented as a liveness bug and was a slashable
+   offence. Guarded now the way CometBFT guards `enterNewRound`.
+2. **Rounds advanced but were never begun.** `ScheduleTimeout(Propose, r)` meant
+   both "wait for someone else's proposal" and "the round moved on" — opposite
+   instructions from one action. Split out as `Action::StartRound`. The
+   prevote/precommit wait timers were missing entirely, so a round whose prevotes
+   divided had nothing left that could end it.
+3. **`drop_peer` never closed the socket.** A disconnect the other end cannot
+   observe is not a disconnect: the peer kept a thread and a descriptor, and
+   neither side would re-establish, so a partition was permanent.
+4. **A reset connection was scored `Unforgivable`** — a permanent ban. On links
+   where connectivity is assumed intermittent, a node would ban the entire
+   network over a bad afternoon.
+
+The first is the one worth dwelling on. It was not a protocol bug; it was in the
+loop that drives the protocol, which is exactly the seam no unit test covers and
+exactly what this harness exists to reach.
+
 ---
 
 # Order of work
 
-| # | Item | Why here | Size |
-|---|---|---|---|
-| 15 | Joined harness + live stress script | Validates everything after it; the thing that catches seam defects | M |
-| 1 | Equivocation evidence end to end | The economic security argument does not currently run | S |
-| 2 | Double-sign guard | §1 makes an honest operator's mistake fatal; ships with it | S |
-| 3 | Inbound eviction | Cheapest attack on a node's usefulness | M |
-| 4 | Anchor connections | Restart is when an eclipse is cheapest | S |
-| 5 | Ban decay | Small, and wrong in both directions today | S |
-| 7 | Address advertisement | Topology cannot grow past the seeds without it | M |
-| 6 | Channel priority | Votes must not queue behind payments | M |
-| 8 | Seen-set by height | Same pass as §6 | S |
-| 9 | Retention | Before a chain gets long, not after | M |
-| 12 | Metrics endpoint | Needed to operate anything real | S |
-| 10 | State sync | Large; needs P0/P1 stable first | L |
-| 11 | Validator set rotation | Largest; a mistake here is a chain split | L |
+| # | Item | Why here | Size | State |
+|---|---|---|---|---|
+| 15 | Joined harness | Validates everything after it; the thing that catches seam defects | M | **done** |
+| 1 | Equivocation evidence end to end | The economic security argument did not run | S | **done** |
+| 2 | Double-sign guard | §1 makes an honest operator's mistake fatal; ships with it | S | **done** |
+| 3 | Inbound eviction | Cheapest attack on a node's usefulness | M | open |
+| 4 | Anchor connections | Restart is when an eclipse is cheapest | S | open |
+| 5 | Ban decay | Small, and wrong in both directions today | S | open |
+| 7 | Address advertisement | Topology cannot grow past the seeds without it | M | open |
+| 6 | Channel priority | Votes must not queue behind payments | M | open |
+| 8 | Seen-set by height | Same pass as §6 | S | open |
+| 9 | Retention | Before a chain gets long, not after | M | open |
+| 12 | Metrics endpoint | Needed to operate anything real | S | open |
+| 10 | State sync | Large; needs P0/P1 stable first | L | open |
+| 11 | Validator set rotation | Largest; a mistake here is a chain split | L | open |
 
 ---
 
