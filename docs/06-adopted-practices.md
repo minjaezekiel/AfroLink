@@ -162,9 +162,28 @@ adopted practice than any other single source, in both directions.
 | **21-day unbonding period** (Cosmos Hub) | Taken as the economic root the trusting period is derived from | `crates/light` (`UNBONDING_MS`) | **In code** (parameter) / **Open** (enforcement, Phase 2) |
 | CosmWasm as the contract VM | Taken (ink! unmaintained since Jan 2026) | ADR-0003 | **Decided** |
 | IBC for interop | Taken | ADR-0001, Phase 4 | **Open** |
+| **MConnection channel multiplexing** — several streams over one TCP connection, each with a priority | **Open.** Peers here are trusted equally and consensus traffic does not outrank mempool gossip, so a saturated node misses votes. The right fix, not yet earned | [ADR-0023](adr/0023-peer-to-peer.md) | **Open** |
+| **Secret Connection** — station-to-station over X25519, ChaCha20-Poly1305, identities exchanged inside the encrypted channel | Taken, including the fix it needed: the sorted-transcript defence against ephemeral-key malleability, and refusal of every low-order point rather than only the all-zero key that was reported | `crates/p2p/src/handshake.rs` | **In code** |
+| **PEX in seed / crawler mode** | **Open**, and blocked on block sync: a seed that cannot serve history is a phone book with no numbers in it | ADR-0023 | **Open** |
 | **`x/gov`'s quorum, threshold and voting period** | Taken in shape, not in electorate: a threshold in basis points and a deadline, over a seated council rather than bonded stake. Cosmos's own documented failure mode — low turnout making a coordinated minority decisive — is an argument against stake-weighting *at this stage*, not against voting | [ADR-0022](adr/0022-governance.md), `crates/gov` | **In code** |
 | `NoWithVeto` and an explicit vote against | **Rejected.** With a threshold to clear and a deadline to clear it by, silence already means no. A proposal nobody answers lapses, which is the same shape a savings group's quorum takes | `crates/gov/src/proposal.rs` | **Rejected** |
 | The Cosmos SDK itself | **Rejected** — Go, and the monetary modules we need cannot live at application layer | ADR-0001 | **Rejected** |
+
+---
+
+## Bitcoin's peer layer — [ADR-0023](adr/0023-peer-to-peer.md)
+
+| Practice | Decision | Where it lives | Status |
+|---|---|---|---|
+| **Address groups** — count `/16`s, not addresses | Taken, and every diversity rule in the crate is written in terms of it. Holding many addresses in one group costs nothing; holding them across groups costs money and relationships | `crates/p2p/src/peer.rs` | **In code** |
+| **Tried / new tables with source-group bucketing** — the post-Heilman addrman | Taken, including the two-hash construction that bounds one source to 32 of 256 buckets. Flooding therefore costs address *diversity* rather than address *count* | `crates/p2p/src/addrbook.rs` | **In code** |
+| **A secret salt on bucket placement** | Taken, derived from the node's own secret key. A salt an attacker can compute is not a salt — they would work out offline which addresses collide and craft the cheapest flood | `AddrBook::new` | **In code** |
+| **Diversify outbound connections by group** | Taken as the rule the rest exists to serve: a subnet holding ten thousand addresses is worth one of eight outbound slots | `Manager::wants_outbound` | **In code** |
+| **asmap** — bucket by ASN rather than by prefix | **Open.** Erebus is mounted by an adversary that already holds many prefixes, so grouping by prefix does nothing against it. Bitcoin ships an IP-to-ASN map; that is a data-distribution problem we have not solved, and calling a /16 an AS would be worse than saying so | ADR-0023 | **Open** |
+| **Anchor connections** — keep slots for peers you had before a restart | **Open.** A restart is exactly when an eclipse pays off, and this is the cheap defence | ADR-0023 | **Open** |
+| **Inbound eviction preferring group diversity** | **Open.** Capping inbound without evicting means an attacker who opens forty connections keeps honest peers out | ADR-0023 | **Open** |
+| **BIP324** — encrypt a public ledger's gossip | Taken, and for BIP324's reasons rather than for confidentiality: an authenticated channel makes a node id mean something, tamper-evidence stops an ISP editing what it cannot stop it dropping, and identities inside the channel make topology mapping cost an active attack | `crates/p2p` | **In code** |
+| **Fixed-size padded frames** | **Rejected for now.** Message sizes are visible and a block is distinguishable from a vote by length. Padding costs bandwidth on exactly the links that have least of it | ADR-0023 | **Rejected** (revisit) |
 
 ---
 

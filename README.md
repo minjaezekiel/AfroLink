@@ -43,7 +43,7 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Eighteen crates, **831 tests passing**. A working
+**Phase 2 in progress.** Nineteen crates, **917 tests passing**. A working
 chain: four validators propose, vote and commit blocks; a light client verifies
 a payment holding nothing but a 32-byte header; the chain survives a restart;
 and a wallet can **send money, watch it arrive, and prove its whole history** —
@@ -59,8 +59,14 @@ curl 'localhost:8080/v1/transactions/{id}'                          # proof + re
 curl -X POST --data-binary @tx.bin localhost:8080/v1/transactions   # 202
 ```
 
-Nodes still cannot talk to *each other* — that is the peer-to-peer layer, and it
-is next. A one-node chain is not decentralised, and
+Nodes can now talk to *each other*: `crates/p2p` gives them an authenticated,
+encrypted transport, an eclipse-resistant address book and a gossip policy, and
+two nodes on two sockets relay a transaction through a third
+([ADR-0023](docs/adr/0023-peer-to-peer.md)). What is still missing is **block
+sync** — a node that falls behind cannot catch up — and a **node binary**:
+nothing here is a daemon yet, every transport is driven by `cargo test`. Those
+two are what stand between this and a testnet.
+
 [ADR-0013](docs/adr/0013-http-transport.md) says why the client surface was
 built first anyway.
 
@@ -81,14 +87,15 @@ crates/
   alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
   pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         adversarial inputs, and ledger invariants under load       41 tests ✅
+  fuzz/         adversarial inputs, and ledger invariants under load       48 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
   http/         strict HTTP/1.1 transport around the query protocol         83 tests ✅
+  p2p/          authenticated encrypted peer transport, eclipse defence     79 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.
 Every case is a pure function of a `u64` seed, so a failure names the seed that
-produced it and reproduces forever. Three suites:
+produced it and reproduces forever. Five suites:
 
 * **~284 000 hostile byte strings** across 71 decoder fixtures, asserting that
   anything which decodes re-encodes to *exactly* the bytes it came from. Two
@@ -99,10 +106,16 @@ produced it and reproduces forever. Three suites:
   equivocation — attacking one invariant: no two nodes commit different blocks at
   the same height. `AFROLINK_CAMPAIGN=25 cargo test --release` runs ~1 300
   independent schedules.
-* **~110 000 malformed HTTP requests** against the transport, which is now the
-  first thing an anonymous peer reaches — asserting it never panics, never reads
-  one request two ways, and never lets what *follows* a request change where
-  that request ended. The last one is the property request smuggling violates.
+* **~110 000 malformed HTTP requests** against the client transport — asserting
+  it never panics, never reads one request two ways, and never lets what
+  *follows* a request change where that request ended. The last one is the
+  property request smuggling violates.
+* **~12 000 hostile inputs at the peer transport**, which is now the first thing
+  an anonymous *peer* reaches, before any signature or proof is checked: random
+  frames, mutated frames, bare length headers announcing four gigabytes, hostile
+  handshake openings including every low-order Curve25519 point, and forged
+  identity frames. Nothing may panic, nothing may allocate on a stranger's word,
+  and nothing may authenticate as a node whose key the sender does not hold.
 * **Seeded sequences of *valid* transactions**, asserting after every block that
   balances still sum to supply, that no account lost money without a transaction
   naming it, that no savings group has reached a state it could not have reached

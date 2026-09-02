@@ -125,11 +125,29 @@ header it verified itself, trusting nothing about the node in between.
 
 ## Phase 2 — Multi-node testnet
 
-- [ ] **Validator-to-validator networking** — a separate layer from the client
-      RPC above, as it is in CometBFT: a known, bounded, keyed validator set on
-      one side and anonymous strangers on the other are different threat models.
-      Authenticated handshake (an audited Noise implementation, never a
-      hand-rolled one), gossip, peer scoring
+- [x] **Validator-to-validator networking** — a separate layer from the client
+      RPC, as it is in CometBFT. An authenticated, encrypted transport
+      (station-to-station over X25519 and ChaCha20-Poly1305, with the
+      ephemeral-key malleability bug that broke Tendermint 0.32 refused at the
+      exchange), an eclipse-resistant address book following Bitcoin's tried/new
+      bucketing, and one rule above them: no two outbound connections into the
+      same address group. The consensus driver did not change a line
+      *([ADR-0023](adr/0023-peer-to-peer.md))*
+- [ ] **Block sync** — the largest remaining gap in the network layer. There is
+      no `GetBlock`, so a node that falls behind cannot catch up and a restarted
+      node cannot rejoin a running chain. Needs the first request/response
+      pattern in the peer protocol, with its own bounds and its own scoring
+      *(ADR-0023)*
+- [ ] **A node binary** — nothing in the workspace is a daemon; every transport,
+      including the HTTP one, is driven by `cargo test`. Assembling a genesis
+      file, a store, both transports, a timer loop and a signal handler is the
+      other thing standing between this and a testnet *(ADR-0023)*
+- [ ] **Seed nodes and peer exchange in crawler mode** — needs block sync first,
+      since a seed that cannot serve history is a phone book with no numbers in
+      it *(ADR-0023)*
+- [ ] **Inbound eviction preferring group diversity** — the inbound cap alone
+      means an attacker who can open forty connections keeps honest peers out.
+      Bitcoin evicts rather than refuses, and that is the right fix *(ADR-0023)*
 - [x] Byzantine testing — partitions, packet loss, message reordering and
       injected equivocation, all against the agreement invariant *([08](08-adversarial-testing.md))*
 - [ ] Model checking the round state machine (TLA+ / Stateright). The randomised
@@ -142,12 +160,14 @@ header it verified itself, trusting nothing about the node in between.
       trusting period is derived from. Slashing reaches stake that has already
       begun unbonding, which is what makes the window worth anything
       *([ADR-0012](adr/0012-staking-and-slashing.md))*
-- [ ] Downtime slashing — needs the per-block vote history a networked node has
+- [ ] Downtime slashing — needs the per-block vote history a networked node has.
+      No longer blocked: the votes now arrive over a wire *(ADR-0023)*
 - [ ] Delegation — stake through another operator. Deliberately deferred:
       reward accounting and slashing across delegators is the largest addition
       to the staking surface *(ADR-0012)*
 - [ ] Epoch rotation — `active_set()` derives the set; nothing yet installs it
-      at a boundary. That is the node's job and arrives with networking
+      at a boundary. That is the node's job, and it is now waiting on the node
+      binary rather than on networking
 - [ ] Bisection helper for skipping sync — the protocol supports it; the retry
       loop that halves the gap on `InsufficientOverlap` is not written
 - [ ] **Witness log transport** — `crates/witness` is transport-free by design;

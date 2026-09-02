@@ -131,6 +131,31 @@ pub enum Domain {
     TreeHeadSignDoc,
     /// A leaf in a witness log: one observation of the chain.
     WitnessEntry,
+    /// The handshake transcript two peers must agree on before they trust each
+    /// other.
+    ///
+    /// Covers the protocol version, the chain id, and both ephemeral public
+    /// keys in sorted order. Sorting is the fix for the malleability class that
+    /// broke Tendermint's Secret Connection before 0.33: without it, an
+    /// attacker who injects an ephemeral key can make both sides derive a
+    /// transcript it also knows.
+    P2pTranscript,
+    /// Derives a directional session key from the Diffie–Hellman secret and the
+    /// transcript.
+    P2pSessionKey,
+    /// The bytes a node's long-term key signs to prove it holds the identity it
+    /// claims.
+    ///
+    /// Separate from every other signing domain, so a handshake signature can
+    /// never be presented as a consensus vote and a vote can never be replayed
+    /// into a handshake.
+    P2pHandshakeSignDoc,
+    /// Places an address into an address-book bucket.
+    ///
+    /// Salted with a secret only the node knows, so an attacker cannot compute
+    /// in advance which bucket an address of theirs will occupy — which is what
+    /// makes filling a specific bucket expensive rather than free.
+    P2pAddrBucket,
 }
 
 impl Domain {
@@ -155,6 +180,10 @@ impl Domain {
             Self::WitnessLogId => "afrolink/v1/witness-log-id",
             Self::TreeHeadSignDoc => "afrolink/v1/tree-head-sign-doc",
             Self::WitnessEntry => "afrolink/v1/witness-entry",
+            Self::P2pTranscript => "afrolink/v1/p2p-transcript",
+            Self::P2pSessionKey => "afrolink/v1/p2p-session-key",
+            Self::P2pHandshakeSignDoc => "afrolink/v1/p2p-handshake-sign-doc",
+            Self::P2pAddrBucket => "afrolink/v1/p2p-addr-bucket",
         }
     }
 }

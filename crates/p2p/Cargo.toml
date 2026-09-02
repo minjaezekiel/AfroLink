@@ -1,0 +1,27 @@
+[package]
+name = "afrolink-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Validator-to-validator networking: an authenticated encrypted transport, an eclipse-resistant address book, and the gossip policy above them."
+
+[dependencies]
+afrolink-primitives.workspace = true
+afrolink-crypto.workspace = true
+afrolink-consensus.workspace = true
+afrolink-types.workspace = true
+afrolink-node.workspace = true
+thiserror.workspace = true
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.11"
+getrandom.workspace = true
+
+[dev-dependencies]
+afrolink-executor.workspace = true
+afrolink-state.workspace = true
+
+[lints]
+workspace = true

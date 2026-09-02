@@ -426,6 +426,71 @@ still run against whatever the executor actually did.
 **An invariant that is never reached always holds.** This is the third time that
 sentence has earned its place in this document.
 
+### 19. A dial that never returned
+
+Not a security defect — a design one, found the first time the integration suite
+was run, and it hung.
+
+`Transport::dial` did the handshake on a spawned thread and then `join`ed it. But
+the thread it joined ran the connection's *read loop*, which lives as long as the
+peer does. So a dial that succeeded never returned, and a node could open exactly
+one connection, in the sense that it could open one and then stop.
+
+The fix is the seam the rest of the crate already draws: the handshake and the
+manager's decision run on the calling thread, so a dial can report *why* it
+failed, and everything after that is two threads. The general shape is worth
+writing down because it is easy to get backwards — **a connection setup is
+synchronous and a connection is not.**
+
+The same run turned up a busy-wait next to it. When a peer was dropped, its
+outbox sender went with it, so the writer thread's `recv_timeout` returned
+`Disconnected` — and the loop, which only checked for a shutdown flag, treated
+that as "nothing to send yet" and spun. It would not have failed a test. It would
+have pegged a core per departed peer on a real node, which is the sort of thing
+that gets found in production by a graph.
+
+### 20. A rule that was right, and the fixtures that were not
+
+Concentration rules kept refusing test fixtures across two phases, and each time
+the first instinct was that the rule was too strict. It never was.
+
+* **Councils of three equal jurisdictions**, three times over — refused, because
+  a third of the weight is exactly enough to block a two-thirds threshold. That
+  belongs to [ADR-0022](adr/0022-governance.md) and is the same shape as what
+  follows.
+* **The peer integration tests, where every node is on `127.0.0.1`** and the
+  second dial was therefore into a group already used.
+
+The second is the interesting one, because the honest fix is a carve-out and
+carve-outs are how defences rot. `127.0.0.0/8` carries no information about
+network diversity at all: treating it as one group stops a devnet forming its
+second connection, and treating each socket as its own group is exactly as
+meaningful, which is to say not at all. So loopback sockets are each their own
+group, **and the port is ignored for every routable address** — because an
+attacker who could split a subnet into many groups by opening many ports would
+have bought diversity with nothing. Both halves are asserted:
+`a_port_never_splits_a_routable_group` next to `loopback_sockets_are_each_their_own_group`.
+
+The lesson is the one this document keeps arriving at from different directions:
+when a rule refuses a fixture, the fixture is usually what is wrong.
+
+### 21. An address book that recommended addresses nobody could dial
+
+Found by reading the peer-exchange path rather than by running it.
+
+`Manager::admit` recorded every connection in the address book and marked it
+`tried` — inbound connections included. What an inbound connection tells you,
+though, is the peer's **ephemeral source port**, which dials nothing. A node
+would therefore have filled its tried table with unreachable addresses and then
+handed them to every peer that asked for a sample, which is a slow, entirely
+self-inflicted partition.
+
+The fix is one line and it closes something larger than the bug: **only a peer
+this node dialled enters the address book.** An attacker cannot reach a node's
+gossip sample by connecting to it. They have to be reachable, and the node has to
+have chosen to reach them. Bitcoin arrives at the same place from the same
+direction.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -478,6 +543,18 @@ Named gaps, so they are not mistaken for coverage:
 - **The mempool is not fuzzed.** Its limits are unit-tested and its insert path
   runs full stateless verification, but nobody has thrown a hostile sequence of
   submissions at it under the scheduler.
+- **The peer layer is fuzzed at its surface, not at its policy.** Around 12 000
+  hostile inputs go at framing, the handshake and the message decoders, and
+  nothing panics or allocates on a stranger's word. What is *not* fuzzed is the
+  manager under adversarial sequencing — a scheduler that opens, floods, drops
+  and reconnects peers while asserting that an attacker never holds more than one
+  outbound slot. The invariant is unit-tested against a static ten-thousand
+  address flood; it is not attacked over time.
+- **There is no networked equivalent of the consensus simulator.** Agreement is
+  attacked in `sim.rs`, which has no sockets; the socket layer is tested for
+  refusal and delivery, not for whether four real nodes commit the same block
+  under partition. Joining those two is the obvious next harness and it needs
+  block sync first.
 - **Governance is fuzzed for structure, not for capture.** The suite checks that
   a council cannot vote itself into a shape its own rules refuse and that no
   proposal moves money. It says nothing about whether the *seated body* is
@@ -487,8 +564,19 @@ Named gaps, so they are not mistaken for coverage:
 
 ## Where this goes
 
-Phase 2 adds the validator-to-validator layer, and with it the network-level
-attacks that need peers rather than clients: eclipse, peer scoring, gossip
-amplification. The harness is deliberately transport-free so it survives that
+The validator-to-validator layer has arrived
+([ADR-0023](adr/0023-peer-to-peer.md)), and with it the network-level attacks
+that need peers rather than clients. Eclipse resistance, peer scoring and gossip
+amplification are now tested — but as *rules*, in a module with no sockets in it,
+plus a dozen integration tests over loopback.
+
+What is missing is the join between the two harnesses that already exist. The
+deterministic simulator in `sim.rs` attacks agreement with partitions, loss and
+reordering, and has no network. The peer suite attacks the wire, and has no
+consensus. Neither asks the question a real testnet asks: **do four nodes on four
+sockets commit the same block while an attacker holds one of them eclipsed?**
+
+The harness was kept transport-free precisely so that it survives this
 transition — the delivery rules in `sim.rs` are the same abstraction a real
-network needs faults injected through.
+network needs faults injected through. Joining them needs block sync first,
+because a node that cannot catch up cannot be partitioned and then healed.
