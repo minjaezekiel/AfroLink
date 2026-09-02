@@ -307,3 +307,62 @@ fn peer_vote(
     }
     .sign(&key(signer))
 }
+
+#[test]
+fn beginning_the_same_round_twice_does_not_make_a_proposer_equivocate() {
+    // The most dangerous defect this file guards, and it was not in the protocol
+    // — it was in the driver.
+    //
+    // Every driver polls. A loop that called `start_round` again while still in
+    // the same round made the proposer build a *second* block for that round: a
+    // fresh timestamp gives a fresh header and a fresh block id, so the node
+    // signed two different values for one `(height, round)`. That is exactly what
+    // this chain slashes 5% of stake for, and the node would have done it to
+    // itself, honestly, because of its own timer.
+    //
+    // It surfaced as a liveness failure rather than as a slashing: the node's own
+    // vote set detected the conflict, withdrew its power from the tally, and a
+    // three-of-four majority could no longer reach a quorum. A cluster stalled,
+    // and the reason was that an honest validator had equivocated.
+    let me = proposer_seed(4);
+    let mut node = node(me, 4);
+
+    let first = node.start_round(now());
+    let proposals: Vec<_> = first
+        .iter()
+        .filter(|a| matches!(a, Action::BroadcastProposal(_)))
+        .collect();
+    assert_eq!(proposals.len(), 1, "the proposer proposes once");
+
+    // Called again in the same round, as a polling driver will.
+    let again = node.start_round(Timestamp::from_millis(1_700_000_009_000));
+    assert!(
+        again.is_empty(),
+        "beginning a round already begun must do nothing; got {again:?}"
+    );
+
+    // And the vote this node cast is still the only one it has cast, with its
+    // power intact — an equivocation would have withdrawn it.
+    let cast = votes_broadcast(&first);
+    assert_eq!(cast.len(), 1, "one prevote, for one block");
+    let block_id = cast[0].1.expect("prevoted for its own block");
+
+    // Two more validators agree, which with this node's own vote is three of
+    // four. It can only carry the prevote step if its own vote still counts.
+    let peers = others(me, 4);
+    let mut carried = false;
+    for signer in &peers[..2] {
+        let out = node.handle(Event::Vote(Box::new(peer_vote(
+            *signer,
+            VoteType::Prevote,
+            Some(block_id),
+        ))));
+        carried |= votes_broadcast(&out)
+            .iter()
+            .any(|(kind, _)| *kind == VoteType::Precommit);
+    }
+    assert!(
+        carried,
+        "the proposer's own vote was not counted — it equivocated against itself"
+    );
+}

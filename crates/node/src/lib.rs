@@ -50,7 +50,7 @@ use afrolink_executor::{Block, BlockContext, Executor, TxReceipt, ValidatorSets}
 use afrolink_primitives::{ChainId, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
 use afrolink_types::{Account, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Something that happened to the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +88,21 @@ pub enum Action {
     /// chain, so they are part of the output rather than an internal detail.
     Committed(Box<Block>, Box<Commit>),
     /// Start a timer for this step.
+    ///
+    /// "If nothing has moved this round on by then, vote nil and let it end."
     ScheduleTimeout(Step, Round),
+    /// The round has advanced. **Begin it**, by calling [`Node::start_round`].
+    ///
+    /// Distinct from [`Self::ScheduleTimeout`] because they are opposite
+    /// instructions and were once the same one. A driver that read
+    /// `ScheduleTimeout(Propose, r)` as "wait" was right when it came from
+    /// `start_round` — a validator waiting for somebody else's proposal — and
+    /// wrong when it came from a round that had just failed, where what is needed
+    /// is for this node to *propose*. So a round that did not commit advanced,
+    /// waited, timed out, advanced again, and the chain never committed anything
+    /// once a single proposer was unreachable. One action, two meanings, and the
+    /// driver could not tell which it had.
+    StartRound(Round),
 }
 
 /// Why a block offered by a peer was not applied.
@@ -177,6 +191,17 @@ pub struct Node {
     proposals: BTreeMap<Round, SignedProposal>,
     prevotes: BTreeMap<Round, VoteSet>,
     precommits: BTreeMap<Round, VoteSet>,
+    /// Step timers already asked for, so a timer is not pushed further out by
+    /// every vote that arrives after the one that armed it.
+    waits: BTreeSet<(Round, Step)>,
+    /// The `(height, round)` this node has already begun.
+    ///
+    /// Beginning a round twice is not a harmless repeat. A proposer builds a
+    /// *fresh* block each time — a new timestamp gives a new header and a new
+    /// block id — so a driver that called `start_round` twice in one round made
+    /// an honest proposer sign two different values for one `(height, round)`.
+    /// That is the exact definition of equivocation this chain slashes 5% for.
+    begun: Option<(Height, Round)>,
 
     /// Transactions waiting to be proposed.
     ///
@@ -225,6 +250,8 @@ impl Node {
             proposals: BTreeMap::new(),
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
+            waits: BTreeSet::new(),
+            begun: None,
             mempool: Mempool::new(MempoolLimits::default()),
             committed: Vec::new(),
             last_commit: None,
@@ -243,6 +270,22 @@ impl Node {
     #[must_use]
     pub fn height(&self) -> Height {
         self.height
+    }
+
+    /// The round currently being decided.
+    ///
+    /// For operators and for tests: a node stuck at a height is a different
+    /// problem from a node cycling through rounds at one, and without this they
+    /// look identical from outside.
+    #[must_use]
+    pub fn round(&self) -> Round {
+        self.round_state.round
+    }
+
+    /// The step within the current round.
+    #[must_use]
+    pub fn step(&self) -> Step {
+        self.round_state.step
     }
 
     /// The current state root.
@@ -312,6 +355,15 @@ impl Node {
     /// Begin the current round, proposing if it is our turn.
     pub fn start_round(&mut self, time: Timestamp) -> Vec<Action> {
         let round = self.round_state.round;
+        // **A round is begun once.** CometBFT guards `enterNewRound` the same
+        // way, and the reason is not tidiness: without it a driver that polls —
+        // and every driver polls — makes its own proposer equivocate, because the
+        // second call builds a second block for the same height and round. An
+        // honest validator would have been slashed for its own node's timer.
+        if self.begun == Some((self.height, round)) {
+            return Vec::new();
+        }
+        self.begun = Some((self.height, round));
         let mut actions = Vec::new();
 
         if self.is_proposer(round) {
@@ -484,7 +536,16 @@ impl Node {
             .get(&round)
             .and_then(|s| s.quorum_value(&self.validators))
         else {
-            return Vec::new();
+            // More than two thirds have prevoted and no single value carried it.
+            // Without a timer here the round has nothing left that can end it, and
+            // a node sits in the prevote step for good — reachable whenever the
+            // network is split enough to divide the prevotes but not enough to
+            // stop them arriving.
+            return self.arm(round, Step::Prevote, |node| {
+                node.prevotes
+                    .get(&round)
+                    .is_some_and(|s| s.has_quorum_any(&node.validators))
+            });
         };
 
         let Decision::Precommit(value) = self.round_state.decide_precommit(Some(quorum)) else {
@@ -500,16 +561,34 @@ impl Node {
             .get(&round)
             .and_then(|s| s.quorum_value(&self.validators))
         else {
-            return Vec::new();
+            // As above, for the precommit step.
+            return self.arm(round, Step::Precommit, |node| {
+                node.precommits
+                    .get(&round)
+                    .is_some_and(|s| s.has_quorum_any(&node.validators))
+            });
         };
 
         match self.round_state.decide_commit(Some(quorum)) {
             Decision::Commit(block_id) => self.commit(block_id),
-            Decision::NextRound(next) => {
-                vec![Action::ScheduleTimeout(Step::Propose, next)]
-            }
+            // `decide_commit` has already moved the round on. What is needed now
+            // is for this node to *begin* that round — proposing if it is its
+            // turn — not to wait for somebody else to.
+            Decision::NextRound(next) => vec![Action::StartRound(next)],
             _ => Vec::new(),
         }
+    }
+
+    /// Ask for a step timer once per round, if `when` says it is due.
+    ///
+    /// Once, because every later vote in the same round would otherwise push the
+    /// deadline further out and a timer that keeps being reset never fires.
+    fn arm(&mut self, round: Round, step: Step, when: impl Fn(&Self) -> bool) -> Vec<Action> {
+        if self.waits.contains(&(round, step)) || !when(self) {
+            return Vec::new();
+        }
+        self.waits.insert((round, step));
+        vec![Action::ScheduleTimeout(step, round)]
     }
 
     /// Apply the committed block to real state and advance the height.
@@ -662,6 +741,7 @@ impl Node {
         self.proposals.clear();
         self.prevotes.clear();
         self.precommits.clear();
+        self.waits.clear();
         self.decided = false;
         self.last_commit = Some(commit.clone());
 
@@ -681,11 +761,12 @@ impl Node {
                 self.round_state.step = Step::Precommit;
                 self.emit_vote(VoteType::Precommit, None)
             }
-            // Precommits were inconclusive: move on to the next round.
+            // Precommits were inconclusive: move on to the next round, and
+            // begin it rather than waiting in it.
             Step::Precommit if self.round_state.step == Step::Precommit => {
                 let next = round.next();
                 self.round_state.advance_to(next);
-                vec![Action::ScheduleTimeout(Step::Propose, next)]
+                vec![Action::StartRound(next)]
             }
             _ => Vec::new(),
         }

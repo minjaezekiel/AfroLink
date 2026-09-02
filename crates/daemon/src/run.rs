@@ -150,6 +150,9 @@ fn adopt_genesis(
     }
 }
 
+/// How many rounds may be begun back to back before the loop takes a breath.
+const MAX_ROUND_RESTARTS: usize = 8;
+
 /// A timer the consensus driver asked for.
 struct Deadline {
     step: Step,
@@ -371,8 +374,7 @@ fn drive(
                 // commits has to reach the store, and the transport is the one
                 // place that knows how — a driver holding the node itself would
                 // produce blocks that exist only in memory.
-                let actions = transport.start_round(now());
-                deadline = schedule(config, &actions, deadline);
+                deadline = begin_round(config, transport, deadline);
             }
         }
 
@@ -383,11 +385,42 @@ fn drive(
             deadline = None;
             let actions = transport.timeout(step);
             deadline = schedule(config, &actions, deadline);
+            // A step that ended the round asks for the next one to be *begun*.
+            // Waiting instead is how a chain advances rounds forever without
+            // committing, once a single proposer is unreachable.
+            if wants_new_round(&actions) {
+                deadline = begin_round(config, transport, deadline);
+            }
         }
 
         std::thread::sleep(poll);
     }
     Ok(())
+}
+
+/// Begin rounds until one of them settles into waiting.
+///
+/// A round that fails to commit asks to be begun again immediately, and the loop
+/// obliges rather than sleeping through it — but a bounded number of times, so a
+/// state machine that asked forever would peg a core rather than being obeyed
+/// forever.
+fn begin_round(
+    config: &Config,
+    transport: &Transport,
+    mut deadline: Option<Deadline>,
+) -> Option<Deadline> {
+    for _ in 0..MAX_ROUND_RESTARTS {
+        let actions = transport.start_round(now());
+        deadline = schedule(config, &actions, deadline);
+        if !wants_new_round(&actions) {
+            break;
+        }
+    }
+    deadline
+}
+
+fn wants_new_round(actions: &[Action]) -> bool {
+    actions.iter().any(|a| matches!(a, Action::StartRound(_)))
 }
 
 /// Turn a `ScheduleTimeout` action into a real deadline.

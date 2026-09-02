@@ -143,6 +143,16 @@ struct Shared {
     node: Arc<SharedNode>,
     manager: Mutex<Manager>,
     outboxes: Mutex<BTreeMap<PeerId, SyncSender<PeerMessage>>>,
+    /// A handle on each peer's socket, purely so it can be closed.
+    ///
+    /// Dropping a peer used to mean forgetting it: its outbox went and its
+    /// manager entry went, and its **socket stayed open** with a thread parked on
+    /// it. A banned peer kept a file descriptor and a thread for as long as it
+    /// cared to hold them, kept sending frames this node then paid to decrypt and
+    /// discard, and — worse — never learned it had been dropped, so neither side
+    /// would ever re-establish. A disconnect that the other end cannot observe is
+    /// not a disconnect.
+    streams: Mutex<BTreeMap<PeerId, TcpStream>>,
     running: AtomicBool,
     /// Frames delivered to the node. Observable so a test can wait on progress
     /// rather than on a sleep.
@@ -208,6 +218,15 @@ impl Shared {
     fn drop_peer(&self, peer: &PeerId) {
         if let Ok(mut outboxes) = self.outboxes.lock() {
             outboxes.remove(peer);
+        }
+        // Close the socket, so the peer thread unblocks and the *other end*
+        // finds out. Without this a dropped peer is only dropped locally: the
+        // remote still believes it is connected and will refuse a fresh dial as a
+        // duplicate, which makes a partition permanent rather than temporary.
+        if let Ok(mut streams) = self.streams.lock()
+            && let Some(stream) = streams.remove(peer)
+        {
+            drop(stream.shutdown(std::net::Shutdown::Both));
         }
         if let Ok(mut manager) = self.manager.lock() {
             manager.on_disconnect(peer);
@@ -369,7 +388,12 @@ impl Shared {
                 // learns a block committed by seeing the precommits, which it
                 // already has — or, if it was not there to see them, by asking
                 // for the block through the sync path.
-                Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => continue,
+                // The node's own business, and the driver's. A peer learns a
+                // block committed by seeing the precommits, and nobody else has
+                // any use for this node's round timers.
+                Action::Committed(_, _) | Action::ScheduleTimeout(_, _) | Action::StartRound(_) => {
+                    continue;
+                }
             };
             self.relay(&message, except);
         }
@@ -432,6 +456,7 @@ impl Transport {
             node,
             manager: Mutex::new(manager),
             outboxes: Mutex::new(BTreeMap::new()),
+            streams: Mutex::new(BTreeMap::new()),
             running: AtomicBool::new(true),
             delivered: AtomicU64::new(0),
             blocks,
@@ -513,6 +538,19 @@ impl Transport {
             .lock()
             .map(|m| m.peers())
             .unwrap_or_default()
+    }
+
+    /// Drop every peer, keeping the listener open.
+    ///
+    /// What a partition looks like from inside one node: connections go away, the
+    /// node keeps running, and it will re-dial from its address book when asked.
+    /// An operator uses it to shed a bad peer set without a restart; a test uses
+    /// it to cut a node off from a network that carries on without it, which is
+    /// the only way to ask whether it can catch up afterwards.
+    pub fn disconnect_all(&self) {
+        for peer in self.peers() {
+            self.shared.drop_peer(&peer);
+        }
     }
 
     /// Connect to a peer, refusing anyone but the identity named.
@@ -655,6 +693,9 @@ fn establish(
     if let Ok(mut outboxes) = shared.outboxes.lock() {
         outboxes.insert(peer, tx);
     }
+    if let Ok(mut streams) = shared.streams.lock() {
+        streams.insert(peer, stream.try_clone()?);
+    }
 
     let (mut sealer, mut opener) = session.split();
 
@@ -784,10 +825,29 @@ fn read_loop(shared: &Arc<Shared>, reader: &mut TcpStream, opener: &mut Opener, 
                 penalise(shared, peer, Misbehaviour::Undecodable);
                 return;
             }
-            Err(FrameError::Session(_) | FrameError::Io(_)) => {
-                // A failed tag is unrecoverable: the frame counters have
-                // diverged and nothing after this will authenticate either.
+            Err(FrameError::Session(_)) => {
+                // A failed authentication tag. Somebody edited a frame in flight,
+                // or the counters have diverged and nothing after this will
+                // authenticate either. Unforgivable, and one is enough.
                 penalise(shared, peer, Misbehaviour::Unforgivable);
+                return;
+            }
+            Err(FrameError::Io(_)) => {
+                // **The wire broke. That is not misbehaviour.**
+                //
+                // A reset connection, a router that rebooted, a peer that was
+                // killed — none of it is a protocol violation and none of it is
+                // anything the peer chose. Scoring it as one, which this used to
+                // do by lumping it in with a failed tag, permanently bans any
+                // peer whose link drops: a node that restarts is banned by
+                // everyone who saw the reset, and can never rejoin.
+                //
+                // On the links this chain is built for, where connectivity is
+                // assumed to be intermittent ([ADR-0005]), that is not an edge
+                // case — it is a node quietly banning the entire network over the
+                // course of a bad afternoon.
+                //
+                // [ADR-0005]: ../../../docs/adr/0005-african-first-design.md
                 return;
             }
         }

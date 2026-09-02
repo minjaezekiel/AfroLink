@@ -20,11 +20,7 @@
 
 #![deny(missing_docs)]
 
-mod chain;
-mod config;
-mod identity;
-mod init;
-mod run;
+use afrolink_daemon::{config, identity, init, run};
 
 use std::path::PathBuf;
 use std::process::ExitCode;

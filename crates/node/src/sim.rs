@@ -33,6 +33,12 @@ use afrolink_state::MemoryStore;
 use std::collections::BTreeSet;
 
 use crate::{Action, Event, Node};
+
+/// How many times one delivery may restart a round before the harness gives up.
+///
+/// A bound rather than a `while`: a state machine that asked to begin a round
+/// forever would otherwise hang the test rather than fail it.
+const MAX_ROUND_RESTARTS: usize = 8;
 use afrolink_consensus::{Step, ValidatorSet};
 
 /// A set of nodes and the messages in flight between them.
@@ -242,19 +248,30 @@ impl Network {
                 if !self.is_live(target) {
                     continue;
                 }
-                let actions = self
+                let mut actions = self
                     .nodes
                     .get_mut(target)
                     .map(|n| n.handle(event))
                     .unwrap_or_default();
-                for action in &actions {
-                    if let Action::Committed(block, _) = action {
-                        self.committed
-                            .push((target, block.header.height, block.header.id()));
-                        commits.push((target, (**block).clone()));
+                // A round that ends without committing asks to be *begun* again,
+                // and a real driver obliges immediately. Doing the same here is
+                // what keeps this harness from being a more forgiving machine
+                // than the one it is testing — the difference that once hid a
+                // node not counting its own vote.
+                for _ in 0..MAX_ROUND_RESTARTS {
+                    let again = actions.iter().any(|a| matches!(a, Action::StartRound(_)));
+                    self.record(target, &actions, &mut commits);
+                    self.dispatch(target, actions);
+                    if !again {
+                        break;
                     }
+                    let time = self.time;
+                    actions = self
+                        .nodes
+                        .get_mut(target)
+                        .map(|n| n.start_round(time))
+                        .unwrap_or_default();
                 }
-                self.dispatch(target, actions);
             }
         }
         commits
@@ -268,6 +285,17 @@ impl Network {
             }
         }
         self.run(max_steps)
+    }
+
+    /// Note every block a node committed.
+    fn record(&mut self, from: usize, actions: &[Action], commits: &mut Vec<(usize, Block)>) {
+        for action in actions {
+            if let Action::Committed(block, _) = action {
+                self.committed
+                    .push((from, block.header.height, block.header.id()));
+                commits.push((from, (**block).clone()));
+            }
+        }
     }
 
     /// Turn a node's actions into messages, subject to the delivery rules.
@@ -313,6 +341,9 @@ impl Network {
                         }
                     }
                 }
+                // Handled by the caller, which has to call `start_round` and
+                // therefore needs the node rather than the queue.
+                Action::StartRound(_) => {}
                 Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => {}
             }
         }
@@ -558,15 +589,33 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_missed_the_proposal_prevotes_nil_on_timeout() {
-        // Liveness: a round with no proposal must conclude rather than hang.
+    fn a_round_with_no_proposal_ends_and_the_next_one_begins() {
+        // Liveness, stated the way it should always have been.
+        //
+        // This assertion used to be `commits.is_empty()` under a comment reading
+        // "a round with no proposal must conclude rather than hang" — it was
+        // asserting the hang. A round that ended and left every node waiting for
+        // a proposal nobody would ever make looked exactly like this, and it is
+        // what stalled a four-node cluster the moment one proposer was
+        // unreachable: rounds advanced forever and nothing was ever committed.
+        //
+        // Nobody starts a round here, so no proposal exists. The propose timeout
+        // drives every node to prevote nil, the nil quorum ends the round, and
+        // the next round has to *begin on its own*.
         let mut net = network(4);
-        // Nobody starts a round, so no proposal exists. Timeouts drive it.
         let commits = net.tick(Step::Propose, 1_000);
-        assert!(commits.is_empty());
+        assert!(
+            !commits.is_empty(),
+            "the network never recovered from a round with no proposal"
+        );
         for node in &net.nodes {
-            assert_eq!(node.height(), Height(1), "no block, so no progress");
+            assert_eq!(
+                node.height(),
+                Height(2),
+                "every node should have committed the block the next round proposed"
+            );
         }
+        assert_eq!(net.agreement_violation(), None);
     }
 
     #[test]

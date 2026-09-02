@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "afrolinkd: the node binary. Assembles a store, a consensus driver, a peer-to-peer transport and a query server into something that runs."
 
+[lib]
+name = "afrolink_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "afrolinkd"
 path = "src/main.rs"
@@ -27,6 +31,9 @@ hex.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 ctrlc = "3.5"
+
+[dev-dependencies]
+afrolink-types.workspace = true
 
 [lints]
 workspace = true

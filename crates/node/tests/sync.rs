@@ -27,7 +27,7 @@
 )]
 
 use afrolink_consensus::{
-    Commit, CommitError, CountryCode, SignedVote, Step, Validator, ValidatorSet, Vote, VoteType,
+    Commit, CommitError, CountryCode, SignedVote, Validator, ValidatorSet, Vote, VoteType,
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
@@ -126,22 +126,24 @@ fn a_real_chain(heights: usize) -> Vec<(Block, Commit)> {
         for node in &mut network.nodes {
             let _ = node.submit(payment(n as u64));
         }
+        // One `start_round` is now one height: a round that commits resets to
+        // round zero of the next height and waits to be begun, and a round that
+        // does not commit begins the next one itself. Firing an extra propose
+        // timeout here — which this fixture used to do to unstick a round that
+        // could not end on its own — now commits a second block per iteration.
         network.start_round();
-        network.run(4_000);
-        network.tick(Step::Propose, 4_000);
-        network.run(4_000);
+        network.run(8_000);
 
         let leader = &network.nodes[0];
         let Some(block) = leader.committed.last().cloned() else {
             panic!("height {n} did not commit");
         };
         let commit = leader.last_commit.clone().expect("a commit certificate");
-        if chain_blocks
-            .last()
-            .is_some_and(|(b, _): &(Block, Commit)| b.header.height == block.header.height)
-        {
-            panic!("height {n} produced no new block");
-        }
+        assert_eq!(
+            block.header.height,
+            Height(n as u64 + 1),
+            "the fixture must produce exactly one height per round, in order"
+        );
         chain_blocks.push((block, commit));
     }
     assert!(

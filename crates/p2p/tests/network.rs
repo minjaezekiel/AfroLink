@@ -438,7 +438,6 @@ impl BlockSource for Served {
 
 /// A real chain of `heights` blocks, decided by a real validator set.
 fn a_real_chain(heights: usize) -> Vec<SyncBlock> {
-    use afrolink_consensus::Step;
     use afrolink_node::sim::Network;
 
     let validators = validators();
@@ -463,10 +462,13 @@ fn a_real_chain(heights: usize) -> Vec<SyncBlock> {
 
     let mut chain_blocks = Vec::new();
     for _ in 0..heights {
+        // One `start_round` is now one height: a round that commits resets to
+        // round zero of the next height and waits to be begun, and a round that
+        // does not commit begins the next one itself. Firing an extra propose
+        // timeout here — which this fixture used to do to unstick a round that
+        // could not end on its own — now commits a second block per iteration.
         network.start_round();
-        network.run(4_000);
-        network.tick(Step::Propose, 4_000);
-        network.run(4_000);
+        network.run(8_000);
         let leader = &network.nodes[0];
         chain_blocks.push(SyncBlock {
             block: leader.committed.last().cloned().expect("a block"),
