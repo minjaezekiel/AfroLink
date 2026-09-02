@@ -150,6 +150,13 @@ pub enum Domain {
     /// never be presented as a consensus vote and a vote can never be replayed
     /// into a handshake.
     P2pHandshakeSignDoc,
+    /// Identifies a genesis document, so operators can compare one string.
+    ///
+    /// Every node on a chain must agree byte for byte on its genesis — the
+    /// validator set, the allocations, the council, the parameters. This is what
+    /// turns that agreement into something two people can check over a phone
+    /// call, rather than a diff of a file neither of them can read aloud.
+    GenesisId,
     /// Places an address into an address-book bucket.
     ///
     /// Salted with a secret only the node knows, so an attacker cannot compute
@@ -183,6 +190,7 @@ impl Domain {
             Self::P2pTranscript => "afrolink/v1/p2p-transcript",
             Self::P2pSessionKey => "afrolink/v1/p2p-session-key",
             Self::P2pHandshakeSignDoc => "afrolink/v1/p2p-handshake-sign-doc",
+            Self::GenesisId => "afrolink/v1/genesis-id",
             Self::P2pAddrBucket => "afrolink/v1/p2p-addr-bucket",
         }
     }

@@ -43,13 +43,16 @@ Full evidence and sourcing: **[docs/00-research.md](docs/00-research.md)**.
 
 ## Status
 
-**Phase 2 in progress.** Nineteen crates, **917 tests passing**. A working
-chain: four validators propose, vote and commit blocks; a light client verifies
-a payment holding nothing but a 32-byte header; the chain survives a restart;
-and a wallet can **send money, watch it arrive, and prove its whole history** —
-over HTTP, trusting nothing about the node it is talking to. A sovereign issues
-its own currency and hands the role on; a council licenses the attestors and
-tunes the parameters, and can reach nobody's money
+**Phase 2 in progress.** Twenty crates, **976 tests passing**. A chain that
+**runs**: `afrolinkd` opens a store, joins a network, drives consensus against a
+real clock and serves proved queries while it does. Four validators propose, vote
+and commit blocks; a node that fell behind asks its peers for what it missed and
+verifies every block before applying it; a light client verifies a payment
+holding nothing but a 32-byte header; the chain survives a restart; and a wallet
+can **send money, watch it arrive, and prove its whole history** — over HTTP,
+trusting nothing about the node it is talking to. A sovereign issues its own
+currency and hands the role on; a council licenses the attestors and tunes the
+parameters, and can reach nobody's money
 ([ADR-0022](docs/adr/0022-governance.md)).
 
 ```bash
@@ -59,13 +62,24 @@ curl 'localhost:8080/v1/transactions/{id}'                          # proof + re
 curl -X POST --data-binary @tx.bin localhost:8080/v1/transactions   # 202
 ```
 
-Nodes can now talk to *each other*: `crates/p2p` gives them an authenticated,
-encrypted transport, an eclipse-resistant address book and a gossip policy, and
-two nodes on two sockets relay a transaction through a third
-([ADR-0023](docs/adr/0023-peer-to-peer.md)). What is still missing is **block
-sync** — a node that falls behind cannot catch up — and a **node binary**:
-nothing here is a daemon yet, every transport is driven by `cargo test`. Those
-two are what stand between this and a testnet.
+Nodes talk to *each other*: `crates/p2p` gives them an authenticated, encrypted
+transport, an eclipse-resistant address book and a gossip policy
+([ADR-0023](docs/adr/0023-peer-to-peer.md)), plus **block sync** — a node that
+falls behind asks its peers for the heights it missed, and applies each one only
+after checking the commit certificate against its own validator set and
+re-executing it ([ADR-0024](docs/adr/0024-block-sync-and-the-node-binary.md)).
+
+And there is now a **node binary**. `afrolinkd` is the first artefact here that
+runs on its own rather than under `cargo test`:
+
+```bash
+afrolinkd init  --dir ./node --chain-id afrolink-devnet   # keys, genesis, config
+afrolinkd start --dir ./node                              # a chain, on a socket
+afrolinkd show  --dir ./node                              # identity and genesis hash
+```
+
+A second node initialised with `--join ./node/genesis`, given the first as a
+seed, catches up from genesis and then tracks the tip.
 
 [ADR-0013](docs/adr/0013-http-transport.md) says why the client surface was
 built first anyway.
@@ -80,17 +94,18 @@ crates/
   gov/          the council, the parameters it may tune, the timelock       36 tests ✅
   executor/     block execution, genesis, and attacks on the money        141 tests ✅
   consensus/    validator sets, votes, rounds, decentralisation report   59 tests ✅
-  node/         consensus driver, mempool, proposals, simulator          41 tests ✅
+  node/         consensus driver, mempool, proposals, catch-up, simulator 56 tests ✅
   light/        commit + proof verification, long-range defence         25 tests ✅
   store/        durable storage, history index, proof-serving view      36 tests ✅
   rpc/          proof-carrying query protocol (no networking)          14 tests ✅
   alias/        usernames, phone/email bindings, SIM-swap defence        51 tests ✅
   pay/          afri: payment URIs, payment references                   18 tests ✅
   witness/      append-only witness logs, corroborated checkpoints        38 tests ✅
-  fuzz/         adversarial inputs, and ledger invariants under load       48 tests ✅
+  fuzz/         adversarial inputs, and ledger invariants under load       50 tests ✅
   staking/      bonding, unbonding, slashing, validator set derivation     35 tests ✅
   http/         strict HTTP/1.1 transport around the query protocol         83 tests ✅
-  p2p/          authenticated encrypted peer transport, eclipse defence     79 tests ✅
+  p2p/          encrypted peer transport, eclipse defence, block sync     102 tests ✅
+  daemon/       afrolinkd: the node binary — keys, config, the only clock  19 tests ✅
 ```
 
 Adversarial testing is not a separate job nobody looks at — it is `cargo test`.

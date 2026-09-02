@@ -491,6 +491,52 @@ gossip sample by connecting to it. They have to be reachable, and the node has t
 have chosen to reach them. Bitcoin arrives at the same place from the same
 direction.
 
+### 22. A node that did not count its own vote
+
+The most instructive defect in this document, because the test suite was the
+thing hiding it.
+
+`Node` returns its own votes as `Action::BroadcastVote`. The transport put them
+on the wire and never fed them back into the node's own vote set. The
+deterministic simulator, though, has always delivered a broadcast to its sender
+as well as to everybody else — one line in `sim::dispatch`, written years of
+commits ago and entirely correct. So **every consensus test in the workspace had
+the rule, and the system under test did not.**
+
+It is invisible on four validators: three votes from three peers is already more
+than two thirds of four, so the missing self-vote is never the one that matters.
+It is total on one validator, which can never reach a quorum it is not counted
+in. The first devnet started by the node binary produced no blocks at all, and
+950 passing tests said nothing, because every one of them drove consensus through
+the simulator.
+
+The general lesson is worth more than the fix: **a simulator more capable than
+production is a simulator that hides bugs.** Every divergence between the harness
+and the system is a defect the harness is guaranteed not to find, and the
+divergences are invisible precisely because the harness passes. What caught this
+was not a test but an artefact — running the thing.
+
+It is pinned now by `a_lone_validator_counts_its_own_vote_and_commits`, which
+fails without the fix, and the single-validator case is the shape that makes it
+fail loudly rather than subtly.
+
+### 23. Two constants that had to differ, and did not
+
+`MAX_BLOCK_BYTES` bounds a block's transactions; `MAX_FRAME_LEN` bounds what a
+peer may send. Both were written independently as `4 * 1024 * 1024`.
+
+A block at the consensus limit could therefore be built, proposed and voted on —
+and never sent, because every wrapper a block travels in is strictly larger than
+the block, so `write_frame` refuses it. A proposer could have produced a legal
+block that no peer could receive, and only at the limit, which is exactly where
+nobody looks.
+
+Found while writing the block-sync protocol, by asking how many blocks fit in one
+frame. The fix is that there is now one number: `MAX_FRAME_LEN` is derived from
+`MAX_BLOCK_BYTES` plus a stated headroom, and a `const` assertion fails the build
+if the relationship is ever broken. Two constants that must not drift apart
+should not be two constants.
+
 ## What this does not prove
 
 Nothing here proves the chain is secure. It falsifies specific claims, and
@@ -578,5 +624,12 @@ sockets commit the same block while an attacker holds one of them eclipsed?**
 
 The harness was kept transport-free precisely so that it survives this
 transition — the delivery rules in `sim.rs` are the same abstraction a real
-network needs faults injected through. Joining them needs block sync first,
-because a node that cannot catch up cannot be partitioned and then healed.
+network needs faults injected through. Block sync now exists
+([ADR-0024](adr/0024-block-sync-and-the-node-binary.md)), so the blocker is gone:
+a node can be partitioned, fall behind, and catch up again.
+
+Defect 22 sharpens what that harness has to be. The simulator and the transport
+disagreed about a consensus rule for as long as both existed, and the disagreement
+was undetectable from inside either. A joined harness is not only a better test of
+agreement — it is the only thing that can find the *next* place where the model
+and the system quietly differ.

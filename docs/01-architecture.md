@@ -201,13 +201,22 @@ addresses, state and its proofs, transactions, the bank, the executor,
 Ubuntu-BFT, the light client, durable storage, staking and slashing, aliases,
 witness logs, and the query protocol.
 
-**The network line is half-drawn.** A client can reach a node over HTTP — send a
+**The network line is drawn.** A client reaches a node over HTTP — send a
 payment, find it, prove it ([ADR-0013](adr/0013-http-transport.md),
-[ADR-0014](adr/0014-payment-history-and-the-mempool.md)) — but nodes cannot
-reach each other. The consequence is not a missing feature but a missing
-property: a one-node chain is not decentralised, whatever the consensus code can
-do. Multi-node behaviour is exercised by the deterministic simulator rather than
-by a network.
+[ADR-0014](adr/0014-payment-history-and-the-mempool.md)) — and nodes reach each
+other over an authenticated, encrypted peer transport with an eclipse-resistant
+address book ([ADR-0023](adr/0023-peer-to-peer.md)). A node that falls behind
+catches up ([ADR-0024](adr/0024-block-sync-and-the-node-binary.md)), which is
+what makes a peer set something a node can *leave and rejoin* rather than
+something it belongs to only while it happens to be up.
 
-**Nothing above the protocol-module line exists.** No contract VM, no
-governance, no bridges.
+**And there is something to run.** `afrolinkd` is the first artefact here that is
+not a library under `cargo test`: it owns the only clock in the workspace, and
+everything below it stays synchronous and deterministic because it does. That is
+architectural rather than a status — the reason `Node` takes timeouts as events
+and returns broadcasts as values is so that exactly one place has to know what
+time it is.
+
+**Above the protocol-module line there is governance and nothing else.** A
+council licenses attestors and tunes parameters and can reach nobody's money
+([ADR-0022](adr/0022-governance.md)). No contract VM, no bridges.

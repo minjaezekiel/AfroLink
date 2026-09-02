@@ -35,19 +35,36 @@ use std::io::{Read, Write};
 
 use afrolink_consensus::SignedVote;
 use afrolink_crypto::hash::{Domain, Hash32, hash};
+use afrolink_executor::MAX_BLOCK_BYTES;
 use afrolink_node::SignedProposal;
+use afrolink_primitives::Height;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader};
 use afrolink_types::Transaction;
 
 use crate::peer::PeerAddr;
 use crate::secret::{Opener, Sealer, SessionError, TAG_LEN};
+use crate::sync::SyncBlock;
+
+/// What a frame may carry beyond the block itself.
+///
+/// A block travels wrapped: as a proposal it gains a chain id, a height, a
+/// round, a proposer and a signature; as a [`SyncBlock`] it gains a whole commit
+/// certificate, which is one precommit — a vote and a 64-byte signature, about
+/// 130 bytes — per validator. A mebibyte of headroom covers a certificate from
+/// some eight thousand validators, which is an order of magnitude beyond any set
+/// this chain will carry, and it costs nothing when unused.
+pub const FRAME_HEADROOM: usize = 1024 * 1024;
 
 /// Largest frame this protocol accepts, sealed bytes included.
 ///
-/// A whole proposed block is the biggest thing gossiped, and `MAX_BLOCK_BYTES`
-/// bounds that. This sits above it with room for the framing and the tag, and
-/// far below anything that would trouble a node's memory.
-pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
+/// **Derived from `MAX_BLOCK_BYTES` rather than restating it.** The two were
+/// independently written as `4 * 1024 * 1024` and were therefore exactly equal,
+/// which meant a block at the consensus limit could be *built* and *voted on* but
+/// never *sent*: every wrapper a block travels in — a proposal, a sync response —
+/// is strictly larger than the block, so `write_frame` would refuse it. A
+/// proposer could have produced a legal block that no peer could receive. Two
+/// constants that must not drift apart should not be two numbers.
+pub const MAX_FRAME_LEN: usize = MAX_BLOCK_BYTES.saturating_add(FRAME_HEADROOM);
 
 /// Most addresses one `Addrs` message may carry.
 ///
@@ -113,6 +130,29 @@ pub enum PeerMessage {
     Ping(u64),
     /// The echo of a [`Self::Ping`].
     Pong(u64),
+    /// The highest height this peer has **committed** — not the one it is working on.
+    ///
+    /// The distinction is the whole meaning of the message and it is easy to get
+    /// backwards: a node driving consensus at height 42 has committed 41, and
+    /// announcing 42 would have peers asking it for a block that does not exist
+    /// yet, every tick, forever.
+    ///
+    /// A claim and nothing more. Claiming too high earns the peer requests it
+    /// cannot answer; claiming too low means it is never asked. Neither buys
+    /// anything, because what makes a synced block acceptable is the certificate
+    /// attached to it, not the peer's account of itself.
+    Status(Height),
+    /// Ask for one committed block and its certificate.
+    GetBlock(Height),
+    /// One committed block and the certificate that finalised it.
+    Block(Box<SyncBlock>),
+    /// A refusal to serve a height: not held, or beyond this peer's tip.
+    ///
+    /// Its own message rather than silence, so a node that asked can ask
+    /// somebody else at once instead of waiting out a timeout. Silence and
+    /// "I do not have it" are different facts and a syncer that cannot tell them
+    /// apart wastes a request window on every pruned peer it meets.
+    NoBlock(Height),
 }
 
 impl PeerMessage {
@@ -122,13 +162,26 @@ impl PeerMessage {
     /// repeatedly, and an address list is answered rather than relayed, so
     /// neither belongs in the seen-set: putting them there would mean a peer
     /// could never probe us twice.
+    ///
+    /// The sync messages are excluded for a sharper reason. They are a
+    /// request/response exchange, not gossip, and a node that fails to apply a
+    /// block must be able to ask for the same height again. If a `Block` were
+    /// deduplicated, the second copy would be dropped before it was looked at and
+    /// the node would stall for good at the first height it stumbled on.
     #[must_use]
     pub fn gossip_id(&self) -> Option<Hash32> {
         let bytes = match self {
             Self::Proposal(p) => p.to_bytes(),
             Self::Vote(v) => v.to_bytes(),
             Self::Transaction(t) => t.to_bytes(),
-            Self::GetAddrs | Self::Addrs(_) | Self::Ping(_) | Self::Pong(_) => return None,
+            Self::GetAddrs
+            | Self::Addrs(_)
+            | Self::Ping(_)
+            | Self::Pong(_)
+            | Self::Status(_)
+            | Self::GetBlock(_)
+            | Self::Block(_)
+            | Self::NoBlock(_) => return None,
         };
         Some(hash(Domain::P2pTranscript, &bytes))
     }
@@ -144,6 +197,10 @@ impl PeerMessage {
             Self::Addrs(_) => "addrs",
             Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
+            Self::Status(_) => "status",
+            Self::GetBlock(_) => "getblock",
+            Self::Block(_) => "block",
+            Self::NoBlock(_) => "noblock",
         }
     }
 }
@@ -176,6 +233,22 @@ impl Encode for PeerMessage {
                 out.push(7);
                 nonce.encode(out);
             }
+            Self::Status(height) => {
+                out.push(8);
+                height.encode(out);
+            }
+            Self::GetBlock(height) => {
+                out.push(9);
+                height.encode(out);
+            }
+            Self::Block(sync) => {
+                out.push(10);
+                sync.encode(out);
+            }
+            Self::NoBlock(height) => {
+                out.push(11);
+                height.encode(out);
+            }
         }
     }
 }
@@ -203,6 +276,10 @@ impl Decode for PeerMessage {
             }
             6 => Self::Ping(u64::decode(r)?),
             7 => Self::Pong(u64::decode(r)?),
+            8 => Self::Status(Height::decode(r)?),
+            9 => Self::GetBlock(Height::decode(r)?),
+            10 => Self::Block(Box::new(SyncBlock::decode(r)?)),
+            11 => Self::NoBlock(Height::decode(r)?),
             tag => {
                 return Err(CodecError::UnknownDiscriminant {
                     tag,
@@ -433,6 +510,36 @@ mod tests {
     #[test]
     fn an_unknown_message_tag_does_not_decode() {
         assert!(decode_exact::<PeerMessage>(&[99]).is_err());
+    }
+
+    #[test]
+    fn a_block_at_the_consensus_limit_still_fits_in_a_frame() {
+        // These two constants were written independently and came out exactly
+        // equal, which made a legal block unsendable: a proposer could build and
+        // vote on a block that no peer could ever receive, because every wrapper
+        // a block travels in is strictly larger than the block. The frame bound
+        // is now derived from the block bound, and this is what keeps them from
+        // drifting apart again.
+        const {
+            assert!(
+                MAX_FRAME_LEN > MAX_BLOCK_BYTES,
+                "a frame must hold a maximum-size block plus what wraps it"
+            );
+            assert!(
+                MAX_FRAME_LEN - MAX_BLOCK_BYTES >= FRAME_HEADROOM,
+                "the headroom is what a commit certificate travels in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_reply_is_never_deduplicated() {
+        // A block is a *response*, not gossip. If it entered the seen-set, a node
+        // that failed to apply a height could never be sent that height again,
+        // and would stall there for good.
+        assert!(PeerMessage::GetBlock(Height(7)).gossip_id().is_none());
+        assert!(PeerMessage::NoBlock(Height(7)).gossip_id().is_none());
+        assert!(PeerMessage::Status(Height(7)).gossip_id().is_none());
     }
 
     #[test]

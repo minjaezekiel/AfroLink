@@ -17,3 +17,7 @@ priv_validator_key.json
 .idea/
 .vscode/
 *.swp
+
+# A node's data directory: keys, a database and a genesis. Never in a repository.
+afrolink-data/
+*.redb

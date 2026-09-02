@@ -1,12 +1,16 @@
 [package]
-name = "afrolink-p2p"
+name = "afrolink-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Validator-to-validator networking: an authenticated encrypted transport, an eclipse-resistant address book, and the gossip policy above them."
+description = "afrolinkd: the node binary. Assembles a store, a consensus driver, a peer-to-peer transport and a query server into something that runs."
+
+[[bin]]
+name = "afrolinkd"
+path = "src/main.rs"
 
 [dependencies]
 afrolink-primitives.workspace = true
@@ -14,12 +18,15 @@ afrolink-crypto.workspace = true
 afrolink-consensus.workspace = true
 afrolink-executor.workspace = true
 afrolink-state.workspace = true
-afrolink-types.workspace = true
 afrolink-node.workspace = true
+afrolink-p2p.workspace = true
+afrolink-store.workspace = true
+afrolink-rpc.workspace = true
+afrolink-http.workspace = true
+hex.workspace = true
 thiserror.workspace = true
-x25519-dalek = { version = "3.0", features = ["static_secrets"] }
-chacha20poly1305 = "0.11"
 getrandom.workspace = true
+ctrlc = "3.5"
 
 [lints]
 workspace = true

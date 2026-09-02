@@ -133,18 +133,26 @@ header it verified itself, trusting nothing about the node in between.
       bucketing, and one rule above them: no two outbound connections into the
       same address group. The consensus driver did not change a line
       *([ADR-0023](adr/0023-peer-to-peer.md))*
-- [ ] **Block sync** — the largest remaining gap in the network layer. There is
-      no `GetBlock`, so a node that falls behind cannot catch up and a restarted
-      node cannot rejoin a running chain. Needs the first request/response
-      pattern in the peer protocol, with its own bounds and its own scoring
+- [x] **Block sync** — a node that fell behind asks its peers for the heights it
+      missed. A block travels with the commit certificate that finalised it, and
+      is applied only after that certificate verifies against this node's own
+      validator set *and* re-execution reproduces the header's state root — so a
+      peer is a source of blocks, never an authority about them
+      *([ADR-0024](adr/0024-block-sync-and-the-node-binary.md))*
+- [x] **A node binary** — `afrolinkd`: keys, a genesis document whose hash
+      operators compare, a durable store, both transports, a consensus loop that
+      owns the only clock in the workspace, and a clean stop. A second node
+      joins a running chain from genesis and catches up *(ADR-0024)*
+- [ ] **State sync** — a new node still replays every block from genesis. Needs
+      the state tree served in verifiable chunks rather than blocks served whole
+      *(ADR-0024)*
+- [ ] **Double-signing protection across a restart** — nothing records what this
+      node has already signed at a height, so a validator restarted from a stale
+      store could double-sign. Tendermint keeps a write-ahead log for exactly
+      this, and it is the most serious operational gap left *(ADR-0024)*
+- [ ] **Seed nodes and peer exchange in crawler mode** — no longer blocked on
+      block sync, which now exists; what is missing is the crawler mode itself
       *(ADR-0023)*
-- [ ] **A node binary** — nothing in the workspace is a daemon; every transport,
-      including the HTTP one, is driven by `cargo test`. Assembling a genesis
-      file, a store, both transports, a timer loop and a signal handler is the
-      other thing standing between this and a testnet *(ADR-0023)*
-- [ ] **Seed nodes and peer exchange in crawler mode** — needs block sync first,
-      since a seed that cannot serve history is a phone book with no numbers in
-      it *(ADR-0023)*
 - [ ] **Inbound eviction preferring group diversity** — the inbound cap alone
       means an attacker who can open forty connections keeps honest peers out.
       Bitcoin evicts rather than refuses, and that is the right fix *(ADR-0023)*
@@ -166,8 +174,9 @@ header it verified itself, trusting nothing about the node in between.
       reward accounting and slashing across delegators is the largest addition
       to the staking surface *(ADR-0012)*
 - [ ] Epoch rotation — `active_set()` derives the set; nothing yet installs it
-      at a boundary. That is the node's job, and it is now waiting on the node
-      binary rather than on networking
+      at a boundary. No longer blocked: the node binary exists, and this is now
+      the change that also forces block sync to follow validator set transitions
+      the way `crates/light` already does *(ADR-0024)*
 - [ ] Bisection helper for skipping sync — the protocol supports it; the retry
       loop that halves the gap on `InsufficientOverlap` is not written
 - [ ] **Witness log transport** — `crates/witness` is transport-free by design;

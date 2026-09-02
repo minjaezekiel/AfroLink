@@ -26,11 +26,13 @@ use std::time::Duration;
 use afrolink_consensus::{CountryCode, Validator, ValidatorSet};
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_executor::{Allocation, Genesis, GenesisLimits};
-use afrolink_node::{Node, SharedNode};
+use afrolink_node::Node;
+use afrolink_node::SharedNode;
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
-use afrolink_p2p::transport::{Transport, wait_for};
+use afrolink_p2p::sync::{BlockSource, NoBlocks, SyncBlock};
+use afrolink_p2p::transport::{DiscardCommits, Transport, wait_for};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::MemoryStore;
 use afrolink_types::{Fee, Message, Transaction, TxBody};
@@ -92,6 +94,16 @@ fn transport(seed: u8, node: &Arc<SharedNode>) -> Transport {
 }
 
 fn transport_with(seed: u8, node: &Arc<SharedNode>, limits: Limits) -> Transport {
+    transport_serving(seed, node, limits, Arc::new(NoBlocks))
+}
+
+/// A transport that can also answer a peer asking to catch up.
+fn transport_serving(
+    seed: u8,
+    node: &Arc<SharedNode>,
+    limits: Limits,
+    blocks: Arc<dyn BlockSource>,
+) -> Transport {
     let identity = PeerId::new(key(seed).public_key());
     let manager = Manager::new(identity, AddrBook::new(&key(seed)), limits);
     Transport::start(
@@ -100,6 +112,8 @@ fn transport_with(seed: u8, node: &Arc<SharedNode>, limits: Limits) -> Transport
         Arc::clone(node),
         manager,
         "127.0.0.1:0".parse().unwrap(),
+        blocks,
+        Arc::new(DiscardCommits),
     )
     .expect("binds")
 }
@@ -274,6 +288,8 @@ fn a_node_on_another_chain_cannot_join() {
         Arc::clone(&b),
         manager,
         "127.0.0.1:0".parse().unwrap(),
+        Arc::new(NoBlocks),
+        Arc::new(DiscardCommits),
     )
     .expect("binds");
 
@@ -402,5 +418,282 @@ fn a_stopped_transport_stops_accepting() {
     assert!(
         refused.is_err() || wait_for(Duration::from_millis(500), || ta.peers().is_empty()),
         "a stopped transport must not take on new peers"
+    );
+}
+
+// -- catching up over real sockets -------------------------------------------
+
+/// A block source backed by whatever a test put in it.
+///
+/// Stands in for the durable store, which is where a real node serves from. What
+/// matters for these tests is that the blocks travel over a real socket, get
+/// framed and sealed like anything else, and are verified by the receiver.
+struct Served(Vec<SyncBlock>);
+
+impl BlockSource for Served {
+    fn block_at(&self, height: Height) -> Option<SyncBlock> {
+        self.0.iter().find(|s| s.height() == height).cloned()
+    }
+}
+
+/// A real chain of `heights` blocks, decided by a real validator set.
+fn a_real_chain(heights: usize) -> Vec<SyncBlock> {
+    use afrolink_consensus::Step;
+    use afrolink_node::sim::Network;
+
+    let validators = validators();
+    let genesis = Genesis {
+        chain_id: chain(),
+        genesis_time: Timestamp::from_millis(1_700_000_000_000),
+        validators: validators.clone(),
+        issuers: Vec::new(),
+        attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(account(50)),
+        params: afrolink_executor::ChainParams::devnet(),
+        allocations: vec![Allocation {
+            address: account(50),
+            denom: Denom::native(),
+            amount: Amount::from_afri(1_000),
+        }],
+    };
+    let mut store = MemoryStore::new();
+    let block = genesis.apply(&mut store, GenesisLimits::devnet()).unwrap();
+    let keys: Vec<SecretKey> = (1..=4u8).map(key).collect();
+    let mut network = Network::new(&chain(), &keys, &validators, &store, &block);
+
+    let mut chain_blocks = Vec::new();
+    for _ in 0..heights {
+        network.start_round();
+        network.run(4_000);
+        network.tick(Step::Propose, 4_000);
+        network.run(4_000);
+        let leader = &network.nodes[0];
+        chain_blocks.push(SyncBlock {
+            block: leader.committed.last().cloned().expect("a block"),
+            commit: leader.last_commit.clone().expect("a certificate"),
+        });
+    }
+    chain_blocks
+}
+
+/// A node that has already applied `chain_blocks`, so it can serve them.
+fn node_at_tip(seed: u8, chain_blocks: &[SyncBlock]) -> Arc<SharedNode> {
+    let shared = node(seed);
+    {
+        let mut guard = shared.lock().unwrap();
+        for sync in chain_blocks {
+            guard
+                .apply_synced(sync.block.clone(), sync.commit.clone())
+                .expect("the fixture chain applies to a fresh node");
+        }
+    }
+    shared
+}
+
+fn height_of(shared: &Arc<SharedNode>) -> Height {
+    shared.lock().unwrap().height()
+}
+
+/// Drive both transports until `condition` holds, or give up.
+///
+/// Ticks are what move sync along — a status announcement, then a request, then a
+/// reply — so a test that only waits never progresses.
+fn tick_until(a: &Transport, b: &Transport, condition: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < PATIENCE {
+        if condition() {
+            return true;
+        }
+        a.tick();
+        b.tick();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    condition()
+}
+
+#[test]
+fn a_node_that_fell_behind_catches_up_from_a_peer() {
+    // The gap this closes. Until now a node that missed a height could never
+    // reach the tip again: there was no message that asks for a block, so a
+    // restarted node was a node that had left the network permanently.
+    let chain_blocks = a_real_chain(4);
+    let ahead = node_at_tip(1, &chain_blocks);
+    let behind = node(2);
+    assert_eq!(height_of(&behind), Height(1), "it has only genesis");
+
+    let ta = transport_serving(
+        1,
+        &ahead,
+        Limits::default(),
+        Arc::new(Served(chain_blocks.clone())),
+    );
+    let tb = transport(2, &behind);
+    tb.dial(address_of(&ta)).expect("connects");
+    assert!(wait_for(PATIENCE, || !ta.peers().is_empty()));
+
+    let target = height_of(&ahead);
+    assert!(
+        tick_until(&ta, &tb, || height_of(&behind) == target),
+        "the node behind never caught up: it is at {:?}, the peer is at {target:?}",
+        height_of(&behind)
+    );
+    assert_eq!(tb.synced(), chain_blocks.len() as u64);
+    assert_eq!(
+        behind.lock().unwrap().app_hash(),
+        ahead.lock().unwrap().app_hash(),
+        "and it holds the same state, not merely the same height"
+    );
+}
+
+#[test]
+fn a_node_at_the_tip_stays_quiet() {
+    // Two nodes level with each other must not sit in a request loop forever.
+    let chain_blocks = a_real_chain(2);
+    let a = node_at_tip(1, &chain_blocks);
+    let b = node_at_tip(2, &chain_blocks);
+    let ta = transport_serving(
+        1,
+        &a,
+        Limits::default(),
+        Arc::new(Served(chain_blocks.clone())),
+    );
+    let tb = transport_serving(2, &b, Limits::default(), Arc::new(Served(chain_blocks)));
+    tb.dial(address_of(&ta)).expect("connects");
+    assert!(wait_for(PATIENCE, || !ta.peers().is_empty()));
+
+    for _ in 0..20 {
+        ta.tick();
+        tb.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(ta.synced(), 0);
+    assert_eq!(tb.synced(), 0);
+    assert!(!ta.is_behind());
+    assert!(!tb.is_behind());
+}
+
+#[test]
+fn a_peer_that_serves_forged_blocks_is_cut_off_and_changes_nothing() {
+    // A peer that claims a high tip and answers with blocks whose certificates
+    // are invented. The node must not advance one height, and must stop asking:
+    // an attacker who could keep a node in a sync loop has denied it service
+    // whether or not the blocks are ever accepted.
+    let real = a_real_chain(3);
+    let forged: Vec<SyncBlock> = real
+        .iter()
+        .map(|sync| SyncBlock {
+            block: sync.block.clone(),
+            // A certificate with the signatures thrown away. Everything else about
+            // the block is genuine, which is the point: only the proof is missing.
+            commit: afrolink_consensus::Commit::new(
+                sync.commit.height,
+                sync.commit.round,
+                sync.commit.block_id,
+                Vec::new(),
+            ),
+        })
+        .collect();
+
+    let liar = node_at_tip(1, &real);
+    let honest = node(2);
+    let ta = transport_serving(1, &liar, Limits::default(), Arc::new(Served(forged)));
+    let tb = transport(2, &honest);
+    tb.dial(address_of(&ta)).expect("connects");
+    assert!(wait_for(PATIENCE, || !ta.peers().is_empty()));
+
+    for _ in 0..40 {
+        ta.tick();
+        tb.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        height_of(&honest),
+        Height(1),
+        "a block with no certificate must not advance anybody"
+    );
+    assert_eq!(tb.synced(), 0);
+    assert!(
+        tb.peers().is_empty(),
+        "and the peer that sent it is gone: a forged certificate is not a mistake"
+    );
+}
+
+#[test]
+fn a_node_serving_nothing_says_so_rather_than_going_silent() {
+    // A pruned or empty peer must answer. Silence and "I do not have it" are
+    // different facts, and a syncer that cannot tell them apart burns a request
+    // window waiting out a timeout on every such peer it meets.
+    let chain_blocks = a_real_chain(2);
+    // Ahead, and therefore worth asking — but holding no blocks to serve.
+    let ahead = node_at_tip(1, &chain_blocks);
+    let behind = node(2);
+    let ta = transport(1, &ahead);
+    let tb = transport(2, &behind);
+    tb.dial(address_of(&ta)).expect("connects");
+    assert!(wait_for(PATIENCE, || !ta.peers().is_empty()));
+
+    for _ in 0..30 {
+        ta.tick();
+        tb.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(height_of(&behind), Height(1), "there was nothing to learn");
+    assert!(
+        !tb.peers().is_empty(),
+        "and a peer that simply has no blocks is not misbehaving"
+    );
+}
+
+#[test]
+fn a_lone_validator_counts_its_own_vote_and_commits() {
+    // The defect this closes was invisible everywhere else. A node's own votes
+    // are returned as actions, not applied to its own vote set, and the
+    // deterministic simulator has always delivered a broadcast back to its sender
+    // — so every consensus test in the workspace had the rule and the transport
+    // did not. On four validators it never showed: three votes from three peers is
+    // already more than two thirds. On one validator it is total, and the node
+    // binary's own devnet committed nothing at all.
+    let validators = ValidatorSet::new(vec![Validator::new(
+        key(1).public_key(),
+        1,
+        CountryCode::new("ke").unwrap(),
+    )])
+    .unwrap();
+    let genesis = Genesis {
+        chain_id: chain(),
+        genesis_time: Timestamp::from_millis(1_700_000_000_000),
+        validators: validators.clone(),
+        issuers: Vec::new(),
+        attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(account(50)),
+        params: afrolink_executor::ChainParams::devnet(),
+        allocations: vec![Allocation {
+            address: account(50),
+            denom: Denom::native(),
+            amount: Amount::from_afri(1_000),
+        }],
+    };
+    let mut store = MemoryStore::new();
+    let block = genesis.apply(&mut store, GenesisLimits::devnet()).unwrap();
+    let alone = Arc::new(SharedNode::new(Node::new(
+        chain(),
+        key(1),
+        validators,
+        store,
+        &block,
+    )));
+    let transport = transport(1, &alone);
+
+    // One round, driven by hand the way the daemon's loop drives it.
+    let actions = {
+        let mut node = alone.lock().unwrap();
+        node.start_round(Timestamp::from_millis(1_700_000_001_000))
+    };
+    transport.broadcast(actions);
+
+    assert_eq!(
+        height_of(&alone),
+        Height(2),
+        "a validator that is the whole set must be able to commit on its own"
     );
 }

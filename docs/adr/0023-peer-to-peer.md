@@ -238,9 +238,19 @@ learned what a peer is.
   one — consensus ignores what it already has — but a patient attacker can
   amplify by replaying just outside the window.
 
+## Closed by
+
+- **Block sync and the node binary** — both gaps named above are closed by
+  [ADR-0024](0024-block-sync-and-the-node-binary.md). Building them found two
+  defects in the work recorded here: `MAX_FRAME_LEN` and `MAX_BLOCK_BYTES` were
+  equal, so a block at the consensus limit could be proposed and never sent; and
+  the transport never fed a node's own votes back into its own vote set, which is
+  invisible on four validators and fatal on one.
+
 ## Revisit if
 
-- **Block sync arrives**, which changes what a peer is for and adds the first
+- **Block sync arrives** — it has, in
+  [ADR-0024](0024-block-sync-and-the-node-binary.md), and it did add the first
   request/response pattern to this protocol
 - **A testnet runs on real addresses**, at which point the loopback carve-out
   stops being exercised and ASN bucketing starts mattering

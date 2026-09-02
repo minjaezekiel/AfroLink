@@ -16,5 +16,6 @@ pub mod handshake;
 pub mod manager;
 pub mod peer;
 pub mod secret;
+pub mod sync;
 pub mod transport;
 pub mod wire;

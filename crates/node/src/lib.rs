@@ -41,11 +41,12 @@ pub use proposal::{Proposal, SignedProposal};
 pub use service::SharedNode;
 
 use afrolink_consensus::{
-    Commit, Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet, VoteType,
+    Commit, CommitError, Decision, RoundState, SignedVote, Step, ValidatorSet, Vote, VoteSet,
+    VoteType,
 };
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
-use afrolink_executor::{Block, BlockContext, Executor, ValidatorSets};
+use afrolink_executor::{Block, BlockContext, Executor, TxReceipt, ValidatorSets};
 use afrolink_primitives::{ChainId, Height, Round, Timestamp};
 use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
 use afrolink_types::{Account, Transaction};
@@ -88,6 +89,55 @@ pub enum Action {
     Committed(Box<Block>, Box<Commit>),
     /// Start a timer for this step.
     ScheduleTimeout(Step, Round),
+}
+
+/// Why a block offered by a peer was not applied.
+///
+/// Every one of these is a refusal to advance. A node that cannot verify a block
+/// stays where it is: being behind is recoverable, and having applied somebody
+/// else's idea of history is not.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SyncError {
+    /// The block belongs to another chain.
+    #[error("block is for chain {got}, this node is on {expected}")]
+    WrongChain {
+        /// The chain this node runs.
+        expected: ChainId,
+        /// The chain the block claims.
+        got: ChainId,
+    },
+    /// Not the height this node needs next.
+    #[error("block is at height {got}, this node needs {expected}")]
+    WrongHeight {
+        /// The height this node is ready to apply.
+        expected: u64,
+        /// The height the block claims.
+        got: u64,
+    },
+    /// The block does not follow the one this node last committed.
+    #[error("block's parent is not this node's tip")]
+    WrongParent,
+    /// The certificate finalises some other block.
+    #[error("the certificate does not finalise this block")]
+    CommitIsForAnotherBlock,
+    /// The transactions do not match the root the header commits to.
+    #[error("the transactions do not match the header's tx_root")]
+    TxRootMismatch,
+    /// Larger than a validator will execute.
+    #[error("block exceeds the size a validator will execute")]
+    Oversized,
+    /// The certificate did not carry more than two thirds of voting power.
+    #[error("certificate rejected: {0}")]
+    BadCommit(#[from] CommitError),
+    /// Re-execution produced a different state root than the header claims.
+    ///
+    /// The gravest of these. A certificate this node accepted says two thirds of
+    /// the validator set executed these transactions and got that root, and this
+    /// node got another. That is either a consensus-breaking bug in this build or
+    /// a chain that has forked, and in both cases the only safe thing to do is
+    /// stop rather than write a state nobody else has.
+    #[error("re-execution produced a different app_hash than the header claims")]
+    AppHashMismatch,
 }
 
 /// An account's next expected nonce, or zero if it has never transacted.
@@ -139,6 +189,13 @@ pub struct Node {
     pub committed: Vec<Block>,
     /// The certificate for the most recently committed block.
     pub last_commit: Option<Commit>,
+    /// Receipts from the most recently committed block, in execution order.
+    ///
+    /// Kept because the header commits to their Merkle root: a node holding the
+    /// block but not these can prove a transaction *ran* and not what it *did*.
+    /// They exist for exactly as long as it takes the caller that persists the
+    /// block to take them.
+    last_receipts: Vec<TxReceipt>,
     /// Whether the current height has already been decided.
     decided: bool,
 }
@@ -171,6 +228,7 @@ impl Node {
             mempool: Mempool::new(MempoolLimits::default()),
             committed: Vec::new(),
             last_commit: None,
+            last_receipts: Vec::new(),
             decided: false,
         }
     }
@@ -479,7 +537,7 @@ impl Node {
             .unwrap_or_default();
         let commit = Commit::new(self.height, round, block_id, signatures);
 
-        self.executor.execute_block(
+        let outcome = self.executor.execute_block(
             &mut self.store,
             BlockContext {
                 height: self.height,
@@ -487,14 +545,116 @@ impl Node {
             },
             &block.transactions,
         );
+        self.last_receipts = outcome.outcomes.into_iter().map(|o| o.receipt).collect();
 
+        self.decided = true;
+        self.advance_past(block, commit)
+    }
+
+    /// Receipts from the most recently committed block, in execution order.
+    ///
+    /// What a caller persisting the block needs and cannot recompute without
+    /// re-executing: the header commits to their root, so a stored block without
+    /// them can prove a transaction ran but not what it did.
+    #[must_use]
+    pub fn last_receipts(&self) -> &[TxReceipt] {
+        &self.last_receipts
+    }
+
+    /// Take a block finalised elsewhere, verify it, and advance to it.
+    ///
+    /// The catch-up path: how a node that fell behind, or one that has just
+    /// restarted, reaches the tip without having taken part in deciding any of it.
+    ///
+    /// # Nothing here is taken on trust
+    ///
+    /// A peer handing over a block is not an authority, and this function is
+    /// written on that assumption. The certificate is checked against **this
+    /// node's own validator set**, which is what makes a peer unable to invent
+    /// history: forging it needs more than two thirds of the validators' signing
+    /// keys, and anyone holding those does not need to lie to this node.
+    ///
+    /// Then the block is re-executed anyway. The certificate proves the network
+    /// agreed; re-execution is how this node ends up holding the state rather
+    /// than a root hash somebody sent it. If the two disagree the block is
+    /// refused and **nothing is written** — the trial state is discarded rather
+    /// than merged, so a node that cannot verify a height simply stays at the
+    /// height before it.
+    ///
+    /// The checks run cheapest-first on purpose. Verifying a certificate is
+    /// dozens of signature verifications and executing a block is more; a peer
+    /// should not be able to buy either with a header field that costs one
+    /// comparison to refuse.
+    ///
+    /// # Errors
+    /// The first [`SyncError`] encountered. Every one of them leaves this node
+    /// exactly where it was.
+    pub fn apply_synced(&mut self, block: Block, commit: Commit) -> Result<Vec<Action>, SyncError> {
+        if block.header.chain_id != self.chain_id {
+            return Err(SyncError::WrongChain {
+                expected: self.chain_id.clone(),
+                got: block.header.chain_id.clone(),
+            });
+        }
+        if block.header.height != self.height {
+            return Err(SyncError::WrongHeight {
+                expected: self.height.0,
+                got: block.header.height.0,
+            });
+        }
+        if block.header.parent != self.last_block_id {
+            // A block at the right height that does not follow ours. Either the
+            // peer is on a fork or this node is, and applying it either way is
+            // how a node adopts a history it never verified the middle of.
+            return Err(SyncError::WrongParent);
+        }
+        let block_id = block.header.id();
+        if commit.block_id != block_id || commit.height != block.header.height {
+            return Err(SyncError::CommitIsForAnotherBlock);
+        }
+        if !block.tx_root_matches() {
+            return Err(SyncError::TxRootMismatch);
+        }
+        // Before executing, exactly as on the proposal path. A peer is no more
+        // entitled to make this node execute an unbounded block than a proposer is.
+        if !block.within_size_limits() {
+            return Err(SyncError::Oversized);
+        }
+
+        commit.verify(&self.chain_id, &self.validators)?;
+
+        // Into a copy, so a block that does not verify writes nothing at all.
+        let mut trial = self.store.clone();
+        let outcome = self.executor.execute_block(
+            &mut trial,
+            BlockContext {
+                height: block.header.height,
+                time: block.header.time,
+            },
+            &block.transactions,
+        );
+        if outcome.app_hash != block.header.app_hash {
+            return Err(SyncError::AppHashMismatch);
+        }
+
+        self.store = trial;
+        self.last_receipts = outcome.outcomes.into_iter().map(|o| o.receipt).collect();
+        Ok(self.advance_past(block, commit))
+    }
+
+    /// Retire a finalised block and open the next height.
+    ///
+    /// Shared by the two ways a height becomes final — deciding it here, and
+    /// learning it from a peer — because a node that reached a height by syncing
+    /// must be indistinguishable afterwards from one that voted on it. Two copies
+    /// of this bookkeeping would be two chances to drift apart.
+    fn advance_past(&mut self, block: Block, commit: Commit) -> Vec<Action> {
         // Everything in this block is spent, and anything that can no longer be
         // included is dead weight. Both happen here, once, on the one path that
         // is reached exactly when a height is final.
         self.mempool.remove_committed(&block.transactions);
         self.mempool.evict_expired(self.height.next());
 
-        self.decided = true;
         self.committed.push(block.clone());
         self.last_block_id = block.header.id();
         self.height = self.height.next();

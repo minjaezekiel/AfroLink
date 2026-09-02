@@ -31,8 +31,10 @@ use afrolink_fuzz::{Rng, hammer};
 use afrolink_p2p::handshake::{HELLO_LEN, Handshake, PROTOCOL_VERSION};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
 use afrolink_p2p::secret::Session;
+use afrolink_p2p::sync::SyncBlock;
 use afrolink_p2p::wire::{MAX_FRAME_LEN, PeerMessage, read_frame, write_frame};
-use afrolink_primitives::ChainId;
+use afrolink_primitives::codec::{Encode, decode_exact};
+use afrolink_primitives::{ChainId, Height, Round};
 use std::net::SocketAddr;
 
 const ROUNDS: u64 = 2_000;
@@ -79,6 +81,13 @@ fn peer_decoders_stay_canonical_under_attack() {
                 at("198.51.100.4", 1),
                 at("2001:db8::1", 65535),
             ]),
+        ),
+        ("PeerMessage::Status", PeerMessage::Status(Height(u64::MAX))),
+        ("PeerMessage::GetBlock", PeerMessage::GetBlock(Height(0))),
+        ("PeerMessage::NoBlock", PeerMessage::NoBlock(Height(7))),
+        (
+            "PeerMessage::Block",
+            PeerMessage::Block(Box::new(sync_block())),
         ),
     ] {
         hammer::<PeerMessage>(label, &message, ROUNDS);
@@ -234,5 +243,65 @@ fn a_truncated_stream_of_valid_frames_is_always_a_clean_close() {
         let mut cursor = &wire[..cut];
         // Read until something stops us; whatever stops us must not be a panic.
         while read_frame(&mut cursor, &mut opener).is_ok() {}
+    }
+}
+
+#[test]
+fn a_sync_reply_is_never_two_things_at_once() {
+    // The whole catch-up path rests on a block decoding exactly one way. A second
+    // spelling of one block would be a second block id, and a node deciding which
+    // history it holds by which spelling arrived first.
+    hammer::<SyncBlock>("SyncBlock", &sync_block(), ROUNDS);
+}
+
+#[test]
+fn a_certificate_for_the_wrong_height_never_survives_decoding() {
+    // The cheapest check in the sync path, and the one that keeps a mismatched
+    // pair away from the code that verifies signatures. Every mutation that
+    // decodes must still agree with itself about what height it is.
+    for seed in 0..2_000u64 {
+        let mut rng = Rng::new(seed);
+        let mut bytes = sync_block().to_bytes();
+        if bytes.is_empty() {
+            continue;
+        }
+        let at = rng.below(bytes.len());
+        bytes[at] ^= 1 << (rng.byte() % 8);
+        if let Ok(decoded) = decode_exact::<SyncBlock>(&bytes) {
+            assert_eq!(
+                decoded.commit.height, decoded.block.header.height,
+                "seed {seed}: a block and a certificate for different heights decoded as a pair"
+            );
+        }
+    }
+}
+
+/// One committed block and a certificate that matches its height.
+///
+/// The signatures are not valid and are not meant to be: this file is about the
+/// codec, and whether a certificate *verifies* is `Node::apply_synced`'s question.
+fn sync_block() -> SyncBlock {
+    use afrolink_crypto::hash::Hash32;
+    use afrolink_executor::{Block, BlockHeader};
+    use afrolink_primitives::Timestamp;
+
+    let header = BlockHeader {
+        chain_id: chain(),
+        height: Height(9),
+        time: Timestamp::from_millis(1_700_000_000_000),
+        parent: Hash32::from_bytes([1; 32]),
+        tx_root: Block::tx_root(&[]),
+        app_hash: Hash32::from_bytes([2; 32]),
+        outcome_root: Hash32::from_bytes([3; 32]),
+        validators_hash: Hash32::from_bytes([4; 32]),
+        next_validators_hash: Hash32::from_bytes([5; 32]),
+    };
+    let block_id = header.id();
+    SyncBlock {
+        block: Block {
+            header,
+            transactions: Vec::new(),
+        },
+        commit: afrolink_consensus::Commit::new(Height(9), Round(0), block_id, Vec::new()),
     }
 }

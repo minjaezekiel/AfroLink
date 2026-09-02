@@ -43,14 +43,61 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use afrolink_consensus::Commit;
+use afrolink_executor::{Block, TxReceipt};
 use afrolink_node::{Action, Event, SharedNode};
-use afrolink_primitives::ChainId;
+use afrolink_primitives::{ChainId, Height};
+use afrolink_state::MemoryStore;
 
 use crate::handshake::{Handshake, HandshakeError};
 use crate::manager::{Directive, Manager, Refusal};
 use crate::peer::{Misbehaviour, PeerAddr, PeerId};
 use crate::secret::{Opener, Sealer, Session};
+use crate::sync::{BlockSource, SyncBlock};
 use crate::wire::{FrameError, PeerMessage, read_frame, write_frame};
+
+/// Where finalised blocks go once a height is settled.
+///
+/// The transport is the only place that sees *both* ways a height becomes final —
+/// decided here, or learned from a peer — so it is the only place that can
+/// persist them uniformly. A trait rather than a store, for the same reason
+/// [`BlockSource`] is one: this crate has no business knowing what a database is.
+///
+/// Receipts travel with the block because the header commits to their root, and
+/// recovering them later means re-executing the block. So does the state, and for
+/// a sharper reason: it is read while the node lock is still held, so what the
+/// sink is given is the state *this* block produced. An implementation that went
+/// back to the node for it could be handed the state after the following block
+/// instead, and would then persist a root that its stored tip does not claim.
+pub trait CommitSink: Send + Sync {
+    /// Record a finalised block. Called once per height, in height order.
+    fn committed(
+        &self,
+        block: &Block,
+        commit: &Commit,
+        receipts: &[TxReceipt],
+        state: &MemoryStore,
+    );
+}
+
+/// A sink that keeps nothing.
+///
+/// For a node with no durable store — a test, or a validator that has been told
+/// to hold history in memory only. Named rather than an `Option` so that
+/// discarding history is something somebody chose.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscardCommits;
+
+impl CommitSink for DiscardCommits {
+    fn committed(
+        &self,
+        _block: &Block,
+        _commit: &Commit,
+        _receipts: &[TxReceipt],
+        _state: &MemoryStore,
+    ) {
+    }
+}
 
 /// Messages queued for one peer before it is considered too slow to keep.
 pub const OUTBOX_DEPTH: usize = 256;
@@ -100,6 +147,13 @@ struct Shared {
     /// Frames delivered to the node. Observable so a test can wait on progress
     /// rather than on a sleep.
     delivered: AtomicU64,
+    /// Where committed blocks are read from, to serve peers that fell behind.
+    blocks: Arc<dyn BlockSource>,
+    /// Where committed blocks are written, however this node reached them.
+    sink: Arc<dyn CommitSink>,
+    /// Heights applied from peers rather than decided here. Observable so a test
+    /// can wait on catching up rather than on a sleep.
+    synced: AtomicU64,
 }
 
 impl Shared {
@@ -137,6 +191,17 @@ impl Shared {
         }
     }
 
+    /// Record a misbehaviour against a peer and act on whatever that decides.
+    fn punish(&self, peer: PeerId, what: Misbehaviour) {
+        let directives = {
+            let Ok(mut manager) = self.manager.lock() else {
+                return;
+            };
+            manager.penalise(peer, what)
+        };
+        self.apply(directives);
+    }
+
     fn drop_peer(&self, peer: &PeerId) {
         if let Ok(mut outboxes) = self.outboxes.lock() {
             outboxes.remove(peer);
@@ -153,22 +218,47 @@ impl Shared {
                 Directive::Deliver(event) => self.deliver(*event),
                 Directive::Send(peer, message) => self.send_to(&peer, *message),
                 Directive::Relay(message, from) => self.relay(&message, Some(from)),
+                Directive::Broadcast(message) => self.relay(&message, None),
+                Directive::ServeBlock(peer, height) => {
+                    // Read from the durable store, never from the running node's
+                    // memory: a node serving from memory can only help peers who
+                    // fell behind while it happened to be up, and would put every
+                    // sync request behind the consensus lock.
+                    let answer = self.blocks.block_at(height).map_or_else(
+                        || PeerMessage::NoBlock(height),
+                        |sync| PeerMessage::Block(Box::new(sync)),
+                    );
+                    self.send_to(&peer, answer);
+                }
+                Directive::ApplyBlock(from, sync) => self.apply_block(from, *sync),
                 Directive::Disconnect(peer, _why) => self.drop_peer(&peer),
             }
         }
     }
 
-    /// Hand an event to consensus, and put whatever it decides back on the wire.
+    /// Hand a peer's message to consensus, and put whatever it decides on the wire.
     fn deliver(&self, event: Event) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        self.feed(event);
+    }
+
+    /// Hand an event to consensus, and put whatever it decides back on the wire.
+    ///
+    /// Separate from [`Self::deliver`] because this is also the path a node's
+    /// *own* votes take, and those are not messages that arrived from anywhere.
+    fn feed(&self, event: Event) {
         let Some(mut node) = self.node.lock() else {
             return;
         };
         let actions = node.handle(event);
+        let receipts = node.last_receipts().to_vec();
+        let height = node.height();
+        let state = node.store().clone();
         // The lock is released before anything is written, so a slow socket
         // never holds up consensus. It is the same rule `SharedNode` states for
         // the submit path: the lock covers a mempool insertion, never I/O.
         drop(node);
-        self.delivered.fetch_add(1, Ordering::Relaxed);
+        self.after_commit(&actions, &receipts, &state, height);
         // Relayed to everyone, including whoever sent the original. A node only
         // emits a broadcast action for something it *newly* accepted, so the
         // sender receiving it back costs one frame and is deduplicated there —
@@ -177,20 +267,109 @@ impl Shared {
         self.broadcast(actions, None);
     }
 
-    /// Put a node's outbound actions on the wire.
+    /// Apply a block a peer sent, and tell the manager where that left us.
+    ///
+    /// The manager advanced its own height optimistically when it handed this
+    /// over. Reporting the node's *actual* height afterwards — whether the apply
+    /// worked or not — is what makes that optimism safe: a refused block leaves
+    /// the manager pointing at the height it stumbled on, and the next tick asks
+    /// for it again, from somebody else.
+    fn apply_block(&self, from: PeerId, sync: SyncBlock) {
+        let Some(mut node) = self.node.lock() else {
+            return;
+        };
+        let outcome = node.apply_synced(sync.block, sync.commit);
+        let receipts = node.last_receipts().to_vec();
+        let height = node.height();
+        let state = node.store().clone();
+        drop(node);
+
+        match outcome {
+            Ok(actions) => {
+                self.synced.fetch_add(1, Ordering::Relaxed);
+                self.after_commit(&actions, &receipts, &state, height);
+            }
+            Err(why) => {
+                // Refused. Nothing was written and nothing is broadcast: a block
+                // this node could not verify is not one it should be spreading.
+                self.set_manager_height(height);
+                // A certificate that does not verify is not a mistake anyone makes
+                // by accident — it is a forgery attempt, and one is enough. The
+                // rest are survivable disagreements: a peer on a fork sends real
+                // blocks that do not fit here, and should cost its reputation
+                // without being cut off on the first one.
+                let what = match why {
+                    afrolink_node::SyncError::BadCommit(_) => Misbehaviour::Unforgivable,
+                    _ => Misbehaviour::BadBlock,
+                };
+                self.punish(from, what);
+            }
+        }
+    }
+
+    /// Persist what was finalised, and tell the manager the new height.
+    fn after_commit(
+        &self,
+        actions: &[Action],
+        receipts: &[TxReceipt],
+        state: &MemoryStore,
+        height: Height,
+    ) {
+        for action in actions {
+            if let Action::Committed(block, commit) = action {
+                self.sink.committed(block, commit, receipts, state);
+            }
+        }
+        self.set_manager_height(height);
+    }
+
+    fn set_manager_height(&self, height: Height) {
+        if let Ok(mut manager) = self.manager.lock() {
+            manager.set_height(height);
+        }
+    }
+
+    /// Put a node's outbound actions on the wire — and its own votes back to itself.
+    ///
+    /// # A node counts its own vote
+    ///
+    /// A vote this node signs has to reach this node's vote set, and returning it
+    /// as an `Action` does not put it there. The deterministic simulator has
+    /// always delivered a broadcast to its sender as well as to everybody else;
+    /// this transport did not, and the difference is invisible on a four-validator
+    /// network — three votes from three peers is already more than two thirds — and
+    /// total on a one-validator chain, which can never reach a quorum it is not
+    /// counted in. A `devnet` started by the node binary committed no blocks at
+    /// all, and no test in the workspace covered it, because every test drove
+    /// consensus through the simulator that had the rule.
+    ///
+    /// Only votes are looped back. A proposer already feeds its own proposal
+    /// through `on_proposal` inside `start_round`, so doing it again here would
+    /// put one proposal through the prevote decision twice.
     fn broadcast(&self, actions: Vec<Action>, except: Option<PeerId>) {
         for action in actions {
+            let mut own: Option<Event> = None;
             let message = match action {
                 Action::BroadcastProposal(p) => PeerMessage::Proposal(p),
-                Action::BroadcastVote(v) => PeerMessage::Vote(v),
+                Action::BroadcastVote(v) => {
+                    own = Some(Event::Vote(v.clone()));
+                    PeerMessage::Vote(v)
+                }
                 Action::BroadcastTransaction(t) => PeerMessage::Transaction(t),
                 // Committing and scheduling a timeout are the node's own
                 // business. Neither is something a peer is told about: a peer
                 // learns a block committed by seeing the precommits, which it
-                // already has.
+                // already has — or, if it was not there to see them, by asking
+                // for the block through the sync path.
                 Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => continue,
             };
             self.relay(&message, except);
+            if let Some(event) = own {
+                // Terminates: a vote already in the set is refused by `VoteSet`,
+                // so handling it produces nothing and the recursion stops. The
+                // depth is the length of one round — prevote, precommit, commit.
+                self.feed(event);
+            }
         }
     }
 }
@@ -229,12 +408,21 @@ impl Transport {
         chain_id: ChainId,
         key: afrolink_crypto::SecretKey,
         node: Arc<SharedNode>,
-        manager: Manager,
+        mut manager: Manager,
         listen: SocketAddr,
+        blocks: Arc<dyn BlockSource>,
+        sink: Arc<dyn CommitSink>,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(listen)?;
         let local = listener.local_addr()?;
         let ours = PeerId::new(key.public_key());
+        // The manager's idea of where the chain is comes from the node, once,
+        // here — and is corrected after every commit. A manager that started at
+        // genesis while the node was at height nine thousand would ask its peers
+        // for nine thousand blocks it already has.
+        if let Some(node) = node.lock() {
+            manager.set_height(node.height());
+        }
         let shared = Arc::new(Shared {
             chain_id,
             key,
@@ -244,6 +432,9 @@ impl Transport {
             outboxes: Mutex::new(BTreeMap::new()),
             running: AtomicBool::new(true),
             delivered: AtomicU64::new(0),
+            blocks,
+            sink,
+            synced: AtomicU64::new(0),
         });
 
         let accepting = Arc::clone(&shared);
@@ -290,6 +481,25 @@ impl Transport {
     #[must_use]
     pub fn delivered(&self) -> u64 {
         self.shared.delivered.load(Ordering::Relaxed)
+    }
+
+    /// How many blocks this node applied from peers rather than deciding itself.
+    #[must_use]
+    pub fn synced(&self) -> u64 {
+        self.shared.synced.load(Ordering::Relaxed)
+    }
+
+    /// Whether some peer claims a height this node does not have.
+    ///
+    /// What a node consults before it bothers proposing: a validator that is
+    /// behind should be catching up, not offering blocks built on a state the
+    /// rest of the network has already moved past.
+    #[must_use]
+    pub fn is_behind(&self) -> bool {
+        self.shared
+            .manager
+            .lock()
+            .is_ok_and(|manager| manager.is_behind())
     }
 
     /// Who is connected right now.
@@ -545,13 +755,7 @@ fn read_loop(shared: &Arc<Shared>, reader: &mut TcpStream, opener: &mut Opener, 
 }
 
 fn penalise(shared: &Arc<Shared>, peer: PeerId, what: Misbehaviour) {
-    let directives = {
-        let Ok(mut manager) = shared.manager.lock() else {
-            return;
-        };
-        manager.penalise(peer, what)
-    };
-    shared.apply(directives);
+    shared.punish(peer, what);
 }
 
 /// Wait for a condition, or give up.

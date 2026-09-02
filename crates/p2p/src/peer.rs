@@ -225,6 +225,12 @@ pub enum Misbehaviour {
     TooFast,
     /// An address list that was empty, over-long, or unasked for.
     BadAddrs,
+    /// A block nobody asked for, or an answer to a question never put.
+    ///
+    /// Separate from [`Self::BadAddrs`] because it is a heavier thing to send: an
+    /// unsolicited block is up to four mebibytes a peer decided this node should
+    /// spend memory and a certificate verification on.
+    BadBlock,
     /// A protocol violation that cannot be a mistake.
     Unforgivable,
 }
@@ -235,7 +241,7 @@ impl Misbehaviour {
     pub const fn penalty(self) -> i32 {
         match self {
             Self::TooFast | Self::BadAddrs => 5,
-            Self::Undecodable | Self::Oversized => 20,
+            Self::Undecodable | Self::Oversized | Self::BadBlock => 20,
             Self::BadSignature => 50,
             Self::Unforgivable => BAN_THRESHOLD,
         }

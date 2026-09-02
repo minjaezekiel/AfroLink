@@ -34,9 +34,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use afrolink_crypto::hash::Hash32;
 use afrolink_node::Event;
+use afrolink_primitives::Height;
 
 use crate::addrbook::AddrBook;
 use crate::peer::{AddrGroup, Misbehaviour, PeerAddr, PeerId, Reputation};
+use crate::sync::{MAX_BLOCKS_IN_FLIGHT, MAX_STAGED_BLOCKS, REQUEST_TIMEOUT_TICKS, SyncBlock};
 use crate::wire::{MAX_ADDRS, PeerMessage};
 
 /// How many peers a node keeps, and how fast they may talk.
@@ -98,6 +100,24 @@ pub enum Directive {
     Send(PeerId, Box<PeerMessage>),
     /// Send this to every peer except the one named.
     Relay(Box<PeerMessage>, PeerId),
+    /// Send this to every peer.
+    Broadcast(Box<PeerMessage>),
+    /// Read this height from the durable store and send it to this peer.
+    ///
+    /// A directive rather than a lookup, because the manager has no store in it
+    /// and is not going to acquire one: what to serve is policy, where it is kept
+    /// is the transport's business.
+    ServeBlock(PeerId, Height),
+    /// Apply this committed block, verifying its certificate first.
+    ///
+    /// Emitted only in contiguous height order, because a block cannot be applied
+    /// before its parent has been.
+    ///
+    /// The peer that supplied it travels with it, because verification happens
+    /// after staging and a block that fails it is evidence about *somebody*.
+    /// Without this the sender is anonymous by the time the failure is known, and
+    /// a peer could feed a node unverifiable blocks indefinitely for free.
+    ApplyBlock(PeerId, Box<SyncBlock>),
     /// Close this connection.
     Disconnect(PeerId, &'static str),
 }
@@ -112,6 +132,16 @@ struct Connected {
     budget: u32,
     /// Whether we have asked this peer for addresses and not yet been answered.
     awaiting_addrs: bool,
+    /// The highest height this peer has claimed, if it has said.
+    tip: Option<Height>,
+    /// The height we asked this peer for and have not been answered on.
+    ///
+    /// At most one. A peer that is slow then costs one outstanding request rather
+    /// than a whole batch window, and a peer that is fast is asked again the
+    /// moment it answers.
+    awaiting_block: Option<Height>,
+    /// Ticks since that request went out.
+    request_age: u32,
 }
 
 /// A bounded set of recently seen gossip ids.
@@ -160,6 +190,15 @@ pub struct Manager {
     seen: Seen,
     limits: Limits,
     cursor: u64,
+    /// The next height this node needs — one past its committed tip.
+    height: Height,
+    /// Blocks that arrived before their parent did.
+    ///
+    /// Requests go out in parallel and replies come back in whatever order the
+    /// network delivers them. Bounded, because a peer answering only with
+    /// far-future heights would otherwise fill memory with blocks that can never
+    /// be applied.
+    staged: BTreeMap<Height, (PeerId, SyncBlock)>,
 }
 
 impl Manager {
@@ -174,7 +213,59 @@ impl Manager {
             seen: Seen::new(limits.seen_capacity),
             limits,
             cursor: 0,
+            height: Height(0),
+            staged: BTreeMap::new(),
         }
+    }
+
+    /// Start from a known height, rather than assuming genesis.
+    #[must_use]
+    pub fn at_height(mut self, height: Height) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// The next height this node needs.
+    #[must_use]
+    pub const fn height(&self) -> Height {
+        self.height
+    }
+
+    /// Tell the manager where the node actually is.
+    ///
+    /// Called after every commit, local or synced — and after a **failed** apply,
+    /// which is what makes the optimistic advance in [`Self::drain_staged`] safe:
+    /// the manager assumes the block it handed over was applied, and this is how
+    /// it is corrected when that was wrong. The node re-requests the height it
+    /// stumbled on rather than silently skipping it.
+    pub fn set_height(&mut self, height: Height) {
+        self.height = height;
+        // Anything at or below the tip is dead weight; anything a peer sent for a
+        // height we have passed is not an attack, just a slow reply.
+        self.staged.retain(|staged, _| *staged >= height);
+    }
+
+    /// The highest height this node has committed.
+    ///
+    /// One below [`Self::height`], which is the height being worked on. Every
+    /// number that crosses the wire is this one, so that both ends of a `Status`
+    /// mean the same thing by it.
+    #[must_use]
+    pub const fn committed_tip(&self) -> Height {
+        Height(self.height.0.saturating_sub(1))
+    }
+
+    /// The highest height any connected peer claims to hold.
+    #[must_use]
+    pub fn best_peer_height(&self) -> Option<Height> {
+        self.peers.values().filter_map(|p| p.tip).max()
+    }
+
+    /// Whether some peer claims a height this node does not have.
+    #[must_use]
+    pub fn is_behind(&self) -> bool {
+        self.best_peer_height()
+            .is_some_and(|best| best >= self.height)
     }
 
     /// The address book, for seeding and inspection.
@@ -303,6 +394,9 @@ impl Manager {
                 reputation: Reputation::new(),
                 budget: self.limits.messages_per_tick,
                 awaiting_addrs: false,
+                tip: None,
+                awaiting_block: None,
+                request_age: 0,
             },
         );
         Ok(())
@@ -318,35 +412,146 @@ impl Manager {
         self.book.mark_failed(peer);
     }
 
-    /// Refresh every peer's message budget, and ask a peer for addresses.
+    /// Refresh budgets, announce where we are, ask for addresses, and catch up.
     ///
     /// The clock enters the policy here and nowhere else. What "a tick" is worth
-    /// is the transport's business; whether a peer has spent its budget is this
-    /// module's.
+    /// is the transport's business; whether a peer has spent its budget, and
+    /// whether a block request has waited long enough to be given to somebody
+    /// else, is this module's.
     pub fn on_tick(&mut self) -> Vec<Directive> {
         for peer in self.peers.values_mut() {
             peer.budget = self.limits.messages_per_tick;
         }
         self.cursor = self.cursor.wrapping_add(1);
-        // Ask exactly one peer per tick, in rotation. Asking everyone at once
-        // makes a node's address book a reflection of whoever answers fastest,
-        // which is the peer closest to it — and closeness is something an
-        // attacker on the path controls.
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         if ids.is_empty() {
             return Vec::new();
         }
-        let Ok(index) = usize::try_from(self.cursor.checked_rem(ids.len() as u64).unwrap_or(0))
-        else {
-            return Vec::new();
-        };
-        let Some(target) = ids.get(index).copied() else {
-            return Vec::new();
-        };
-        if let Some(peer) = self.peers.get_mut(&target) {
-            peer.awaiting_addrs = true;
+
+        // A request that has gone unanswered long enough is abandoned rather than
+        // punished. A peer that does not answer may be slow, or may genuinely not
+        // hold the block despite what it claimed; neither is misbehaviour, and
+        // both are fixed by asking somebody else.
+        for peer in self.peers.values_mut() {
+            if peer.awaiting_block.is_some() {
+                peer.request_age = peer.request_age.saturating_add(1);
+                if peer.request_age >= REQUEST_TIMEOUT_TICKS {
+                    peer.awaiting_block = None;
+                    peer.request_age = 0;
+                }
+            }
         }
-        vec![Directive::Send(target, Box::new(PeerMessage::GetAddrs))]
+
+        // What this node *has*, which is one below the height it is working on.
+        // Announcing the working height would have every peer ask for a block
+        // that does not exist yet, on every tick, for as long as they are
+        // connected.
+        let mut out = vec![Directive::Broadcast(Box::new(PeerMessage::Status(
+            self.committed_tip(),
+        )))];
+
+        // Ask exactly one peer per tick for addresses, in rotation. Asking
+        // everyone at once makes a node's address book a reflection of whoever
+        // answers fastest, which is the peer closest to it — and closeness is
+        // something an attacker on the path controls.
+        if let Some(target) = self.rotate(&ids, 0) {
+            if let Some(peer) = self.peers.get_mut(&target) {
+                peer.awaiting_addrs = true;
+            }
+            out.push(Directive::Send(target, Box::new(PeerMessage::GetAddrs)));
+        }
+
+        out.extend(self.schedule_sync(&ids));
+        out
+    }
+
+    /// Pick from `ids` by the rotating cursor, so the same peer is not always first.
+    fn rotate(&self, ids: &[PeerId], offset: u64) -> Option<PeerId> {
+        let len = u64::try_from(ids.len()).ok()?;
+        let index = self.cursor.wrapping_add(offset).checked_rem(len)?;
+        ids.get(usize::try_from(index).ok()?).copied()
+    }
+
+    /// Hand out the heights this node is missing, one request per peer.
+    ///
+    /// The whole catch-up policy, and it is deliberately unclever: ask for the
+    /// lowest heights first, never more than [`MAX_BLOCKS_IN_FLIGHT`] at a time,
+    /// never twice for the same height, and never from a peer that has not
+    /// claimed to hold it. Asking for the lowest first is what keeps the staging
+    /// buffer small — a syncer that requests the *tip* first holds every block it
+    /// receives and applies none of them.
+    fn schedule_sync(&mut self, ids: &[PeerId]) -> Vec<Directive> {
+        let Some(best) = self.best_peer_height() else {
+            return Vec::new();
+        };
+        if best < self.height {
+            return Vec::new();
+        }
+
+        let mut in_flight = self
+            .peers
+            .values()
+            .filter(|p| p.awaiting_block.is_some())
+            .count();
+        // A height already asked for, or already sitting in the staging buffer,
+        // is not asked for again: duplicate requests spend the in-flight budget
+        // on work already done.
+        let mut claimed: BTreeSet<Height> = self
+            .peers
+            .values()
+            .filter_map(|p| p.awaiting_block)
+            .collect();
+        claimed.extend(self.staged.keys().copied());
+
+        // Never request past what the staging buffer can hold. Otherwise a gap at
+        // the bottom — one peer stalled on the height everything else waits for —
+        // turns into blocks arriving that must be thrown away.
+        let ceiling = Height(
+            self.height
+                .0
+                .saturating_add(MAX_STAGED_BLOCKS as u64)
+                .min(best.0),
+        );
+
+        let mut out = Vec::new();
+        let mut want = self.height;
+        while in_flight < MAX_BLOCKS_IN_FLIGHT && want <= ceiling {
+            if claimed.contains(&want) {
+                want = want.next();
+                continue;
+            }
+            let Some(target) = self.free_peer_holding(ids, want) else {
+                // Nobody free claims this height. Stop rather than skip: the
+                // heights above it cannot be applied until this one is, so
+                // spending requests on them buys nothing.
+                break;
+            };
+            if let Some(peer) = self.peers.get_mut(&target) {
+                peer.awaiting_block = Some(want);
+                peer.request_age = 0;
+            }
+            out.push(Directive::Send(
+                target,
+                Box::new(PeerMessage::GetBlock(want)),
+            ));
+            claimed.insert(want);
+            in_flight = in_flight.saturating_add(1);
+            want = want.next();
+        }
+        out
+    }
+
+    /// A peer with no outstanding request that claims to hold `height`.
+    fn free_peer_holding(&self, ids: &[PeerId], height: Height) -> Option<PeerId> {
+        for offset in 0..u64::try_from(ids.len()).ok()? {
+            let candidate = self.rotate(ids, offset)?;
+            if self.peers.get(&candidate).is_some_and(|peer| {
+                peer.awaiting_block.is_none() && peer.tip.is_some_and(|tip| tip >= height)
+            }) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Handle one message from one peer.
@@ -404,7 +609,78 @@ impl Manager {
             // Nothing to do. A pong's only job is to have arrived, and the
             // transport notices that by resetting its idle timer.
             PeerMessage::Pong(_) => Vec::new(),
+            PeerMessage::Status(height) => {
+                // Recorded, believed only as far as it is useful. A peer that
+                // overstates its tip earns a request it cannot answer; one that
+                // understates it is never asked. What makes a block acceptable is
+                // the certificate on it, never this.
+                if let Some(peer) = self.peers.get_mut(&from) {
+                    peer.tip = Some(height);
+                }
+                Vec::new()
+            }
+            PeerMessage::GetBlock(height) => vec![Directive::ServeBlock(from, height)],
+            PeerMessage::Block(sync) => self.on_block(from, *sync),
+            PeerMessage::NoBlock(height) => {
+                if let Some(peer) = self.peers.get_mut(&from)
+                    && peer.awaiting_block == Some(height)
+                {
+                    peer.awaiting_block = None;
+                    peer.request_age = 0;
+                    // It claimed this height and does not have it. Believe the
+                    // newer, worse claim — otherwise this node asks the same peer
+                    // for the same gap on every tick for as long as they are
+                    // connected.
+                    peer.tip = Some(Height(height.0.saturating_sub(1)));
+                }
+                Vec::new()
+            }
         }
+    }
+
+    /// Take a block that was asked for, and release what can now be applied.
+    fn on_block(&mut self, from: PeerId, sync: SyncBlock) -> Vec<Directive> {
+        let height = sync.height();
+        let Some(peer) = self.peers.get_mut(&from) else {
+            return Vec::new();
+        };
+        if peer.awaiting_block != Some(height) {
+            // Either nobody asked, or this answers a different question. Both are
+            // a peer deciding on its own that this node should spend memory and a
+            // certificate verification — the same rule as an unsolicited address
+            // list, at a heavier price.
+            return self.penalise(from, Misbehaviour::BadBlock);
+        }
+        peer.awaiting_block = None;
+        peer.request_age = 0;
+        peer.tip = Some(peer.tip.map_or(height, |tip| tip.max(height)));
+
+        // A reply that raced this node's own commit. Not an attack and not worth
+        // keeping.
+        if height < self.height {
+            return Vec::new();
+        }
+        if self.staged.len() >= MAX_STAGED_BLOCKS {
+            return Vec::new();
+        }
+        self.staged.insert(height, (from, sync));
+        self.drain_staged()
+    }
+
+    /// Release staged blocks in contiguous order, and only in contiguous order.
+    ///
+    /// The height is advanced **optimistically**, on the assumption the transport
+    /// applies what it is handed. That is what lets the next tick request the
+    /// heights beyond without waiting a round trip for confirmation — and it is
+    /// safe because a failed apply is reported back through
+    /// [`Self::set_height`], which winds the manager back to the truth.
+    fn drain_staged(&mut self) -> Vec<Directive> {
+        let mut out = Vec::new();
+        while let Some((from, sync)) = self.staged.remove(&self.height) {
+            self.height = self.height.next();
+            out.push(Directive::ApplyBlock(from, Box::new(sync)));
+        }
+        out
     }
 
     fn on_addrs(&mut self, from: PeerId, addrs: &[PeerAddr]) -> Vec<Directive> {
@@ -772,7 +1048,312 @@ mod tests {
         assert!(m.on_outbound(addr(2, "198.51.100.2")).is_ok());
     }
 
+    // -- catching up --------------------------------------------------------
+
+    /// A manager with `count` peers connected, all claiming height `tip`.
+    fn syncing(ours: Height, peers: u32, tip: u64) -> (Manager, Vec<PeerAddr>) {
+        let mut m = manager();
+        m.set_height(ours);
+        let addrs: Vec<PeerAddr> = (0..peers)
+            .map(|n| addr(n, &format!("203.0.{n}.1")))
+            .collect();
+        for a in &addrs {
+            m.on_inbound(*a).expect("connects");
+            drop(m.on_message(a.id, PeerMessage::Status(Height(tip))));
+        }
+        (m, addrs)
+    }
+
+    /// Every height a tick asked for, in the order asked.
+    fn requested(directives: &[Directive]) -> Vec<(PeerId, Height)> {
+        directives
+            .iter()
+            .filter_map(|d| match d {
+                Directive::Send(peer, message) => match message.as_ref() {
+                    PeerMessage::GetBlock(height) => Some((*peer, *height)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn applied(directives: &[Directive]) -> Vec<Height> {
+        directives
+            .iter()
+            .filter_map(|d| match d {
+                Directive::ApplyBlock(_, sync) => Some(sync.height()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_node_at_the_tip_asks_for_nothing() {
+        // The common case, and the one that must cost nothing: a node level with
+        // its peers should not be issuing a request every tick forever.
+        let (mut m, _) = syncing(Height(9), 3, 8);
+        assert!(requested(&m.on_tick()).is_empty());
+        assert!(!m.is_behind());
+    }
+
+    #[test]
+    fn a_node_that_is_behind_asks_for_the_heights_it_is_missing() {
+        // Lowest first, and never twice for the same height. Asking for the *tip*
+        // first is the tempting mistake: every reply then has to be held, because
+        // none of them can be applied until the bottom of the gap arrives.
+        let (mut m, _) = syncing(Height(5), 4, 100);
+        let asked = requested(&m.on_tick());
+        let heights: Vec<u64> = asked.iter().map(|(_, h)| h.0).collect();
+        assert_eq!(heights, vec![5, 6, 7, 8], "lowest first, one per peer");
+
+        let mut peers: Vec<PeerId> = asked.iter().map(|(p, _)| *p).collect();
+        peers.sort_unstable();
+        peers.dedup();
+        assert_eq!(peers.len(), 4, "one request per peer, spread across them");
+    }
+
+    #[test]
+    fn no_more_requests_are_outstanding_than_the_limit_allows() {
+        // Each outstanding request is a promise to hold a reply in memory.
+        let (mut m, _) = syncing(Height(1), 32, 10_000);
+        let first = requested(&m.on_tick());
+        assert_eq!(first.len(), MAX_BLOCKS_IN_FLIGHT);
+        // And a second tick, with nothing answered, adds none.
+        assert!(requested(&m.on_tick()).is_empty());
+    }
+
+    #[test]
+    fn a_peer_is_never_asked_for_a_height_it_has_not_claimed() {
+        // A peer's status is not trusted for correctness, but it is respected for
+        // routing: asking a node at height 3 for height 900 wastes a request slot
+        // that a peer who has it could have used.
+        let mut m = manager();
+        m.set_height(Height(1));
+        let low = addr(1, "203.0.1.1");
+        let high = addr(2, "203.0.2.1");
+        m.on_inbound(low).expect("connects");
+        m.on_inbound(high).expect("connects");
+        drop(m.on_message(low.id, PeerMessage::Status(Height(1))));
+        drop(m.on_message(high.id, PeerMessage::Status(Height(50))));
+
+        let asked = requested(&m.on_tick());
+        for (peer, height) in &asked {
+            if *peer == low.id {
+                assert_eq!(height.0, 1, "the shallow peer is only asked what it has");
+            }
+        }
+        assert!(asked.iter().any(|(p, _)| *p == high.id));
+    }
+
+    #[test]
+    fn a_block_nobody_asked_for_is_penalised() {
+        // An unsolicited block is up to four mebibytes a peer decided this node
+        // should spend memory and a certificate verification on. Same rule as an
+        // unsolicited address list, at a heavier price.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        let out = m.on_message(
+            addrs[0].id,
+            PeerMessage::Block(Box::new(sync_block(1, [7; 32]))),
+        );
+        assert!(applied(&out).is_empty(), "and it is certainly not applied");
+        assert!(m.staged.is_empty());
+    }
+
+    #[test]
+    fn an_answer_to_a_different_question_is_refused() {
+        // Asked for height 1, sent height 2. Accepting it would let a peer choose
+        // which heights this node holds in memory rather than this node choosing.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        m.on_tick();
+        let out = m.on_message(
+            addrs[0].id,
+            PeerMessage::Block(Box::new(sync_block(2, [7; 32]))),
+        );
+        assert!(applied(&out).is_empty());
+        assert!(m.staged.is_empty());
+    }
+
+    #[test]
+    fn blocks_are_released_only_in_contiguous_order() {
+        // Requests go out in parallel, so replies arrive in whatever order the
+        // network delivers them — and a block cannot be applied before its
+        // parent. This is the buffer that makes the difference survivable.
+        let (mut m, _addrs) = syncing(Height(1), 3, 10);
+        let asked = requested(&m.on_tick());
+        assert_eq!(asked.len(), 3);
+
+        // The middle one comes back first: nothing may be applied.
+        let (peer_of_2, _) = asked
+            .iter()
+            .find(|(_, h)| h.0 == 2)
+            .copied()
+            .expect("asked");
+        let out = m.on_message(
+            peer_of_2,
+            PeerMessage::Block(Box::new(sync_block(2, [2; 32]))),
+        );
+        assert!(
+            applied(&out).is_empty(),
+            "height 2 cannot be applied before height 1"
+        );
+
+        // Then the bottom of the gap, which releases both, in order.
+        let (peer_of_1, _) = asked
+            .iter()
+            .find(|(_, h)| h.0 == 1)
+            .copied()
+            .expect("asked");
+        let out = m.on_message(
+            peer_of_1,
+            PeerMessage::Block(Box::new(sync_block(1, [1; 32]))),
+        );
+        assert_eq!(
+            applied(&out),
+            vec![Height(1), Height(2)],
+            "the parent first, then the child that was waiting on it"
+        );
+        assert_eq!(m.height(), Height(3));
+    }
+
+    #[test]
+    fn the_staging_buffer_is_bounded() {
+        // Otherwise a peer answering only with far-future heights fills a node's
+        // memory with blocks it can never apply.
+        let (mut m, addrs) = syncing(Height(1), 1, 10_000);
+        for n in 2..(MAX_STAGED_BLOCKS as u64 + 40) {
+            // Force the request so each reply is "solicited", then answer it.
+            m.peers
+                .get_mut(&addrs[0].id)
+                .expect("connected")
+                .awaiting_block = Some(Height(n));
+            #[expect(clippy::cast_possible_truncation, reason = "test fixture")]
+            let seed = n as u8;
+            drop(m.on_message(
+                addrs[0].id,
+                PeerMessage::Block(Box::new(sync_block(n, [seed; 32]))),
+            ));
+        }
+        assert!(m.staged.len() <= MAX_STAGED_BLOCKS);
+    }
+
+    #[test]
+    fn nothing_is_requested_beyond_what_the_buffer_can_hold() {
+        // A gap at the bottom must not turn into blocks arriving that have to be
+        // thrown away.
+        let (mut m, _) = syncing(Height(1), 32, 1_000_000);
+        for (_, height) in requested(&m.on_tick()) {
+            assert!(height.0 <= 1 + MAX_STAGED_BLOCKS as u64);
+        }
+    }
+
+    #[test]
+    fn a_stalled_peer_loses_its_request_to_someone_else() {
+        // A peer that does not answer may be slow rather than malicious. The
+        // request is abandoned rather than punished, and the height goes to
+        // somebody who will answer it.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        let first = requested(&m.on_tick());
+        assert_eq!(first.len(), 1);
+        let asked_again = (0..=REQUEST_TIMEOUT_TICKS).any(|_| requested(&m.on_tick()) == first);
+        assert!(asked_again, "the same height, asked again");
+        assert!(!m.is_banned(&addrs[0].id), "being slow is not misbehaviour");
+    }
+
+    #[test]
+    fn a_refusal_stops_this_node_asking_that_peer_for_that_gap() {
+        // Silence and "I do not have it" are different facts. A node that cannot
+        // tell them apart wastes a request window on every pruned peer it meets,
+        // every tick, for as long as they stay connected.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        let asked = requested(&m.on_tick());
+        assert_eq!(asked.len(), 1);
+        drop(m.on_message(addrs[0].id, PeerMessage::NoBlock(Height(1))));
+        assert!(
+            requested(&m.on_tick()).is_empty(),
+            "it said it does not have this, so it is not asked again"
+        );
+    }
+
+    #[test]
+    fn a_block_that_could_not_be_applied_is_asked_for_again() {
+        // The manager advances optimistically when it hands a block over. This is
+        // what makes that safe: the transport reports the node's real height back,
+        // and the height that failed is requested afresh rather than skipped.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        m.on_tick();
+        let out = m.on_message(
+            addrs[0].id,
+            PeerMessage::Block(Box::new(sync_block(1, [1; 32]))),
+        );
+        assert_eq!(applied(&out), vec![Height(1)]);
+        assert_eq!(
+            m.height(),
+            Height(2),
+            "advanced on the assumption it applied"
+        );
+
+        // It did not apply. The node is still at height 1.
+        m.set_height(Height(1));
+        assert_eq!(requested(&m.on_tick()), vec![(addrs[0].id, Height(1))]);
+    }
+
+    #[test]
+    fn a_request_for_a_block_is_a_directive_rather_than_a_lookup() {
+        // The manager has no store in it and is not going to acquire one: what to
+        // serve is policy, where it is kept is the transport's business.
+        let (mut m, addrs) = syncing(Height(9), 1, 8);
+        assert_eq!(
+            m.on_message(addrs[0].id, PeerMessage::GetBlock(Height(3))),
+            vec![Directive::ServeBlock(addrs[0].id, Height(3))]
+        );
+    }
+
+    #[test]
+    fn a_node_announces_what_it_has_rather_than_what_it_is_working_on() {
+        // Peers cannot ask this node for blocks they do not know it has, so a node
+        // that never announces is a node nobody ever syncs from. And the number
+        // has to be the *committed* height: announcing the working height, 42,
+        // would have every peer ask for a block that does not exist yet, on every
+        // tick, for as long as they stay connected.
+        let (mut m, _) = syncing(Height(42), 1, 41);
+        assert!(
+            m.on_tick()
+                .contains(&Directive::Broadcast(Box::new(PeerMessage::Status(
+                    Height(41)
+                ))))
+        );
+    }
+
     // -- fixtures -----------------------------------------------------------
+
+    fn sync_block(height: u64, app: [u8; 32]) -> SyncBlock {
+        use afrolink_executor::{Block, BlockHeader};
+        use afrolink_primitives::{ChainId, Round, Timestamp};
+        let header = BlockHeader {
+            chain_id: ChainId::new("afrolink-1").expect("valid"),
+            height: Height(height),
+            time: Timestamp::from_millis(1_700_000_000_000),
+            parent: Hash32::from_bytes([0; 32]),
+            tx_root: Block::tx_root(&[]),
+            app_hash: Hash32::from_bytes(app),
+            outcome_root: Hash32::from_bytes([0; 32]),
+            validators_hash: Hash32::from_bytes([0; 32]),
+            next_validators_hash: Hash32::from_bytes([0; 32]),
+        };
+        let block_id = header.id();
+        SyncBlock {
+            block: Block {
+                header,
+                transactions: Vec::new(),
+            },
+            // Deliberately unverifiable. Nothing in this module checks a
+            // certificate — that is `Node::apply_synced`'s job, and a fixture that
+            // implied otherwise would be claiming a guarantee this layer does not
+            // give.
+            commit: afrolink_consensus::Commit::new(Height(height), Round(0), block_id, Vec::new()),
+        }
+    }
 
     fn sample_transaction() -> afrolink_types::Transaction {
         use afrolink_primitives::{Amount, ChainId, Denom, Height};
