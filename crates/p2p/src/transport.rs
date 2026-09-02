@@ -154,6 +154,9 @@ struct Shared {
     /// Heights applied from peers rather than decided here. Observable so a test
     /// can wait on catching up rather than on a sleep.
     synced: AtomicU64,
+    /// When peer housekeeping last ran, so rate limits are denominated in real
+    /// time rather than in however often the caller happens to call.
+    last_tick: Mutex<std::time::Instant>,
 }
 
 impl Shared {
@@ -239,18 +242,32 @@ impl Shared {
     /// Hand a peer's message to consensus, and put whatever it decides on the wire.
     fn deliver(&self, event: Event) {
         self.delivered.fetch_add(1, Ordering::Relaxed);
-        self.feed(event);
+        drop(self.feed(event));
     }
 
-    /// Hand an event to consensus, and put whatever it decides back on the wire.
+    /// Hand an event to consensus and carry out everything that follows.
+    fn feed(&self, event: Event) -> Vec<Action> {
+        self.drive(|node| node.handle(event))
+    }
+
+    /// **The one path from a node's actions to their effects.**
     ///
-    /// Separate from [`Self::deliver`] because this is also the path a node's
-    /// *own* votes take, and those are not messages that arrived from anywhere.
-    fn feed(&self, event: Event) {
+    /// Every way of reaching the consensus driver — a peer's message, a synced
+    /// block, a round beginning, a timer firing — comes through here, and here is
+    /// the only place that persists what committed and gossips what did not.
+    ///
+    /// It is a single function on purpose. When a node's own votes were counted
+    /// by the transport, commits could only happen on the *delivery* path, so
+    /// hanging persistence off that path worked. Moving the vote into the state
+    /// machine moved where a commit happens — a lone validator now commits inside
+    /// `start_round` — and a caller driving the node directly persisted nothing:
+    /// the chain ran, produced eighteen blocks, and its store stayed empty. Two
+    /// entry points meant one of them could be forgotten. Now there is one.
+    fn drive(&self, act: impl FnOnce(&mut afrolink_node::Node) -> Vec<Action>) -> Vec<Action> {
         let Some(mut node) = self.node.lock() else {
-            return;
+            return Vec::new();
         };
-        let actions = node.handle(event);
+        let actions = act(&mut node);
         let receipts = node.last_receipts().to_vec();
         let height = node.height();
         let state = node.store().clone();
@@ -264,7 +281,8 @@ impl Shared {
         // sender receiving it back costs one frame and is deduplicated there —
         // and suppressing it here would need the node to tell us where the
         // event came from, which is knowledge consensus has no reason to carry.
-        self.broadcast(actions, None);
+        self.broadcast(actions.clone(), None);
+        actions
     }
 
     /// Apply a block a peer sent, and tell the manager where that left us.
@@ -329,32 +347,22 @@ impl Shared {
         }
     }
 
-    /// Put a node's outbound actions on the wire — and its own votes back to itself.
+    /// Put a node's outbound actions on the wire.
     ///
-    /// # A node counts its own vote
+    /// **Send only.** A node counts its own vote inside `Node::emit_vote`, the
+    /// way CometBFT's `signAddVote` does — signed, added to its own vote set
+    /// through the same path a peer's vote takes, and only then gossiped. Gossip
+    /// is downstream of consensus state, never the mechanism by which it changes.
     ///
-    /// A vote this node signs has to reach this node's vote set, and returning it
-    /// as an `Action` does not put it there. The deterministic simulator has
-    /// always delivered a broadcast to its sender as well as to everybody else;
-    /// this transport did not, and the difference is invisible on a four-validator
-    /// network — three votes from three peers is already more than two thirds — and
-    /// total on a one-validator chain, which can never reach a quorum it is not
-    /// counted in. A `devnet` started by the node binary committed no blocks at
-    /// all, and no test in the workspace covered it, because every test drove
-    /// consensus through the simulator that had the rule.
-    ///
-    /// Only votes are looped back. A proposer already feeds its own proposal
-    /// through `on_proposal` inside `start_round`, so doing it again here would
-    /// put one proposal through the prevote decision twice.
+    /// This transport used to loop a node's own votes back through the state
+    /// machine to make quorum work, which meant a consensus invariant depended on
+    /// a transport being present. It worked, and it left the trap set for the next
+    /// caller that drove `Node` without one.
     fn broadcast(&self, actions: Vec<Action>, except: Option<PeerId>) {
         for action in actions {
-            let mut own: Option<Event> = None;
             let message = match action {
                 Action::BroadcastProposal(p) => PeerMessage::Proposal(p),
-                Action::BroadcastVote(v) => {
-                    own = Some(Event::Vote(v.clone()));
-                    PeerMessage::Vote(v)
-                }
+                Action::BroadcastVote(v) => PeerMessage::Vote(v),
                 Action::BroadcastTransaction(t) => PeerMessage::Transaction(t),
                 // Committing and scheduling a timeout are the node's own
                 // business. Neither is something a peer is told about: a peer
@@ -364,12 +372,6 @@ impl Shared {
                 Action::Committed(_, _) | Action::ScheduleTimeout(_, _) => continue,
             };
             self.relay(&message, except);
-            if let Some(event) = own {
-                // Terminates: a vote already in the set is refused by `VoteSet`,
-                // so handling it produces nothing and the recursion stops. The
-                // depth is the length of one round — prevote, precommit, commit.
-                self.feed(event);
-            }
         }
     }
 }
@@ -435,6 +437,7 @@ impl Transport {
             blocks,
             sink,
             synced: AtomicU64::new(0),
+            last_tick: Mutex::new(std::time::Instant::now()),
         });
 
         let accepting = Arc::clone(&shared);
@@ -554,20 +557,55 @@ impl Transport {
     }
 
     /// Run one tick of peer housekeeping.
+    ///
+    /// How often this is called is the caller's business and affects only how
+    /// promptly a node announces itself and asks for addresses. It does **not**
+    /// change what any rate limit means: the elapsed time since the last tick is
+    /// measured here and handed to the policy, so a limit of a thousand messages
+    /// a second is a thousand messages a second whether this runs at 2 Hz or 50.
     pub fn tick(&self) {
+        let elapsed = {
+            let Ok(mut last) = self.shared.last_tick.lock() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let elapsed = now.saturating_duration_since(*last);
+            *last = now;
+            elapsed
+        };
         let directives = {
             let Ok(mut manager) = self.shared.manager.lock() else {
                 return;
             };
-            manager.on_tick()
+            manager.on_tick(elapsed)
         };
         self.shared.apply(directives);
     }
 
-    /// Put a node's own actions on the wire.
+    /// Begin a round on the node, and carry out whatever it decides.
     ///
-    /// The path a proposer's block takes: consensus produces
-    /// `Action::BroadcastProposal`, and this is what turns it into frames.
+    /// A driver calls this rather than reaching for the node itself, because
+    /// "what a node decided" and "what has to happen as a result" must not be two
+    /// steps a caller can get half right. A lone validator commits inside this
+    /// call; that block has to reach the store, and it does so here rather than
+    /// depending on the driver to remember.
+    ///
+    /// Returns the actions so a driver can read `ScheduleTimeout` out of them.
+    /// Broadcasting and persistence have already happened.
+    pub fn start_round(&self, time: afrolink_primitives::Timestamp) -> Vec<Action> {
+        self.shared.drive(|node| node.start_round(time))
+    }
+
+    /// Fire a step's timer on the node, and carry out whatever it decides.
+    pub fn timeout(&self, step: afrolink_consensus::Step) -> Vec<Action> {
+        self.shared.feed(Event::Timeout(step))
+    }
+
+    /// Put a node's own actions on the wire, without touching the node.
+    ///
+    /// For a caller that already has actions in hand and wants only the gossip.
+    /// **Nothing is persisted.** Prefer [`Self::start_round`] and
+    /// [`Self::timeout`], which do the whole job.
     pub fn broadcast(&self, actions: Vec<Action>) {
         self.shared.broadcast(actions, None);
     }
@@ -723,12 +761,14 @@ fn pump(
 fn read_loop(shared: &Arc<Shared>, reader: &mut TcpStream, opener: &mut Opener, peer: PeerId) {
     while shared.running.load(Ordering::SeqCst) {
         match read_frame(reader, opener) {
-            Ok(message) => {
+            Ok((message, bytes)) => {
                 let directives = {
                     let Ok(mut manager) = shared.manager.lock() else {
                         return;
                     };
-                    manager.on_message(peer, message)
+                    // What it actually cost on the wire, so the byte-rate limit
+                    // is spent from the resource it is protecting.
+                    manager.on_message_sized(peer, message, bytes)
                 };
                 shared.apply(directives);
             }

@@ -40,7 +40,7 @@ use afrolink_consensus::Step;
 use afrolink_crypto::hash::{Domain, hash};
 use afrolink_executor::GenesisLimits;
 use afrolink_http::{Config as HttpConfig, Server};
-use afrolink_node::{Action, Event, Node, SharedNode};
+use afrolink_node::{Action, Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::PeerId;
@@ -293,11 +293,13 @@ fn drive(
     // How often the loop wakes. Short, because a consensus timeout should fire
     // close to when it was due rather than up to a whole peer-tick late.
     let poll = Duration::from_millis(20);
-    // How often peer housekeeping runs — and it is deliberately *not* the poll
-    // period. A peer's message budget is denominated in ticks, so ticking twenty
-    // times a second would quietly turn a limit of 512 messages per tick into ten
-    // thousand messages a second, and would put a status announcement and an
-    // address request on every connection twenty times a second besides.
+    // How often peer housekeeping runs. This no longer affects what any rate
+    // limit *means* — those are denominated per second and measured against the
+    // real elapsed time, precisely because tying them to this number once turned
+    // a limit of 512 messages into ten thousand a second when the poll period
+    // changed for unrelated reasons. What it still governs is how promptly this
+    // node announces its height and asks for addresses, and how quickly a stalled
+    // block request is handed to somebody else.
     let peer_tick = Duration::from_millis(500);
     let interval = Duration::from_millis(config.block_interval_ms);
     let mut deadline: Option<Deadline> = None;
@@ -365,14 +367,12 @@ fn drive(
                     .checked_add(interval)
                     .unwrap_or_else(Instant::now);
             } else {
-                let actions = {
-                    let Some(mut node) = shared.lock() else {
-                        return Err(RunError::Halted("node lock is poisoned".to_owned()));
-                    };
-                    node.start_round(now())
-                };
+                // Through the transport, not straight at the node. A round that
+                // commits has to reach the store, and the transport is the one
+                // place that knows how — a driver holding the node itself would
+                // produce blocks that exist only in memory.
+                let actions = transport.start_round(now());
                 deadline = schedule(config, &actions, deadline);
-                transport.broadcast(actions);
             }
         }
 
@@ -380,15 +380,9 @@ fn drive(
             && Instant::now() >= due.at
         {
             let step = due.step;
-            let actions = {
-                let Some(mut node) = shared.lock() else {
-                    return Err(RunError::Halted("node lock is poisoned".to_owned()));
-                };
-                node.handle(Event::Timeout(step))
-            };
             deadline = None;
+            let actions = transport.timeout(step);
             deadline = schedule(config, &actions, deadline);
-            transport.broadcast(actions);
         }
 
         std::thread::sleep(poll);

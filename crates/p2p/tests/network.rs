@@ -20,7 +20,7 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use afrolink_consensus::{CountryCode, Validator, ValidatorSet};
@@ -32,7 +32,7 @@ use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
 use afrolink_p2p::sync::{BlockSource, NoBlocks, SyncBlock};
-use afrolink_p2p::transport::{DiscardCommits, Transport, wait_for};
+use afrolink_p2p::transport::{CommitSink, DiscardCommits, Transport, wait_for};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::MemoryStore;
 use afrolink_types::{Fee, Message, Transaction, TxBody};
@@ -645,14 +645,15 @@ fn a_node_serving_nothing_says_so_rather_than_going_silent() {
 }
 
 #[test]
-fn a_lone_validator_counts_its_own_vote_and_commits() {
-    // The defect this closes was invisible everywhere else. A node's own votes
-    // are returned as actions, not applied to its own vote set, and the
-    // deterministic simulator has always delivered a broadcast back to its sender
-    // — so every consensus test in the workspace had the rule and the transport
-    // did not. On four validators it never showed: three votes from three peers is
-    // already more than two thirds. On one validator it is total, and the node
-    // binary's own devnet committed nothing at all.
+fn the_daemons_drive_loop_commits_without_the_transport_helping() {
+    // The exact sequence `afrolinkd` runs — `start_round`, then hand the actions
+    // to the transport — on the validator set that made the old defect total.
+    //
+    // The invariant itself now lives in `Node::emit_vote` and is tested there,
+    // with no sockets, in `crates/node/tests/quorum.rs`. What this asserts is the
+    // *composition*: that the transport takes actions and sends them, and does
+    // not quietly need to feed any of them back for consensus to work. It failed
+    // when the transport was the thing making quorum happen.
     let validators = ValidatorSet::new(vec![Validator::new(
         key(1).public_key(),
         1,
@@ -689,11 +690,97 @@ fn a_lone_validator_counts_its_own_vote_and_commits() {
         let mut node = alone.lock().unwrap();
         node.start_round(Timestamp::from_millis(1_700_000_001_000))
     };
-    transport.broadcast(actions);
-
     assert_eq!(
         height_of(&alone),
         Height(2),
-        "a validator that is the whole set must be able to commit on its own"
+        "the state machine commits on its own; the transport is not part of quorum"
+    );
+
+    // And handing those actions to a transport is safe: sending is all it does,
+    // so nothing is counted a second time.
+    transport.broadcast(actions);
+    assert_eq!(height_of(&alone), Height(2));
+}
+
+/// A sink that remembers what it was told to persist.
+struct Recorded(Mutex<Vec<Height>>);
+
+impl CommitSink for Recorded {
+    fn committed(
+        &self,
+        block: &afrolink_executor::Block,
+        _commit: &afrolink_consensus::Commit,
+        _receipts: &[afrolink_executor::TxReceipt],
+        _state: &MemoryStore,
+    ) {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push(block.header.height);
+        }
+    }
+}
+
+#[test]
+fn a_block_decided_locally_still_reaches_the_store() {
+    // Found by running the binary, not by a test — twice over.
+    //
+    // Persistence used to hang off the transport's *delivery* path, which worked
+    // only because a node's own votes were fed back through it, so every commit
+    // happened there. Moving the vote into the state machine moved where a commit
+    // happens: a lone validator now commits inside `start_round`, and a driver
+    // calling that directly persisted nothing. The chain produced eighteen blocks
+    // and its store stayed empty, while every test in the workspace passed.
+    //
+    // So the transport has one path from actions to effects, and this asserts it
+    // covers the path that has no network in it at all.
+    let validators = ValidatorSet::new(vec![Validator::new(
+        key(1).public_key(),
+        1,
+        CountryCode::new("ke").unwrap(),
+    )])
+    .unwrap();
+    let genesis = Genesis {
+        chain_id: chain(),
+        genesis_time: Timestamp::from_millis(1_700_000_000_000),
+        validators: validators.clone(),
+        issuers: Vec::new(),
+        attestors: Vec::new(),
+        council: afrolink_executor::Council::devnet(account(50)),
+        params: afrolink_executor::ChainParams::devnet(),
+        allocations: vec![Allocation {
+            address: account(50),
+            denom: Denom::native(),
+            amount: Amount::from_afri(1_000),
+        }],
+    };
+    let mut store = MemoryStore::new();
+    let block = genesis.apply(&mut store, GenesisLimits::devnet()).unwrap();
+    let alone = Arc::new(SharedNode::new(Node::new(
+        chain(),
+        key(1),
+        validators,
+        store,
+        &block,
+    )));
+
+    let sink = Arc::new(Recorded(Mutex::new(Vec::new())));
+    let identity = PeerId::new(key(1).public_key());
+    let transport = Transport::start(
+        chain(),
+        key(1),
+        Arc::clone(&alone),
+        Manager::new(identity, AddrBook::new(&key(1)), Limits::default()),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(NoBlocks),
+        Arc::clone(&sink) as Arc<dyn CommitSink>,
+    )
+    .expect("binds");
+
+    transport.start_round(Timestamp::from_millis(1_700_000_001_000));
+
+    assert_eq!(height_of(&alone), Height(2), "the round committed");
+    assert_eq!(
+        sink.0.lock().unwrap().as_slice(),
+        &[Height(1)],
+        "and the block it committed was handed to the store"
     );
 }

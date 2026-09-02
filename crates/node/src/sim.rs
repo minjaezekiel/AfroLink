@@ -272,22 +272,32 @@ impl Network {
 
     /// Turn a node's actions into messages, subject to the delivery rules.
     ///
-    /// Broadcasts are delivered to the sender too, so proposing and receiving
-    /// follow exactly the same code path — and a sender is never partitioned
-    /// from itself, however hostile the schedule.
+    /// **A broadcast goes to everybody else, and never back to its sender.**
+    ///
+    /// This used to deliver to the sender as well, and that convenience hid a
+    /// real defect for as long as both existed: a node's own vote reached its own
+    /// vote set *because the simulator put it there*, so every consensus test in
+    /// the workspace passed while the production path had no such rule. A node
+    /// binary driving the same state machine committed nothing.
+    ///
+    /// A node now counts its own votes in `Node::emit_vote` and feeds its own
+    /// proposal through `on_proposal` inside `start_round`, so there is nothing
+    /// left for this to deliver — and this harness is no longer more capable than
+    /// the system it is testing, which is the only property that makes it worth
+    /// trusting.
     fn dispatch(&mut self, from: usize, actions: Vec<Action>) {
         for action in actions {
             match action {
                 Action::BroadcastProposal(p) => {
                     for i in 0..self.nodes.len() {
-                        if i == from || self.reaches(from, i) {
+                        if i != from && self.reaches(from, i) {
                             self.queue.push((i, Event::Proposal(p.clone())));
                         }
                     }
                 }
                 Action::BroadcastVote(v) => {
                     for i in 0..self.nodes.len() {
-                        if i == from || self.reaches(from, i) {
+                        if i != from && self.reaches(from, i) {
                             self.queue.push((i, Event::Vote(v.clone())));
                         }
                     }

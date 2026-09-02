@@ -516,9 +516,41 @@ and the system is a defect the harness is guaranteed not to find, and the
 divergences are invisible precisely because the harness passes. What caught this
 was not a test but an artefact — running the thing.
 
-It is pinned now by `a_lone_validator_counts_its_own_vote_and_commits`, which
-fails without the fix, and the single-validator case is the shape that makes it
-fail loudly rather than subtly.
+**Where the fix went matters more than that it went in.** The first attempt made
+the transport loop a node's own votes back through the state machine. It worked,
+every test passed, and it was the wrong layer: a consensus invariant now depended
+on a transport being present, so the next caller to drive `Node` without one would
+break quorum again in exactly the same silent way.
+
+CometBFT puts it in the state machine. `signAddVote` signs the vote and places it
+on the node's own internal queue, so it reaches `addVote` by the same path a
+peer's vote takes; gossip is *downstream* of consensus state rather than the
+mechanism by which it changes. `Node::emit_vote` now does the same.
+
+That let the divergence be **removed rather than mirrored**: `sim::dispatch` no
+longer delivers a broadcast to its sender, and the full Byzantine suite passes
+unchanged. The harness is no longer more capable than the system it tests, which
+is the only property that makes it worth trusting.
+
+Pinned by `crates/node/tests/quorum.rs` — five tests driven against the bare state
+machine, with no transport and no simulator, because a test that reaches `Node`
+through either would be testing the thing that hid this.
+
+### 22a. And the fix moved a second bug into the open
+
+Moving the vote moved *where a commit happens*. Persistence had been hung off the
+transport's delivery path, which was complete only because the transport was where
+votes were counted; now a lone validator commits inside `start_round`, and the
+daemon — which called `Node::start_round` directly — persisted nothing.
+
+The chain produced eighteen blocks and its store reported height zero. Again,
+found by running the binary and diffing its log against its own query endpoint;
+again, invisible to a suite that was by then at 986 tests.
+
+The fix is structural rather than another hook: `Shared::drive` is the one path
+from a node's actions to their effects, and `Transport::start_round` and
+`Transport::timeout` route a driver through it. Two entry points meant one could
+be forgotten, and one was.
 
 ### 23. Two constants that had to differ, and did not
 
@@ -536,6 +568,48 @@ frame. The fix is that there is now one number: `MAX_FRAME_LEN` is derived from
 `MAX_BLOCK_BYTES` plus a stated headroom, and a `const` assertion fails the build
 if the relationship is ever broken. Two constants that must not drift apart
 should not be two constants.
+
+**The constant was the smaller half.** Refusing an *absurd* length was already
+tested; what was not is that a **legal** length costs memory before a single byte
+of it arrives. `vec![0u8; len]` on a stranger's word is five mebibytes for a
+four-byte header, and forty inbound slots is two hundred mebibytes an attacker
+never has to send. Frames are now filled in 16 KiB chunks as bytes actually turn
+up, so the memory taken is bounded by the bandwidth spent taking it.
+
+Writing the test for that produced a small lesson of its own: the first version
+cloned a `Cell` out of the fake reader to inspect it afterwards, which copies the
+*value* rather than sharing it — so the assertion looked at a zero that never
+changed, and passed against the very implementation it existed to catch. A test
+that cannot fail is worse than no test, because it is counted.
+
+### 24. A rate limit whose meaning depended on an unrelated loop
+
+The peer limiter was written as "512 messages per tick", which is not a rate — it
+is a rate multiplied by however often somebody calls. The daemon's loop wakes
+every 20 ms so consensus timeouts fire close to when they are due; ticking the
+peer manager on the same schedule turned the limit into ten thousand messages a
+second. A security bound loosened tenfold by a decision about loop latency, with
+nothing anywhere to notice.
+
+Separating the two clocks fixed the symptom. The cause is that the unit was wrong.
+
+CometBFT denominates the same thing as `SendRate`/`RecvRate` in **bytes per
+second** against a real clock. `Limits` now carries `messages_per_second` and
+`bytes_per_second` with a bounded burst, spent from two token buckets per peer
+that are refilled by *elapsed time handed in* — so the policy still reads no
+clock, exactly as `Node` takes time as `Event::Timeout`.
+
+Both limits, because neither implies the other: a flood of tiny frames costs CPU
+and lock contention, and one maximum-size frame a second saturates a link while
+sitting far inside any message budget. That second hole was open the whole time
+and no test had asked about it.
+
+The property is now asserted directly — the same offered load gets the same
+verdict at 1, 2, 10 and 50 ticks a second. Writing it also corrected a
+misconception of mine: counting *accepted messages* across tick rates does not
+measure the rate, because ticking more often means more refusals for the same
+load, and refusals cost reputation. What is invariant is the verdict, not the
+count.
 
 ## What this does not prove
 

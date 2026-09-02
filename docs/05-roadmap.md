@@ -146,6 +146,15 @@ header it verified itself, trusting nothing about the node in between.
 - [ ] **State sync** — a new node still replays every block from genesis. Needs
       the state tree served in verifiable chunks rather than blocks served whole
       *(ADR-0024)*
+- [ ] **Block gossip as parts** — a `PartSet` of 64 KiB pieces with its own
+      Merkle root, as Tendermint does, so the largest thing a peer can ask a node
+      to hold is a constant rather than a whole block. Frames are already read
+      incrementally, which bounds the memory; this bounds the *message*
+      *(ADR-0024)*
+- [ ] **Channel priorities** — consensus traffic does not currently outrank
+      mempool gossip, so a node whose link is saturated by transactions misses
+      votes. CometBFT multiplexes with per-channel priority for exactly this
+      *(ADR-0023)*
 - [ ] **Double-signing protection across a restart** — nothing records what this
       node has already signed at a height, so a validator restarted from a stale
       store could double-sign. Tendermint keeps a write-ahead log for exactly

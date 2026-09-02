@@ -66,6 +66,13 @@ pub const FRAME_HEADROOM: usize = 1024 * 1024;
 /// constants that must not drift apart should not be two numbers.
 pub const MAX_FRAME_LEN: usize = MAX_BLOCK_BYTES.saturating_add(FRAME_HEADROOM);
 
+/// How much of a frame is read at a time.
+///
+/// The unit in which a reader's buffer grows, so the memory a peer can make this
+/// node hold is bounded by what it has actually sent plus one of these — never by
+/// the length it claimed in the header.
+pub const READ_CHUNK: usize = 16 * 1024;
+
 /// Most addresses one `Addrs` message may carry.
 ///
 /// Bounded because an address list is the one message a peer can make arbitrarily
@@ -320,13 +327,21 @@ pub fn write_frame<W: Write>(
         .map_err(|e| FrameError::Io(e.to_string()))
 }
 
-/// Read one frame and open it.
+/// Read one frame and open it, returning the message and what it cost on the wire.
+///
+/// The byte count is returned rather than discarded because it is what the rate
+/// limiter is denominated in: a peer sending one enormous frame a second is
+/// within any *message* budget, and bytes are the resource that actually runs
+/// out. CometBFT's `RecvRate` counts the same thing for the same reason.
 ///
 /// # Errors
 /// Returns the first [`FrameError`] encountered. Every one of them is fatal to
 /// the connection: there is no resynchronising a stream whose frame counter has
 /// diverged.
-pub fn read_frame<R: Read>(reader: &mut R, opener: &mut Opener) -> Result<PeerMessage, FrameError> {
+pub fn read_frame<R: Read>(
+    reader: &mut R,
+    opener: &mut Opener,
+) -> Result<(PeerMessage, usize), FrameError> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
@@ -342,20 +357,46 @@ pub fn read_frame<R: Read>(reader: &mut R, opener: &mut Opener) -> Result<PeerMe
         return Err(FrameError::TooShort { len });
     }
 
-    let mut sealed = vec![0u8; len];
-    // Past the header, a timeout is not "idle" — it is a peer that announced a
-    // frame and then stopped talking half way through it, which is a stalled
-    // connection rather than a quiet one.
-    reader
-        .read_exact(&mut sealed)
-        .map_err(|e| match from_io(&e) {
-            FrameError::TimedOut => FrameError::Io("stalled mid-frame".to_owned()),
-            other => other,
-        })?;
+    // **Allocate what has arrived, never what was announced.**
+    //
+    // `vec![0u8; len]` here would hand a stranger a five-mebibyte allocation for
+    // the price of a four-byte header: announce the maximum, send nothing, and a
+    // node with forty inbound slots is holding two hundred mebibytes it will
+    // never receive. Growing as the bytes actually turn up makes the attack cost
+    // the attacker exactly as much bandwidth as it costs this node memory, which
+    // is the property that makes it not worth mounting.
+    //
+    // CometBFT reaches the same place from the other end: `MaxPacketMsgPayloadSize`
+    // means a peer never announces more than one small packet, and a block is a
+    // `PartSet` of 64 KiB parts rather than one message — so the largest thing a
+    // peer can ask a node to hold is a constant. Doing that here would mean
+    // splitting proposals and sync responses into parts with their own Merkle
+    // root, which is the right long-term shape and a change to the consensus wire
+    // format; this is the bound that does not need one.
+    let mut sealed: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; READ_CHUNK];
+    while sealed.len() < len {
+        let want = READ_CHUNK.min(len.saturating_sub(sealed.len()));
+        // Past the header, a timeout is not "idle" — it is a peer that announced
+        // a frame and then stopped talking half way through it, which is a
+        // stalled connection rather than a quiet one.
+        let read = match reader.read(chunk.get_mut(..want).unwrap_or(&mut [])) {
+            Ok(0) => return Err(FrameError::Closed),
+            Ok(read) => read,
+            Err(e) => {
+                return Err(match from_io(&e) {
+                    FrameError::TimedOut => FrameError::Io("stalled mid-frame".to_owned()),
+                    other => other,
+                });
+            }
+        };
+        sealed.extend_from_slice(chunk.get(..read).unwrap_or(&[]));
+    }
 
     let plaintext = opener.open(&sealed, &header)?;
-    afrolink_primitives::codec::decode_exact::<PeerMessage>(&plaintext)
-        .map_err(|e| FrameError::Malformed(e.to_string()))
+    let message = afrolink_primitives::codec::decode_exact::<PeerMessage>(&plaintext)
+        .map_err(|e| FrameError::Malformed(e.to_string()))?;
+    Ok((message, len.saturating_add(header.len())))
 }
 
 /// Classify a socket error by kind, never by the operating system's wording.
@@ -395,9 +436,12 @@ mod tests {
         let message = PeerMessage::Ping(42);
         let mut wire: Vec<u8> = Vec::new();
         write_frame(&mut wire, &mut send, &message).expect("writes");
+        let (back, bytes) = read_frame(&mut wire.as_slice(), &mut recv).expect("reads");
+        assert_eq!(back, message);
         assert_eq!(
-            read_frame(&mut wire.as_slice(), &mut recv).expect("reads"),
-            message
+            bytes,
+            wire.len(),
+            "the cost reported is the cost on the wire"
         );
     }
 
@@ -416,7 +460,10 @@ mod tests {
         }
         let mut cursor = wire.as_slice();
         for message in &messages {
-            assert_eq!(read_frame(&mut cursor, &mut recv).expect("reads"), *message);
+            assert_eq!(
+                read_frame(&mut cursor, &mut recv).expect("reads").0,
+                *message
+            );
         }
     }
 
@@ -530,6 +577,85 @@ mod tests {
                 "the headroom is what a commit certificate travels in"
             );
         }
+    }
+
+    /// A reader that counts the largest buffer it was ever asked to fill.
+    ///
+    /// Standing in for memory: a reader asked for one 16 KiB chunk at a time
+    /// cannot be holding five mebibytes, however large a number the header named.
+    struct Trickle {
+        remaining: usize,
+        /// Shared with the test, so the count survives the reader being moved
+        /// into a `Chain`. A plain `Cell` cloned out would copy the value and
+        /// leave the assertion looking at a zero that never changes — which is
+        /// how this test first passed against the very implementation it exists
+        /// to catch.
+        largest_ask: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.largest_ask.set(self.largest_ask.get().max(buf.len()));
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.remaining).min(64);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn an_announced_length_costs_what_arrives_rather_than_what_was_claimed() {
+        // The oldest bug in network code, in its second form. Refusing an absurd
+        // length is not enough: a length that is *legal* and never delivered is
+        // a five-mebibyte allocation for the price of a four-byte header, and a
+        // node with forty inbound slots holds two hundred mebibytes of nothing.
+        let (_, mut recv) = pair();
+        let mut wire = Vec::new();
+        #[expect(clippy::cast_possible_truncation, reason = "MAX_FRAME_LEN fits u32")]
+        let announced = (MAX_FRAME_LEN as u32).to_le_bytes();
+        wire.extend_from_slice(&announced);
+
+        // The header, then a hundred bytes, then silence.
+        let mut reader = std::io::Read::chain(
+            wire.as_slice(),
+            Trickle {
+                remaining: 100,
+                largest_ask: std::rc::Rc::new(std::cell::Cell::new(0)),
+            },
+        );
+        let outcome = read_frame(&mut reader, &mut recv);
+        assert!(
+            matches!(outcome, Err(FrameError::Closed)),
+            "a peer that stops talking mid-frame is a closed connection, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_reader_never_asks_for_more_than_one_chunk_at_a_time() {
+        // The mechanism behind the test above, asserted directly: the buffer
+        // grows in `READ_CHUNK` steps as bytes arrive, so the peak is bounded by
+        // what the peer actually sent and not by what it announced.
+        let (_, mut recv) = pair();
+        let mut wire = Vec::new();
+        #[expect(clippy::cast_possible_truncation, reason = "MAX_FRAME_LEN fits u32")]
+        let announced = (MAX_FRAME_LEN as u32).to_le_bytes();
+        wire.extend_from_slice(&announced);
+
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let trickle = Trickle {
+            remaining: 200,
+            largest_ask: std::rc::Rc::clone(&asked),
+        };
+        let mut reader = std::io::Read::chain(wire.as_slice(), trickle);
+        drop(read_frame(&mut reader, &mut recv));
+
+        assert!(
+            asked.get() <= READ_CHUNK,
+            "the reader asked for {} bytes at once; the chunk size is {READ_CHUNK}",
+            asked.get()
+        );
     }
 
     #[test]

@@ -412,7 +412,7 @@ impl Node {
             return Vec::new();
         };
         self.round_state.step = Step::Prevote;
-        vec![self.emit_vote(VoteType::Prevote, value)]
+        self.emit_vote(VoteType::Prevote, value)
     }
 
     /// Re-execute a proposed block and check it matches its own header.
@@ -490,7 +490,7 @@ impl Node {
         let Decision::Precommit(value) = self.round_state.decide_precommit(Some(quorum)) else {
             return Vec::new();
         };
-        vec![self.emit_vote(VoteType::Precommit, value)]
+        self.emit_vote(VoteType::Precommit, value)
     }
 
     fn check_precommit_quorum(&mut self) -> Vec<Action> {
@@ -674,12 +674,12 @@ impl Node {
             // No proposal arrived in time: prevote nil so the round can conclude.
             Step::Propose if self.round_state.step == Step::Propose => {
                 self.round_state.step = Step::Prevote;
-                vec![self.emit_vote(VoteType::Prevote, None)]
+                self.emit_vote(VoteType::Prevote, None)
             }
             // Prevotes were inconclusive: precommit nil.
             Step::Prevote if self.round_state.step == Step::Prevote => {
                 self.round_state.step = Step::Precommit;
-                vec![self.emit_vote(VoteType::Precommit, None)]
+                self.emit_vote(VoteType::Precommit, None)
             }
             // Precommits were inconclusive: move on to the next round.
             Step::Precommit if self.round_state.step == Step::Precommit => {
@@ -691,7 +691,27 @@ impl Node {
         }
     }
 
-    fn emit_vote(&mut self, vote_type: VoteType, block_id: Option<Hash32>) -> Action {
+    /// Sign a vote, **count it**, and ask for it to be broadcast.
+    ///
+    /// # A node counts its own vote, and does it here rather than on the wire
+    ///
+    /// This is CometBFT's `signAddVote`: the vote is signed and immediately
+    /// placed on the node's own internal queue with an empty peer id, so it
+    /// reaches `addVote` by exactly the path a peer's vote takes. Gossip is
+    /// *downstream* of that, never the mechanism by which it happens.
+    ///
+    /// The direction matters. A design where the network loops a node's own vote
+    /// back makes a consensus invariant depend on a transport, so every caller
+    /// that drives the state machine without one silently breaks quorum — and
+    /// that is precisely the defect this replaces. The version fixed on the wire
+    /// worked, and left the trap set for the next caller.
+    ///
+    /// Returning `Vec<Action>` rather than one action is a consequence: counting
+    /// our own vote can complete a quorum, which produces the next vote, which
+    /// can complete the next quorum, which can commit. The recursion terminates
+    /// because `VoteSet` refuses a vote it already holds and because each step
+    /// moves the round forward — prevote, precommit, commit — and never back.
+    fn emit_vote(&mut self, vote_type: VoteType, block_id: Option<Hash32>) -> Vec<Action> {
         let signed = Vote {
             chain_id: self.chain_id.clone(),
             height: self.height,
@@ -701,6 +721,11 @@ impl Node {
             validator: self.address,
         }
         .sign(&self.key);
-        Action::BroadcastVote(Box::new(signed))
+
+        let mut actions = vec![Action::BroadcastVote(Box::new(signed.clone()))];
+        // Through the same door as everybody else's. A second path into the vote
+        // set would be a second place for the counting rules to be wrong.
+        actions.extend(self.on_vote(signed));
+        actions
     }
 }

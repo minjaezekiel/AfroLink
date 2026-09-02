@@ -19,8 +19,10 @@
 //! **A message is never relayed to whoever sent it.** Obvious, and the omission
 //! is how a two-node network turns one vote into an infinite loop.
 //!
-//! **A peer that talks too fast is slowed, then dropped.** The limit is counted
-//! per tick rather than per second, so the policy has no clock in it.
+//! **A peer that talks too fast is slowed, then dropped.** Two token buckets per
+//! peer — messages and bytes — refilled by *elapsed time handed in* rather than
+//! by a clock this module reads. So the policy still has no clock in it, and the
+//! limit means the same thing however often the caller ticks.
 //!
 //! # And the rule that keeps the network from being captured
 //!
@@ -31,6 +33,7 @@
 //! group is itself a way for an attacker to deny honest peers a seat.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use afrolink_crypto::hash::Hash32;
 use afrolink_node::Event;
@@ -40,8 +43,23 @@ use crate::addrbook::AddrBook;
 use crate::peer::{AddrGroup, Misbehaviour, PeerAddr, PeerId, Reputation};
 use crate::sync::{MAX_BLOCKS_IN_FLIGHT, MAX_STAGED_BLOCKS, REQUEST_TIMEOUT_TICKS, SyncBlock};
 use crate::wire::{MAX_ADDRS, PeerMessage};
+use afrolink_primitives::codec::Encode;
 
 /// How many peers a node keeps, and how fast they may talk.
+///
+/// # Rates are per second, not per tick
+///
+/// A limit denominated in *ticks* means nothing without knowing how often the
+/// caller ticks, and the caller is free to change that. This limit was written
+/// as "512 messages per tick", and a daemon that ticked its peer manager on the
+/// same 20 Hz schedule as its consensus poll quietly turned it into ten thousand
+/// messages a second — a tenfold loosening of a security bound, caused by an
+/// unrelated decision about loop latency, with nothing to notice it.
+///
+/// CometBFT denominates the same thing as `SendRate`/`RecvRate` in **bytes per
+/// second**, enforced against a real clock. That is the model here, with one
+/// addition: a message rate as well, because a flood of tiny frames costs CPU
+/// and lock contention rather than bandwidth, and neither limit implies the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Connections this node makes. The eclipse-relevant number.
@@ -50,8 +68,20 @@ pub struct Limits {
     pub max_inbound: usize,
     /// Gossip ids remembered, for deduplication.
     pub seen_capacity: usize,
-    /// Messages one peer may send between ticks.
-    pub messages_per_tick: u32,
+    /// Messages one peer may send per second, sustained.
+    pub messages_per_second: u64,
+    /// Bytes one peer may send per second, sustained.
+    ///
+    /// The limit that actually bounds a link. A peer within any message budget
+    /// can still send maximum-size frames as fast as its socket allows.
+    pub bytes_per_second: u64,
+    /// How much unused allowance a quiet peer may bank.
+    ///
+    /// Traffic here is bursty by nature — a round's votes arrive together, and a
+    /// sync reply arrives all at once — so a limiter with no burst allowance
+    /// punishes the normal case. It is bounded because an unbounded one is not a
+    /// limit.
+    pub burst: Duration,
 }
 
 impl Default for Limits {
@@ -61,12 +91,69 @@ impl Default for Limits {
     /// because they are the connections an attacker has to capture *all* of to
     /// eclipse a node. Inbound is generous because refusing inbound cheaply is
     /// how a network stops new nodes joining.
+    ///
+    /// The rates are deliberately below CometBFT's 20 MB/s default. A validator
+    /// here is expected on a link that costs money by the gigabyte, and a limit
+    /// no real connection can reach is not a limit — it is a number that will be
+    /// discovered to be wrong during an incident.
     fn default() -> Self {
         Self {
             max_outbound: 8,
             max_inbound: 40,
             seen_capacity: 8_192,
-            messages_per_tick: 512,
+            // What the old "512 per tick" came to at the rate the daemon actually
+            // ticked. Stated in the unit that makes it checkable.
+            messages_per_second: 1_024,
+            bytes_per_second: 5 * 1024 * 1024,
+            burst: Duration::from_secs(2),
+        }
+    }
+}
+
+/// A token bucket, refilled by elapsed time rather than by a clock it reads.
+///
+/// Time arrives as data, exactly as it does at `Node::handle` as
+/// `Event::Timeout`. That is what keeps this module testable without a clock
+/// while giving the limit a meaning that does not depend on the caller's loop.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: u64,
+    capacity: u64,
+    per_second: u64,
+}
+
+impl Bucket {
+    /// A bucket that sustains `per_second` and may bank `burst` worth of it.
+    ///
+    /// `floor` is the smallest capacity that must be allowed whatever the rate
+    /// says — for the byte bucket that is one maximum-size frame, because a
+    /// limiter that cannot pass a single legal message is a limiter that stops
+    /// the chain rather than an attacker.
+    fn new(per_second: u64, burst: Duration, floor: u64) -> Self {
+        let banked =
+            per_second.saturating_mul(burst.as_millis().try_into().unwrap_or(u64::MAX)) / 1_000;
+        let capacity = banked.max(floor).max(1);
+        Self {
+            tokens: capacity,
+            capacity,
+            per_second,
+        }
+    }
+
+    fn refill(&mut self, elapsed: Duration) {
+        let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let gained = self.per_second.saturating_mul(millis) / 1_000;
+        self.tokens = self.tokens.saturating_add(gained).min(self.capacity);
+    }
+
+    /// Spend `n`, or report that the peer has outrun its allowance.
+    fn take(&mut self, n: u64) -> bool {
+        match self.tokens.checked_sub(n) {
+            Some(left) => {
+                self.tokens = left;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -128,8 +215,9 @@ struct Connected {
     addr: PeerAddr,
     outbound: bool,
     reputation: Reputation,
-    /// Messages received since the last tick.
-    budget: u32,
+    /// What this peer may still send before the next refill.
+    messages: Bucket,
+    bytes: Bucket,
     /// Whether we have asked this peer for addresses and not yet been answered.
     awaiting_addrs: bool,
     /// The highest height this peer has claimed, if it has said.
@@ -392,7 +480,15 @@ impl Manager {
                 addr,
                 outbound,
                 reputation: Reputation::new(),
-                budget: self.limits.messages_per_tick,
+                messages: Bucket::new(self.limits.messages_per_second, self.limits.burst, 1),
+                bytes: Bucket::new(
+                    self.limits.bytes_per_second,
+                    self.limits.burst,
+                    // One maximum-size frame, always. Otherwise a node configured
+                    // with a modest byte rate would drop every peer that sent it
+                    // a large block — which is to say, every peer it syncs from.
+                    crate::wire::MAX_FRAME_LEN as u64,
+                ),
                 awaiting_addrs: false,
                 tip: None,
                 awaiting_block: None,
@@ -418,9 +514,10 @@ impl Manager {
     /// is the transport's business; whether a peer has spent its budget, and
     /// whether a block request has waited long enough to be given to somebody
     /// else, is this module's.
-    pub fn on_tick(&mut self) -> Vec<Directive> {
+    pub fn on_tick(&mut self, elapsed: Duration) -> Vec<Directive> {
         for peer in self.peers.values_mut() {
-            peer.budget = self.limits.messages_per_tick;
+            peer.messages.refill(elapsed);
+            peer.bytes.refill(elapsed);
         }
         self.cursor = self.cursor.wrapping_add(1);
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -555,16 +652,26 @@ impl Manager {
     }
 
     /// Handle one message from one peer.
+    ///
+    /// `bytes` is what the message cost on the wire, which is what the byte-rate
+    /// limit is spent from. A caller that does not know — a test constructing a
+    /// message directly — can use [`Self::on_message`].
     #[must_use]
-    pub fn on_message(&mut self, from: PeerId, message: PeerMessage) -> Vec<Directive> {
+    pub fn on_message_sized(
+        &mut self,
+        from: PeerId,
+        message: PeerMessage,
+        bytes: usize,
+    ) -> Vec<Directive> {
         let Some(peer) = self.peers.get_mut(&from) else {
             // A message from someone we are not connected to. Nothing to do and
             // nothing to punish: the connection is already gone.
             return Vec::new();
         };
-        match peer.budget.checked_sub(1) {
-            Some(left) => peer.budget = left,
-            None => return self.penalise(from, Misbehaviour::TooFast),
+        // Both limits, because neither implies the other: a flood of tiny frames
+        // costs CPU and lock contention, and one enormous frame costs a link.
+        if !peer.messages.take(1) || !peer.bytes.take(bytes as u64) {
+            return self.penalise(from, Misbehaviour::TooFast);
         }
 
         // Deduplicate before anything else. A message we have already relayed is
@@ -683,6 +790,16 @@ impl Manager {
         out
     }
 
+    /// Handle one message whose wire cost is not known.
+    ///
+    /// Charges the byte budget for the message's encoded length, which is what it
+    /// would have cost had it arrived over a socket.
+    #[must_use]
+    pub fn on_message(&mut self, from: PeerId, message: PeerMessage) -> Vec<Directive> {
+        let bytes = message.to_bytes().len();
+        self.on_message_sized(from, message, bytes)
+    }
+
     fn on_addrs(&mut self, from: PeerId, addrs: &[PeerAddr]) -> Vec<Directive> {
         let Some(peer) = self.peers.get_mut(&from) else {
             return Vec::new();
@@ -724,6 +841,7 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::MAX_FRAME_LEN;
     use afrolink_crypto::SecretKey;
     use std::net::SocketAddr;
 
@@ -749,6 +867,9 @@ mod tests {
             Limits::default(),
         )
     }
+
+    /// One second per tick, so a rate written "per second" reads as itself.
+    const TICK: Duration = Duration::from_secs(1);
 
     fn ping(n: u64) -> PeerMessage {
         PeerMessage::Ping(n)
@@ -889,7 +1010,8 @@ mod tests {
     #[test]
     fn a_peer_that_floods_is_slowed_then_dropped() {
         let limits = Limits {
-            messages_per_tick: 3,
+            messages_per_second: 3,
+            burst: Duration::from_secs(1),
             ..Limits::default()
         };
         let mut m = Manager::new(
@@ -918,9 +1040,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_refreshes_the_budget() {
+    fn elapsed_time_refills_the_allowance() {
         let limits = Limits {
-            messages_per_tick: 2,
+            messages_per_second: 2,
+            burst: Duration::from_secs(1),
             ..Limits::default()
         };
         let mut m = Manager::new(
@@ -932,9 +1055,12 @@ mod tests {
         m.on_inbound(a).expect("connects");
         assert!(!m.on_message(a.id, ping(1)).is_empty());
         assert!(!m.on_message(a.id, ping(2)).is_empty());
-        assert!(m.on_message(a.id, ping(3)).is_empty(), "budget spent");
-        m.on_tick();
-        assert!(!m.on_message(a.id, ping(4)).is_empty(), "budget refreshed");
+        assert!(m.on_message(a.id, ping(3)).is_empty(), "allowance spent");
+        m.on_tick(TICK);
+        assert!(
+            !m.on_message(a.id, ping(4)).is_empty(),
+            "a second buys two more"
+        );
     }
 
     #[test]
@@ -953,7 +1079,7 @@ mod tests {
         );
 
         // Once asked, the same list is accepted.
-        m.on_tick();
+        m.on_tick(TICK);
         let solicited = m.on_message(a.id, PeerMessage::Addrs(vec![offered]));
         assert!(solicited.is_empty());
         assert!(m.book().get(&offered.id).is_some());
@@ -966,7 +1092,7 @@ mod tests {
         let mut m = manager();
         let a = addr(1, "198.51.100.1");
         m.on_inbound(a).expect("connects");
-        m.on_tick();
+        m.on_tick(TICK);
         let offered: Vec<PeerAddr> = (0..MAX_ADDRS)
             .map(|n| {
                 #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_ADDRS")]
@@ -1048,6 +1174,136 @@ mod tests {
         assert!(m.on_outbound(addr(2, "198.51.100.2")).is_ok());
     }
 
+    /// Whether a peer offering `offered` messages a second, evenly spread,
+    /// survives one second when the manager is ticked `ticks` times across it.
+    ///
+    /// Survival rather than a count, because a count conflates two things: how
+    /// much the limiter let through, and how much reputation the refusals cost.
+    /// Ticking more often means more refusals for the same offered load, so
+    /// counting accepted messages measures the ban policy and not the rate.
+    fn survives_one_second(ticks: u32, offered: u64, limits: Limits) -> bool {
+        let mut m = Manager::new(
+            PeerId::new(key(200).public_key()),
+            AddrBook::new(&key(1)),
+            limits,
+        );
+        let a = addr(1, "203.0.1.1");
+        m.on_inbound(a).expect("connects");
+        let ticks = ticks.max(1);
+        let slice = Duration::from_millis(u64::from(1_000 / ticks));
+        let per_slice = offered / u64::from(ticks);
+
+        for _ in 0..ticks {
+            m.on_tick(slice);
+            for n in 0..per_slice {
+                drop(m.on_message(a.id, ping(n)));
+            }
+        }
+        !m.is_banned(&a.id) && m.peers().contains(&a.id)
+    }
+
+    #[test]
+    fn a_rate_limit_means_the_same_thing_however_often_the_caller_ticks() {
+        // The defect this replaces, stated as a property. The limit used to be
+        // "512 messages per tick", so a daemon that ticked at 20 Hz instead of
+        // 2 Hz silently granted its peers ten times the traffic — a security
+        // bound loosened tenfold by an unrelated decision about loop latency,
+        // with nothing anywhere to notice it.
+        //
+        // Now the same offered load gets the same verdict however finely the
+        // second is sliced.
+        let limits = Limits {
+            messages_per_second: 100,
+            burst: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        for ticks in [1u32, 2, 10, 50] {
+            assert!(
+                survives_one_second(ticks, 100, limits),
+                "a peer sending exactly the limit was dropped at {ticks} ticks a second"
+            );
+            assert!(
+                !survives_one_second(ticks, 5_000, limits),
+                "a peer sending fifty times the limit survived at {ticks} ticks a second"
+            );
+        }
+    }
+
+    #[test]
+    fn one_enormous_frame_a_second_is_still_a_flood() {
+        // A peer well inside any message budget can still saturate a link, which
+        // is why CometBFT denominates its limit in bytes. Ours does both, because
+        // neither implies the other.
+        let limits = Limits {
+            messages_per_second: 1_000_000,
+            bytes_per_second: 1_024,
+            burst: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        let mut m = Manager::new(
+            PeerId::new(key(200).public_key()),
+            AddrBook::new(&key(1)),
+            limits,
+        );
+        let a = addr(1, "203.0.1.1");
+        m.on_inbound(a).expect("connects");
+
+        // The byte bucket's floor admits one maximum-size frame however tight the
+        // rate is: a limiter that cannot pass a legal block stops the chain
+        // rather than an attacker.
+        assert!(
+            !m.on_message_sized(a.id, ping(1), MAX_FRAME_LEN).is_empty(),
+            "one maximum-size frame must always be affordable"
+        );
+        // The next one is refused on bytes alone, with the message count barely
+        // touched — one of a million.
+        assert!(
+            m.on_message_sized(a.id, ping(2), MAX_FRAME_LEN).is_empty(),
+            "the byte allowance is spent even though the message allowance is not"
+        );
+        // And a peer that keeps it up is dropped.
+        for n in 0..40u64 {
+            drop(m.on_message_sized(a.id, ping(n), MAX_FRAME_LEN));
+        }
+        assert!(
+            m.is_banned(&a.id) || !m.peers().contains(&a.id),
+            "a peer sending maximum-size frames without pause must be dropped"
+        );
+    }
+
+    #[test]
+    fn a_quiet_peer_may_bank_a_burst_but_not_an_unbounded_one() {
+        // Votes for a round arrive together and a sync reply arrives all at once,
+        // so a limiter with no burst allowance punishes the normal case. The
+        // bound is what keeps it a limit.
+        let limits = Limits {
+            messages_per_second: 10,
+            burst: Duration::from_secs(2),
+            ..Limits::default()
+        };
+        let mut m = Manager::new(
+            PeerId::new(key(200).public_key()),
+            AddrBook::new(&key(1)),
+            limits,
+        );
+        let a = addr(1, "203.0.1.1");
+        m.on_inbound(a).expect("connects");
+
+        // An hour of silence banks the burst window and not an hour.
+        m.on_tick(Duration::from_secs(3_600));
+        let mut accepted = 0;
+        for n in 0..1_000u64 {
+            if m.on_message(a.id, ping(n)).is_empty() {
+                break;
+            }
+            accepted += 1;
+        }
+        assert_eq!(
+            accepted, 20,
+            "two seconds of burst at ten a second, not an hour of it"
+        );
+    }
+
     // -- catching up --------------------------------------------------------
 
     /// A manager with `count` peers connected, all claiming height `tip`.
@@ -1093,7 +1349,7 @@ mod tests {
         // The common case, and the one that must cost nothing: a node level with
         // its peers should not be issuing a request every tick forever.
         let (mut m, _) = syncing(Height(9), 3, 8);
-        assert!(requested(&m.on_tick()).is_empty());
+        assert!(requested(&m.on_tick(TICK)).is_empty());
         assert!(!m.is_behind());
     }
 
@@ -1103,7 +1359,7 @@ mod tests {
         // first is the tempting mistake: every reply then has to be held, because
         // none of them can be applied until the bottom of the gap arrives.
         let (mut m, _) = syncing(Height(5), 4, 100);
-        let asked = requested(&m.on_tick());
+        let asked = requested(&m.on_tick(TICK));
         let heights: Vec<u64> = asked.iter().map(|(_, h)| h.0).collect();
         assert_eq!(heights, vec![5, 6, 7, 8], "lowest first, one per peer");
 
@@ -1117,10 +1373,10 @@ mod tests {
     fn no_more_requests_are_outstanding_than_the_limit_allows() {
         // Each outstanding request is a promise to hold a reply in memory.
         let (mut m, _) = syncing(Height(1), 32, 10_000);
-        let first = requested(&m.on_tick());
+        let first = requested(&m.on_tick(TICK));
         assert_eq!(first.len(), MAX_BLOCKS_IN_FLIGHT);
         // And a second tick, with nothing answered, adds none.
-        assert!(requested(&m.on_tick()).is_empty());
+        assert!(requested(&m.on_tick(TICK)).is_empty());
     }
 
     #[test]
@@ -1137,7 +1393,7 @@ mod tests {
         drop(m.on_message(low.id, PeerMessage::Status(Height(1))));
         drop(m.on_message(high.id, PeerMessage::Status(Height(50))));
 
-        let asked = requested(&m.on_tick());
+        let asked = requested(&m.on_tick(TICK));
         for (peer, height) in &asked {
             if *peer == low.id {
                 assert_eq!(height.0, 1, "the shallow peer is only asked what it has");
@@ -1165,7 +1421,7 @@ mod tests {
         // Asked for height 1, sent height 2. Accepting it would let a peer choose
         // which heights this node holds in memory rather than this node choosing.
         let (mut m, addrs) = syncing(Height(1), 1, 10);
-        m.on_tick();
+        m.on_tick(TICK);
         let out = m.on_message(
             addrs[0].id,
             PeerMessage::Block(Box::new(sync_block(2, [7; 32]))),
@@ -1180,7 +1436,7 @@ mod tests {
         // network delivers them — and a block cannot be applied before its
         // parent. This is the buffer that makes the difference survivable.
         let (mut m, _addrs) = syncing(Height(1), 3, 10);
-        let asked = requested(&m.on_tick());
+        let asked = requested(&m.on_tick(TICK));
         assert_eq!(asked.len(), 3);
 
         // The middle one comes back first: nothing may be applied.
@@ -1242,7 +1498,7 @@ mod tests {
         // A gap at the bottom must not turn into blocks arriving that have to be
         // thrown away.
         let (mut m, _) = syncing(Height(1), 32, 1_000_000);
-        for (_, height) in requested(&m.on_tick()) {
+        for (_, height) in requested(&m.on_tick(TICK)) {
             assert!(height.0 <= 1 + MAX_STAGED_BLOCKS as u64);
         }
     }
@@ -1253,9 +1509,9 @@ mod tests {
         // request is abandoned rather than punished, and the height goes to
         // somebody who will answer it.
         let (mut m, addrs) = syncing(Height(1), 1, 10);
-        let first = requested(&m.on_tick());
+        let first = requested(&m.on_tick(TICK));
         assert_eq!(first.len(), 1);
-        let asked_again = (0..=REQUEST_TIMEOUT_TICKS).any(|_| requested(&m.on_tick()) == first);
+        let asked_again = (0..=REQUEST_TIMEOUT_TICKS).any(|_| requested(&m.on_tick(TICK)) == first);
         assert!(asked_again, "the same height, asked again");
         assert!(!m.is_banned(&addrs[0].id), "being slow is not misbehaviour");
     }
@@ -1266,11 +1522,11 @@ mod tests {
         // tell them apart wastes a request window on every pruned peer it meets,
         // every tick, for as long as they stay connected.
         let (mut m, addrs) = syncing(Height(1), 1, 10);
-        let asked = requested(&m.on_tick());
+        let asked = requested(&m.on_tick(TICK));
         assert_eq!(asked.len(), 1);
         drop(m.on_message(addrs[0].id, PeerMessage::NoBlock(Height(1))));
         assert!(
-            requested(&m.on_tick()).is_empty(),
+            requested(&m.on_tick(TICK)).is_empty(),
             "it said it does not have this, so it is not asked again"
         );
     }
@@ -1281,7 +1537,7 @@ mod tests {
         // what makes that safe: the transport reports the node's real height back,
         // and the height that failed is requested afresh rather than skipped.
         let (mut m, addrs) = syncing(Height(1), 1, 10);
-        m.on_tick();
+        m.on_tick(TICK);
         let out = m.on_message(
             addrs[0].id,
             PeerMessage::Block(Box::new(sync_block(1, [1; 32]))),
@@ -1295,7 +1551,7 @@ mod tests {
 
         // It did not apply. The node is still at height 1.
         m.set_height(Height(1));
-        assert_eq!(requested(&m.on_tick()), vec![(addrs[0].id, Height(1))]);
+        assert_eq!(requested(&m.on_tick(TICK)), vec![(addrs[0].id, Height(1))]);
     }
 
     #[test]
@@ -1318,7 +1574,7 @@ mod tests {
         // tick, for as long as they stay connected.
         let (mut m, _) = syncing(Height(42), 1, 41);
         assert!(
-            m.on_tick()
+            m.on_tick(TICK)
                 .contains(&Directive::Broadcast(Box::new(PeerMessage::Status(
                     Height(41)
                 ))))

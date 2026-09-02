@@ -68,7 +68,7 @@ the root matches. A node that cannot verify a height stays at the height before
 it, which is recoverable; a node that half-applied a block it then rejected is in
 a state no other node shares, which is not.
 
-### 2. One block per frame, because the constants say so
+### 2. One block per frame, and a reader that allocates what arrives
 
 `MAX_BLOCK_BYTES` bounds a block's transactions and `MAX_FRAME_LEN` bounds a
 frame. Batching several blocks into one response was never available: one
@@ -87,8 +87,23 @@ limit could therefore be built and voted on but never *sent* — every wrapper a
 block travels in, a proposal included, is strictly larger than the block, so
 `write_frame` would have refused it. A proposer could have produced a legal block
 that no peer could receive. `MAX_FRAME_LEN` is now derived from `MAX_BLOCK_BYTES`
-plus a stated headroom: two numbers that must not drift apart should not be two
-numbers.
+plus a stated headroom, with a `const` assertion: two numbers that must not drift
+apart should not be two numbers.
+
+**And the bound itself was the smaller half of the problem.** A reader that
+allocates the length a stranger *announced* hands out five mebibytes for a
+four-byte header — announce the maximum, send nothing, and a node with forty
+inbound slots is holding two hundred mebibytes it will never receive. Frames are
+now filled in `READ_CHUNK` steps as bytes actually arrive, so the memory an
+attacker can take is bounded by the bandwidth they spend taking it.
+
+CometBFT reaches the same place from the other end and more thoroughly:
+`MaxPacketMsgPayloadSize` means a peer never announces more than one small packet,
+and a block is a `PartSet` of 64 KiB parts rather than one message, so the largest
+thing a peer can ask a node to hold is a constant. Adopting that here means
+splitting proposals and sync responses into parts with their own Merkle root —
+the right long-term shape, and a change to the consensus wire format. This is the
+bound that does not need one.
 
 ### 3. The sync policy is pure, and the store is a trait
 
@@ -313,3 +328,15 @@ against the real binary rather than a test harness:
 - [Bitcoin Core headers-first sync](https://developer.bitcoin.org/devguide/p2p_network.html#headers-first)
   — the argument for validating a chain of headers before spending bandwidth on
   bodies, which a BFT chain with commit certificates gets differently
+- [CometBFT `signAddVote`](https://github.com/cometbft/cometbft/blob/main/internal/consensus/state.go)
+  — a validator's own vote goes onto its internal queue and through the same
+  `addVote` path as a peer's, which is why gossip is downstream of consensus
+  state and never the mechanism by which it changes
+- [CometBFT MConnection](https://docs.cometbft.com/v0.38/spec/p2p/legacy-docs/connection)
+  — `SendRate`/`RecvRate` in bytes per second against a real clock, and
+  `MaxPacketMsgPayloadSize`, which together mean no peer can announce more than a
+  small constant
+- [Tendermint `PartSet`](https://github.com/tendermint/tendermint/blob/master/types/part_set.go)
+  and `BlockPartSizeBytes = 65536` — validators agree on a `BlockID` and gossip
+  the block as Merkle-ized 64 KiB parts, so a whole block never has to fit in one
+  message. The structural answer to §2, deferred
