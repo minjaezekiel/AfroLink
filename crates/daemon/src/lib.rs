@@ -22,6 +22,7 @@
 pub mod anchors;
 pub mod chain;
 pub mod config;
+pub mod driver;
 pub mod identity;
 pub mod init;
 pub mod run;

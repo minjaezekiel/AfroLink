@@ -42,6 +42,13 @@ redb = "4.2"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+# A `Result` that nobody looks at is a failure that nobody handled. This is a
+# deny rather than the default warn because of a specific defect: the cluster
+# harness held the flag that says "this node cannot write its own chain" and
+# never read it, so a failed store write was silent and surfaced much later as
+# an unexplained sync stall. `Driver::step` now returns that condition, and this
+# is what makes returning it mean something.
+unused_must_use = "deny"
 
 [workspace.lints.clippy]
 # Consensus-critical code must never panic on untrusted input.

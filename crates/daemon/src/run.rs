@@ -34,24 +34,23 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use afrolink_consensus::Step;
 use afrolink_crypto::hash::{Domain, hash};
 use afrolink_executor::GenesisLimits;
 use afrolink_http::{Config as HttpConfig, Server};
 use afrolink_node::SignRecord;
-use afrolink_node::{Action, Node, SharedNode};
+use afrolink_node::{Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::PeerId;
 use afrolink_p2p::transport::Transport;
 use afrolink_primitives::codec::{Encode, decode_exact};
-use afrolink_primitives::{Height, Timestamp};
 use afrolink_store::ChainStore;
 
 use crate::chain::{Blocks, LiveChain, Persist};
 use crate::config::Config;
+use crate::driver::{Beat, Driver, StopWatchdog, Timings};
 use crate::identity;
 
 /// Why the daemon could not start, or had to stop.
@@ -96,19 +95,16 @@ pub enum RunError {
     Halted(String),
 }
 
+impl From<crate::driver::Halted> for RunError {
+    fn from(halted: crate::driver::Halted) -> Self {
+        Self::Halted(halted.0)
+    }
+}
+
 impl From<afrolink_store::StoreError> for RunError {
     fn from(e: afrolink_store::StoreError) -> Self {
         Self::Store(e.to_string())
     }
-}
-
-/// Wall-clock time, as the chain measures it.
-fn now() -> Timestamp {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    Timestamp::from_millis(millis)
 }
 
 /// Take the genesis from the data directory into the store, once and only once.
@@ -152,15 +148,6 @@ fn adopt_genesis(
         }
         (None, None) => Err(RunError::NoGenesis(config.data_dir.display().to_string())),
     }
-}
-
-/// How many rounds may be begun back to back before the loop takes a breath.
-const MAX_ROUND_RESTARTS: usize = 8;
-
-/// A timer the consensus driver asked for.
-struct Deadline {
-    step: Step,
-    at: Instant,
 }
 
 /// Run a node until it is asked to stop.
@@ -310,6 +297,11 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
     let outcome = drive(config, &transport, &shared, stop, &halted);
 
     log("stopping");
+    // Bounded from here on. `docker stop` allows ten seconds, Kubernetes thirty
+    // and systemd ninety, and each then sends SIGKILL; a stop that outlives the
+    // shortest of those has lost the work it was trying to finish anyway. An exit
+    // we choose can say why in the log, and a SIGKILL cannot.
+    let _watchdog = StopWatchdog::start();
     // Before the transport is torn down, while there is still a peer set to read.
     let anchors = transport.anchors();
     if let Err(e) = crate::anchors::put(&config.anchors_path(), &anchors) {
@@ -327,7 +319,11 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
     outcome
 }
 
-/// The consensus loop: the only place in the workspace that reads a clock.
+/// The consensus loop.
+///
+/// Thin on purpose. Everything it used to do lives in [`crate::driver::Driver`],
+/// which the cluster harness drives too — see that module for why a second
+/// hand-written copy of this loop was a liability rather than a convenience.
 fn drive(
     config: &Config,
     transport: &Transport,
@@ -335,163 +331,20 @@ fn drive(
     stop: &Arc<AtomicBool>,
     halted: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), RunError> {
-    // How often the loop wakes. Short, because a consensus timeout should fire
-    // close to when it was due rather than up to a whole peer-tick late.
-    let poll = Duration::from_millis(20);
-    // How often peer housekeeping runs. This no longer affects what any rate
-    // limit *means* — those are denominated per second and measured against the
-    // real elapsed time, precisely because tying them to this number once turned
-    // a limit of 512 messages into ten thousand a second when the poll period
-    // changed for unrelated reasons. What it still governs is how promptly this
-    // node announces its height and asks for addresses, and how quickly a stalled
-    // block request is handed to somebody else.
-    let peer_tick = Duration::from_millis(500);
-    let interval = Duration::from_millis(config.block_interval_ms);
-    let mut deadline: Option<Deadline> = None;
-    let mut height = current_height(shared);
-    let mut next_round_at = Instant::now();
-    let mut started = false;
-    let mut first_pass = true;
-    let mut dial_at = Instant::now();
-    let mut peer_tick_at = Instant::now();
-
+    let mut driver = Driver::new(
+        Timings::from_config(config),
+        Arc::clone(halted),
+        Instant::now(),
+    );
     while !stop.load(Ordering::SeqCst) {
-        if let Ok(reason) = halted.lock()
-            && let Some(why) = reason.clone()
-        {
-            // A node that cannot write its own chain stops. Carrying on would mean
-            // voting on a history only this process can see.
-            return Err(RunError::Halted(why));
+        // The `?` is the point: a node that cannot write its own chain stops
+        // here, and the type system is what makes that unmissable.
+        if let Beat::Committed(height) = driver.step(Instant::now(), transport, shared, true)? {
+            log(&format!("height {}", height.0));
         }
-
-        // Peer housekeeping: budgets, address exchange, status, and the block
-        // requests that catch this node up.
-        if Instant::now() >= peer_tick_at {
-            transport.tick();
-            peer_tick_at = Instant::now()
-                .checked_add(peer_tick)
-                .unwrap_or_else(Instant::now);
-        }
-        if Instant::now() >= dial_at {
-            // Not every tick: a dial is a TCP connection and a handshake, and
-            // retrying a dead seed twenty times a second is a way to look like an
-            // attacker to it.
-            transport.dial_out();
-            dial_at = Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .unwrap_or_else(Instant::now);
-        }
-
-        let at = current_height(shared);
-        if at != height || !started {
-            // A height was decided — here or by catching up — so the round state
-            // has been reset and the next round has to be opened.
-            height = at;
-            started = true;
-            deadline = None;
-            next_round_at = Instant::now()
-                .checked_add(interval)
-                .unwrap_or_else(Instant::now);
-            if first_pass {
-                // The startup line already said where this node is; saying it
-                // again as though a block had just committed is a log that lies
-                // about what happened.
-                first_pass = false;
-            } else {
-                log(&format!("height {}", at.0.saturating_sub(1)));
-            }
-        }
-
-        if Instant::now() >= next_round_at && deadline.is_none() {
-            if transport.is_behind() {
-                // Catching up rather than proposing. A block built on stale state
-                // is one everybody who is not behind votes down, which costs a
-                // round and, on a small validator set, stalls the chain while it
-                // happens.
-                next_round_at = Instant::now()
-                    .checked_add(interval)
-                    .unwrap_or_else(Instant::now);
-            } else {
-                // Through the transport, not straight at the node. A round that
-                // commits has to reach the store, and the transport is the one
-                // place that knows how — a driver holding the node itself would
-                // produce blocks that exist only in memory.
-                deadline = begin_round(config, transport, deadline);
-            }
-        }
-
-        if let Some(due) = &deadline
-            && Instant::now() >= due.at
-        {
-            let step = due.step;
-            deadline = None;
-            let actions = transport.timeout(step);
-            deadline = schedule(config, &actions, deadline);
-            // A step that ended the round asks for the next one to be *begun*.
-            // Waiting instead is how a chain advances rounds forever without
-            // committing, once a single proposer is unreachable.
-            if wants_new_round(&actions) {
-                deadline = begin_round(config, transport, deadline);
-            }
-        }
-
-        std::thread::sleep(poll);
+        std::thread::sleep(driver.poll());
     }
     Ok(())
-}
-
-/// Begin rounds until one of them settles into waiting.
-///
-/// A round that fails to commit asks to be begun again immediately, and the loop
-/// obliges rather than sleeping through it — but a bounded number of times, so a
-/// state machine that asked forever would peg a core rather than being obeyed
-/// forever.
-fn begin_round(
-    config: &Config,
-    transport: &Transport,
-    mut deadline: Option<Deadline>,
-) -> Option<Deadline> {
-    for _ in 0..MAX_ROUND_RESTARTS {
-        let actions = transport.start_round(now());
-        deadline = schedule(config, &actions, deadline);
-        if !wants_new_round(&actions) {
-            break;
-        }
-    }
-    deadline
-}
-
-fn wants_new_round(actions: &[Action]) -> bool {
-    actions.iter().any(|a| matches!(a, Action::StartRound(_)))
-}
-
-/// Turn a `ScheduleTimeout` action into a real deadline.
-///
-/// Only the first is kept: the driver asks for one timer at a time, and a second
-/// would fire a step the round has already left.
-fn schedule(config: &Config, actions: &[Action], current: Option<Deadline>) -> Option<Deadline> {
-    for action in actions {
-        if let Action::ScheduleTimeout(step, round) = action {
-            let base = match step {
-                Step::Propose => config.timeout_propose_ms,
-                Step::Prevote => config.timeout_prevote_ms,
-                Step::Precommit => config.timeout_precommit_ms,
-            };
-            // Growing with the round, as Tendermint does. A network that is
-            // failing to agree because it is slow gets more time on each attempt;
-            // one that keeps the same deadline every round never recovers from
-            // being merely slow.
-            let grown = base.saturating_mul(u64::from(round.0).saturating_add(1));
-            return Instant::now()
-                .checked_add(Duration::from_millis(grown))
-                .map(|at| Deadline { step: *step, at });
-        }
-    }
-    current
-}
-
-fn current_height(shared: &Arc<SharedNode>) -> Height {
-    shared.lock().map_or(Height(0), |node| node.height())
 }
 
 /// One line to standard error, with a timestamp.

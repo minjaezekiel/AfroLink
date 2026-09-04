@@ -38,12 +38,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use afrolink_consensus::{CountryCode, Step, Validator, ValidatorSet};
+use afrolink_consensus::{CountryCode, Validator, ValidatorSet};
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
 use afrolink_daemon::chain::{Blocks, Persist};
+use afrolink_daemon::driver::{Driver, Timings};
 use afrolink_executor::{Allocation, Genesis, GenesisLimits};
-use afrolink_node::{Action, Node, SharedNode};
+use afrolink_node::{Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
@@ -177,14 +178,15 @@ struct ClusterNode {
     )]
     published: Arc<Mutex<MemoryStore>>,
     dir: TempDir,
-    /// The per-node consensus timer, as `run::drive` keeps it.
-    deadline: Option<(Step, Instant)>,
-    next_round_at: Instant,
-    peer_tick_at: Instant,
-    dial_at: Instant,
-    height: Height,
-    /// Set by [`Persist`] when a write to this node's store failed.
-    halted: Arc<Mutex<Option<String>>>,
+    /// **The daemon's own loop**, not a copy of it.
+    ///
+    /// This harness used to reimplement `run::drive` — the timers, the round
+    /// bookkeeping, `begin_round`, `schedule`. The two drifted, and the drift
+    /// presented as defects in the network rather than in the harness: the copy
+    /// never re-dialled, so a peer lost under load was gone for the run, and it
+    /// dropped the `halted` flag, so a failed store write was silent. Both are
+    /// gone by construction now: there is one loop, and this runs it.
+    driver: Driver,
 }
 
 impl ClusterNode {
@@ -238,17 +240,24 @@ impl ClusterNode {
         let now = Instant::now();
         Self {
             seed,
-            height: shared.lock().map(|n| n.height()).unwrap_or(Height(1)),
             shared,
             transport,
             store,
             published,
             dir,
-            deadline: None,
-            next_round_at: now,
-            peer_tick_at: now,
-            dial_at: now + DIAL_INTERVAL,
-            halted,
+            driver: Driver::new(
+                Timings {
+                    poll: POLL,
+                    peer_tick: PEER_TICK,
+                    dial: DIAL_INTERVAL,
+                    block_interval: BLOCK_INTERVAL,
+                    timeout_propose: TIMEOUT_PROPOSE,
+                    timeout_prevote: TIMEOUT_STEP,
+                    timeout_precommit: TIMEOUT_STEP,
+                },
+                halted,
+                now,
+            ),
         }
     }
 
@@ -282,91 +291,19 @@ impl ClusterNode {
     /// One iteration of the daemon's loop, for this node.
     ///
     /// `dial` is false only while a test is holding a deliberate partition open.
-    /// A real partition stops a node reconnecting as well as stopping its traffic,
-    /// so a harness that kept re-dialling through one would be modelling a
-    /// network condition that cannot happen.
+    ///
+    /// A halt is a panic here, and deliberately: `run::drive` returns it and the
+    /// node stops, so a harness that shrugged at it would be testing a node the
+    /// daemon would never have kept running.
     fn step(&mut self, dial: bool) {
-        let now = Instant::now();
-        if now >= self.peer_tick_at {
-            self.transport.tick();
-            self.peer_tick_at = now + PEER_TICK;
-        }
-        if dial && now >= self.dial_at {
-            // What `run::drive` does on its own timer: a node that lost a peer
-            // gets it back rather than being one short until the process ends.
-            self.transport.dial_out();
-            self.dial_at = now + DIAL_INTERVAL;
-        }
-
-        let at = self.height();
-        if at != self.height {
-            self.height = at;
-            self.deadline = None;
-            self.next_round_at = now + BLOCK_INTERVAL;
-        }
-
-        if now >= self.next_round_at && self.deadline.is_none() {
-            if self.transport.is_behind() {
-                // Catching up rather than proposing, exactly as the daemon does.
-                self.next_round_at = now + BLOCK_INTERVAL;
-            } else {
-                self.deadline = self.begin_round();
-                if self.deadline.is_none() {
-                    self.next_round_at = now + BLOCK_INTERVAL;
-                }
-            }
-        }
-
-        if let Some((step, at)) = self.deadline
-            && now >= at
+        match self
+            .driver
+            .step(Instant::now(), &self.transport, &self.shared, dial)
         {
-            self.deadline = None;
-            let actions = self.transport.timeout(step);
-            self.deadline = schedule(&actions);
-            if wants_new_round(&actions) {
-                self.deadline = self.begin_round();
-            }
+            Ok(_) => {}
+            Err(halted) => panic!("node {} could not write its own chain: {halted}", self.seed),
         }
     }
-
-    /// Begin rounds until one settles into waiting, exactly as the daemon does.
-    fn begin_round(&self) -> Option<(Step, Instant)> {
-        let mut deadline = None;
-        for _ in 0..8 {
-            let actions = self.transport.start_round(now_timestamp());
-            deadline = schedule(&actions).or(deadline);
-            if !wants_new_round(&actions) {
-                break;
-            }
-        }
-        deadline
-    }
-}
-
-fn wants_new_round(actions: &[Action]) -> bool {
-    actions.iter().any(|a| matches!(a, Action::StartRound(_)))
-}
-
-fn now_timestamp() -> Timestamp {
-    Timestamp::from_millis(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
-            .unwrap_or(0),
-    )
-}
-
-fn schedule(actions: &[Action]) -> Option<(Step, Instant)> {
-    actions.iter().find_map(|a| match a {
-        Action::ScheduleTimeout(step, round) => {
-            let base = match step {
-                Step::Propose => TIMEOUT_PROPOSE,
-                Step::Prevote | Step::Precommit => TIMEOUT_STEP,
-            };
-            Some((*step, Instant::now() + base * (round.0.saturating_add(1))))
-        }
-        _ => None,
-    })
 }
 
 /// A running cluster.
@@ -513,11 +450,12 @@ impl Cluster {
             }
             std::thread::sleep(Duration::from_millis(50));
             for node in &self.nodes {
-                if let Ok(reason) = node.halted.lock()
-                    && let Some(why) = reason.clone()
-                {
-                    panic!("node {} could not write its own chain: {why}", node.seed);
-                }
+                assert!(
+                    node.driver.halted().is_none(),
+                    "node {} could not write its own chain: {}",
+                    node.seed,
+                    node.driver.halted().unwrap_or_default()
+                );
             }
             let durable = self.nodes.iter().all(|n| n.stored_height() == n.tip());
             let level = self

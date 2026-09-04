@@ -559,6 +559,127 @@ node that would not settle. `quiesce` now fails on it by name.
 The general point is the one §15 was written for. A harness earns trust by being
 **exactly** as capable as the thing it stands in for — no more, and no less.
 
+# 16. The class itself: correct code that nothing reaches
+
+Seven times now, this workspace has held code that was written, reviewed and
+tested, and that no caller ever executed: the address book that recorded
+undialable peers, the frame limit that made a legal block unsendable, the node
+that did not count its own vote, the persistence orphaned by moving that vote,
+the equivocation evidence that was built and dropped, the signal handler that
+took the wrong signal — and, in the harness itself, a dropped halt flag and a
+missing re-dial. Every one was found by **running the artefact**, never by
+adding another test of the kind that already existed.
+
+Fixing them one at a time is not a strategy. This is the pass that goes after
+the class, and the three defects that prompted it are the worked examples.
+
+## The research
+
+**Signals.** `ctrlc` handles `SIGINT` only unless the `termination` feature is
+on, which adds `SIGTERM` and `SIGHUP`; `signal-hook` is the crate to reach for
+when a daemon needs per-signal semantics. The contract the platforms hold us to
+is explicit and has numbers in it: `docker stop` waits **10s**, Kubernetes waits
+`terminationGracePeriodSeconds` (**30s** by default), `systemd` waits
+`TimeoutStopSec` (**90s** by default) — then each sends `SIGKILL`.
+
+**Harness fidelity.** The state of the art is deterministic simulation testing:
+FoundationDB, and TigerBeetle after it, make every nondeterministic input
+*pluggable* so the simulator drives the real code rather than a model of it.
+Antithesis takes the other route — a deterministic hypervisor around unmodified
+binaries — precisely because retrofitting the first approach is usually
+impractical. CometBFT sits between: `test/e2e` runs the **real node binaries**
+under Docker Compose from a testnet manifest.
+
+The general failure mode has a name outside distributed systems too: a test
+double that duplicates contract details with no guarantee of fidelity to the
+real implementation. Google's testing book and the contract-testing literature
+both land in the same place — a double earns trust only from a mechanism that
+keeps it aligned, never from having been correct when it was written.
+
+## What we do, and why not the alternatives
+
+**Not madsim or turmoil.** They are the obvious Rust answer and they do not fit:
+both are built on `async` and Tokio, and this workspace has neither by
+[ADR-0001](adr/0001-sovereign-rust-l1.md). The seam they need also has to reach
+below the crate — a library that calls `Instant::now` out of band breaks
+determinism regardless — which is why the serious versions end up overriding
+libc symbols. We already have the FoundationDB property where it counts, and got
+it by design rather than by tooling: `Node` takes time as `Event::Timeout` and
+`Manager` takes it as `on_tick(elapsed)`.
+
+**Not a Docker e2e rig.** CometBFT's is the right shape at CometBFT's scale. Ours
+would add a container toolchain to a workspace whose whole dependency argument is
+that a payments daemon's supply chain is an attack surface.
+
+So: **apply the seam we already believe in one layer higher, and put the entry
+point under test.**
+
+### 16.1 One loop, not two
+
+`run::drive` was the loop and `crates/daemon/tests/cluster.rs` had a hand-written
+copy of it — the timers, the round bookkeeping, `begin_round`, `schedule`,
+`wants_new_round`. Two copies of a loop are two loops, and they drifted: the copy
+never re-dialled where the daemon does every five seconds, so a peer lost under
+load was gone for the run, and the symptom surfaced far away as an intermittent
+sync stall that read as a defect in block sync.
+
+That is the exact inverse of the §15 hazard. A simulator *more* capable than
+production hides bugs; a harness *less* capable than production invents them.
+
+`crates/daemon/src/driver.rs` is now the only copy. The clock arrives as
+`Driver::step(now, …)` and the periods arrive as `Timings`, so the daemon and the
+harness run **the same code** at different speeds — the same treatment `Node` and
+`Manager` already had, applied to the layer above them. 102 lines of duplicated
+loop deleted.
+
+### 16.2 A halt is in the return type, and `unused_must_use` is denied
+
+`Persist` sets a flag when a write fails and `run::drive` treats it as fatal. The
+harness held the same flag and dropped it, so a failed write there was silent.
+
+A convention both callers must remember is a convention one of them will forget.
+`Driver::step` now returns `Result<Beat, Halted>`, and `unused_must_use = "deny"`
+is set for the workspace — so a caller that drives a node without confronting the
+one condition that means it must stop **does not compile**. Verified by writing
+that caller and watching the build fail.
+
+### 16.3 The entry point is under test
+
+`crates/daemon/tests/shutdown.rs` spawns the **real binary**, lets it commit
+blocks, signals it the way a service manager would, and asserts on what an
+operator would see: exit status, the clean-stop log lines, a bounded stop time,
+and — because asserting the words alone would pass against a shutdown that
+printed them and flushed nothing — that a restart resumes from the state tree
+rather than replaying genesis.
+
+This is the cheap version of CometBFT's `test/e2e`, and it is the generalisation
+of all seven defects: **the entry point is tested, not only the library behind
+it.** Two of its four tests fail against the original `SIGINT`-only handler,
+verified by reverting the feature flag.
+
+### 16.4 Stopping is bounded
+
+`StopWatchdog` bounds the stop sequence at 8s — inside `docker stop`'s ten, the
+tightest of the three contracts. A shutdown slower than that has lost the work it
+was trying to finish anyway, and an exit we choose can say why in the log where a
+`SIGKILL` cannot.
+
+Its firing path ends in `process::exit`, so it cannot be exercised in-process.
+The *other* direction is covered and it is the dangerous one: a watchdog that
+fired on a healthy shutdown would kill good nodes.
+
+## What is honestly not verified
+
+The re-dial fix is **not** covered by a deterministic test. Removing it again
+leaves the cluster suite green in isolation, because the failure it prevents only
+appears under CPU contention. The evidence for it is empirical and reproducible
+rather than assertional: under full-workspace parallelism the cluster suite went
+from 67s and failing to 23s and passing, and the same failure reproduced
+identically on the tree before any of this work. Recorded as such rather than
+claimed as tested.
+
+---
+
 # Order of work
 
 | # | Item | Why here | Size | State |
@@ -576,6 +697,7 @@ The general point is the one §15 was written for. A harness earns trust by bein
 | 12 | Metrics endpoint | Needed to operate anything real | S | open |
 | 10 | State sync | Large; needs P0/P1 stable first | L | open |
 | 11 | Validator set rotation | Largest; a mistake here is a chain split | L | open |
+| 16 | The defect class itself | Seven instances; one loop, a halt in the type, the entry point under test | M | **done** |
 
 ---
 
