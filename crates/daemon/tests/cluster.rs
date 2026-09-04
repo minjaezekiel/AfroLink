@@ -76,6 +76,15 @@ const TIMEOUT_PROPOSE: Duration = Duration::from_millis(600);
 const TIMEOUT_STEP: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(5);
 const PEER_TICK: Duration = Duration::from_millis(60);
+/// How often a node re-dials from its address book.
+///
+/// `run::drive` does this every five seconds and this harness did not do it at
+/// all, which is a harness *less* capable than the thing it is testing — and that
+/// produces false failures rather than hiding real ones. A peer dropped for any
+/// reason (a full outbox under load, a read timeout) was gone for good here,
+/// while the real daemon would have reconnected within five seconds. Scaled to
+/// this harness's compressed clock.
+const DIAL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long to let a stopped cluster's threads wind down.
 ///
 /// Longer than [`afrolink_p2p::transport::READ_TIMEOUT`], because that is when a
@@ -172,7 +181,10 @@ struct ClusterNode {
     deadline: Option<(Step, Instant)>,
     next_round_at: Instant,
     peer_tick_at: Instant,
+    dial_at: Instant,
     height: Height,
+    /// Set by [`Persist`] when a write to this node's store failed.
+    halted: Arc<Mutex<Option<String>>>,
 }
 
 impl ClusterNode {
@@ -191,11 +203,17 @@ impl ClusterNode {
         );
         let shared = Arc::new(SharedNode::new(node));
         let published = Arc::new(Mutex::new(state));
+        // Kept, not dropped. `run::drive` treats this as fatal — a node that
+        // cannot write its own chain stops rather than voting on a history only
+        // it can see. Throwing it away here made the harness *less* capable than
+        // the daemon: a failed store write left a node running with a store one
+        // block behind, silently, and surfaced later as an unexplained sync
+        // stall rather than as the write failure it was.
         let halted = Arc::new(Mutex::new(None));
         let sink = Arc::new(Persist::new(
             Arc::clone(&store),
             Arc::clone(&published),
-            halted,
+            Arc::clone(&halted),
         ));
 
         // A distinct network key per node, and never the consensus key: a node
@@ -229,6 +247,8 @@ impl ClusterNode {
             deadline: None,
             next_round_at: now,
             peer_tick_at: now,
+            dial_at: now + DIAL_INTERVAL,
+            halted,
         }
     }
 
@@ -260,11 +280,22 @@ impl ClusterNode {
     }
 
     /// One iteration of the daemon's loop, for this node.
-    fn step(&mut self) {
+    ///
+    /// `dial` is false only while a test is holding a deliberate partition open.
+    /// A real partition stops a node reconnecting as well as stopping its traffic,
+    /// so a harness that kept re-dialling through one would be modelling a
+    /// network condition that cannot happen.
+    fn step(&mut self, dial: bool) {
         let now = Instant::now();
         if now >= self.peer_tick_at {
             self.transport.tick();
             self.peer_tick_at = now + PEER_TICK;
+        }
+        if dial && now >= self.dial_at {
+            // What `run::drive` does on its own timer: a node that lost a peer
+            // gets it back rather than being one short until the process ends.
+            self.transport.dial_out();
+            self.dial_at = now + DIAL_INTERVAL;
         }
 
         let at = self.height();
@@ -341,6 +372,11 @@ fn schedule(actions: &[Action]) -> Option<(Step, Instant)> {
 /// A running cluster.
 struct Cluster {
     nodes: Vec<ClusterNode>,
+    /// Whether nodes reconnect on their own, as they do in `run::drive`.
+    ///
+    /// Cleared only by [`Cluster::partition`], because a partition that peers
+    /// could dial straight through is not a partition.
+    autodial: bool,
 }
 
 impl Drop for Cluster {
@@ -358,7 +394,10 @@ impl Cluster {
         let nodes: Vec<ClusterNode> = (1..=n)
             .map(|seed| ClusterNode::start(seed, n, TempDir::new(&format!("{label}-{seed}"))))
             .collect();
-        let mut cluster = Self { nodes };
+        let mut cluster = Self {
+            nodes,
+            autodial: true,
+        };
         cluster.connect_all();
         cluster
     }
@@ -387,6 +426,25 @@ impl Cluster {
         );
     }
 
+    /// Cut one node off, and hold it off.
+    ///
+    /// Both halves matter. Dropping its connections is what a partition looks
+    /// like from inside a node; suspending automatic re-dialling is what makes it
+    /// *stay* a partition, since every other node holds this one in its address
+    /// book and would otherwise reconnect within a quarter of a second.
+    fn partition(&mut self, index: usize) {
+        self.autodial = false;
+        if let Some(node) = self.nodes.get(index) {
+            node.transport.disconnect_all();
+        }
+    }
+
+    /// Put the network back.
+    fn heal(&mut self) {
+        self.autodial = true;
+        self.connect_all();
+    }
+
     /// Drive every node until `done`, or give up.
     fn wait_until(&mut self, patience: Duration, done: impl Fn(&Self) -> bool) -> bool {
         let start = Instant::now();
@@ -394,8 +452,9 @@ impl Cluster {
             if done(self) {
                 return true;
             }
+            let dial = self.autodial;
             for node in &mut self.nodes {
-                node.step();
+                node.step(dial);
             }
             std::thread::sleep(POLL);
         }
@@ -442,10 +501,24 @@ impl Cluster {
             // Peer housekeeping continues: a node that is still catching up needs
             // its block requests to go out. What stops is *beginning rounds*, so
             // the chain stops growing while everything already in motion lands.
+            let dial = self.autodial;
             for node in &mut self.nodes {
                 node.transport.tick();
+                if dial {
+                    // A node that is still catching up needs its peers as much as
+                    // its ticks: without this, one connection lost under load
+                    // leaves it short of the tip for the rest of the run.
+                    node.transport.dial_out();
+                }
             }
             std::thread::sleep(Duration::from_millis(50));
+            for node in &self.nodes {
+                if let Ok(reason) = node.halted.lock()
+                    && let Some(why) = reason.clone()
+                {
+                    panic!("node {} could not write its own chain: {why}", node.seed);
+                }
+            }
             let durable = self.nodes.iter().all(|n| n.stored_height() == n.tip());
             let level = self
                 .nodes
@@ -453,6 +526,26 @@ impl Cluster {
                 .is_some_and(|first| self.nodes.iter().all(|n| n.tip() == first.tip()));
             if durable && level {
                 return;
+            }
+            // `CLUSTER_DEBUG=1` prints the time series rather than only the
+            // final state. Kept because the difference between "a node is slow"
+            // and "a node is stuck" is only visible across samples, and both
+            // present here as the same timeout.
+            if std::env::var("CLUSTER_DEBUG").is_ok() {
+                eprintln!(
+                    "quiesce: {:?}",
+                    self.nodes
+                        .iter()
+                        .map(|n| (
+                            n.seed,
+                            n.tip().0,
+                            n.stored_height().0,
+                            n.transport.peers().len(),
+                            n.transport.is_behind(),
+                            n.transport.synced(),
+                        ))
+                        .collect::<Vec<_>>()
+                );
             }
             assert!(
                 Instant::now() < deadline,
@@ -619,7 +712,7 @@ fn a_partitioned_node_falls_behind_and_catches_up_when_healed() {
     // Cut node 3 off. The remaining three are still more than two thirds of four,
     // so the chain must keep committing without it.
     let isolated = 3;
-    cluster.nodes[isolated].transport.disconnect_all();
+    cluster.partition(isolated);
     let left_at = cluster.nodes[isolated].tip();
 
     let others_advanced = cluster.wait_until(Duration::from_secs(30), |c| {
@@ -639,7 +732,7 @@ fn a_partitioned_node_falls_behind_and_catches_up_when_healed() {
     );
 
     // Heal. It has to catch up through block sync, verifying every certificate.
-    cluster.connect_all();
+    cluster.heal();
     assert!(
         cluster.wait_until(Duration::from_secs(30), |c| {
             let tip = c.nodes[0].tip();

@@ -30,7 +30,7 @@ afrolink-http.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
-ctrlc = "3.5"
+ctrlc = { version = "3.5", features = ["termination"] }
 
 [dev-dependencies]
 afrolink-types.workspace = true

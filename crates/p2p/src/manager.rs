@@ -24,13 +24,25 @@
 //! by a clock this module reads. So the policy still has no clock in it, and the
 //! limit means the same thing however often the caller ticks.
 //!
-//! # And the rule that keeps the network from being captured
+//! # And the rules that keep the network from being captured
 //!
 //! **No two outbound connections into the same [`AddrGroup`].** The address book
 //! makes an eclipse expensive to *set up*; this makes it expensive to *use*,
 //! because owning a subnet buys exactly one of a node's outbound slots. Inbound
 //! connections are capped but not group-restricted, because refusing inbound by
 //! group is itself a way for an attacker to deny honest peers a seat.
+//!
+//! **A full inbound set evicts rather than refuses.** The cap alone was the same
+//! denial with extra steps: an attacker who opens forty cheap connections holds
+//! every slot until they choose to leave, and every honest peer is answered
+//! `NoRoom`. Bitcoin's `AttemptToEvictConnection` accepts the newcomer and
+//! removes somebody, choosing the victim so that an attacker cannot occupy the
+//! protected set — *favour the diversity of peer connections*. The shape of that
+//! is in [`Manager::eviction_candidate`], and it protects exactly one peer per
+//! group, so a subnet buys one inbound seat as well as one outbound one.
+//!
+//! **A ban expires.** [`BAN_DURATION`] of accumulated tick time, and deliberately
+//! not persisted — see [`Manager::penalise`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -109,6 +121,23 @@ impl Default for Limits {
         }
     }
 }
+
+/// How long a ban lasts, measured in the tick time the manager is handed.
+///
+/// Bounded because the alternative is exile forever for one bad afternoon, and
+/// several of the things that earn a penalty are reachable by a peer that is
+/// merely overloaded. An hour is long enough that a flooder gains nothing by
+/// reconnecting and short enough that an honest peer is not lost to a partition.
+pub const BAN_DURATION: Duration = Duration::from_secs(3_600);
+
+/// How many outbound peers are kept as anchors across a restart.
+///
+/// Two, out of eight outbound slots, following Bitcoin PR #17428. Anchoring
+/// *every* slot would mean an attacker who captured this node once keeps it;
+/// anchoring two means an attacker who had not captured it before the restart
+/// cannot capture it during the restart, which is when a fresh draw at every
+/// slot is cheapest for them.
+pub const ANCHOR_COUNT: usize = 2;
 
 /// A token bucket, refilled by elapsed time rather than by a clock it reads.
 ///
@@ -230,6 +259,19 @@ struct Connected {
     awaiting_block: Option<Height>,
     /// Ticks since that request went out.
     request_age: u32,
+    /// The node's accumulated uptime when this connection was admitted.
+    ///
+    /// Held as a stamp rather than a duration so that "longest-connected" is a
+    /// comparison of two numbers and never a clock this module reads. A smaller
+    /// stamp is an older connection.
+    since: Duration,
+    /// Whether this peer has ever answered a block request.
+    ///
+    /// The one piece of evidence a node has that a connection is worth something,
+    /// and an attacker filling inbound slots has not produced it. Used only to
+    /// break ties in [`Manager::eviction_candidate`], never to protect outright —
+    /// serving one block is cheap enough that protection would be for sale.
+    served: bool,
 }
 
 /// A bounded set of recently seen gossip ids.
@@ -274,10 +316,22 @@ pub struct Manager {
     ours: PeerId,
     book: AddrBook,
     peers: BTreeMap<PeerId, Connected>,
-    banned: BTreeSet<PeerId>,
+    /// Banned peers, and the uptime stamp their ban expires at.
+    banned: BTreeMap<PeerId, Duration>,
+    /// Addresses to dial before consulting the book — the anchors from the last
+    /// run. Drained, never refilled from here, because an anchor that is dialled
+    /// and kept becomes an ordinary outbound peer and an anchor that fails should
+    /// not be retried forever.
+    anchors: VecDeque<PeerAddr>,
     seen: Seen,
     limits: Limits,
     cursor: u64,
+    /// Tick time accumulated since this manager was made.
+    ///
+    /// The only notion of time here, and it arrives as data. Connection age and
+    /// ban expiry are both denominated in it, so neither depends on a clock and
+    /// both mean the same thing however often the caller ticks.
+    uptime: Duration,
     /// The next height this node needs — one past its committed tip.
     height: Height,
     /// Blocks that arrived before their parent did.
@@ -297,10 +351,12 @@ impl Manager {
             ours,
             book,
             peers: BTreeMap::new(),
-            banned: BTreeSet::new(),
+            banned: BTreeMap::new(),
+            anchors: VecDeque::new(),
             seen: Seen::new(limits.seen_capacity),
             limits,
             cursor: 0,
+            uptime: Duration::ZERO,
             height: Height(0),
             staged: BTreeMap::new(),
         }
@@ -386,9 +442,46 @@ impl Manager {
     }
 
     /// Whether this peer is refused on sight.
+    ///
+    /// Bans expire, so this is a comparison rather than a membership test. The
+    /// entry is left behind until the next tick sweeps it; a ban that has run out
+    /// is not a ban, whether or not the sweep has happened yet.
     #[must_use]
     pub fn is_banned(&self, peer: &PeerId) -> bool {
-        self.banned.contains(peer)
+        self.banned
+            .get(peer)
+            .is_some_and(|until| *until > self.uptime)
+    }
+
+    /// The outbound peers worth dialling first after a restart.
+    ///
+    /// The longest-connected ones, because a connection that has survived is
+    /// evidence and a connection that was just made is not. Read at shutdown and
+    /// handed back to the next process through [`Self::seed_anchors`].
+    #[must_use]
+    pub fn anchors(&self) -> Vec<PeerAddr> {
+        let mut outbound: Vec<&Connected> = self.peers.values().filter(|p| p.outbound).collect();
+        outbound.sort_by_key(|p| (p.since, p.addr.id));
+        outbound
+            .into_iter()
+            .take(ANCHOR_COUNT)
+            .map(|p| p.addr)
+            .collect()
+    }
+
+    /// Dial these before anything the address book offers.
+    ///
+    /// The anchor half of the eclipse defence: on restart a node's book is
+    /// whatever a seed list plus hours of gossip made it, and an attacker who has
+    /// been feeding it addresses gets a fresh draw at every outbound slot at the
+    /// moment the node is most exposed. Dialling last run's peers first means at
+    /// least [`ANCHOR_COUNT`] of those slots are not on offer.
+    ///
+    /// They are dialled, not trusted: each still passes the ban check, the
+    /// self-connection check and the group-diversity rule, and each still has to
+    /// complete the handshake as the identity it claims.
+    pub fn seed_anchors(&mut self, addrs: impl IntoIterator<Item = PeerAddr>) {
+        self.anchors.extend(addrs.into_iter().take(ANCHOR_COUNT));
     }
 
     /// The groups this node already has outbound connections into.
@@ -415,39 +508,124 @@ impl Manager {
         // dial: dialling back into a subnet that already reached us spends a
         // scarce outbound slot on a peer that costs the network nothing new.
         avoid.extend(self.peers.values().map(|p| p.addr.group()));
+
+        // Anchors first, and each is *consumed* whether or not it is usable. An
+        // anchor that has become unreachable, banned or group-conflicted must not
+        // be retried on every pass — a node that kept re-offering a dead anchor
+        // would spend its dial budget on it instead of finding new peers.
+        while let Some(anchor) = self.anchors.pop_front() {
+            if anchor.id != self.ours
+                && !self.is_banned(&anchor.id)
+                && !self.peers.contains_key(&anchor.id)
+                && !avoid.contains(&anchor.group())
+            {
+                return Some(anchor);
+            }
+        }
+
         self.cursor = self.cursor.wrapping_add(1);
         let cursor = self.cursor;
-        self.book
-            .select(&avoid, cursor)
-            .filter(|candidate| !self.banned.contains(&candidate.id) && candidate.id != self.ours)
+        let candidate = self.book.select(&avoid, cursor)?;
+        (candidate.id != self.ours && !self.is_banned(&candidate.id)).then_some(candidate)
     }
 
     /// Accept a connection this node made.
     ///
     /// # Errors
     /// Returns why the connection should be dropped instead.
-    pub fn on_outbound(&mut self, addr: PeerAddr) -> Result<(), Refusal> {
+    pub fn on_outbound(&mut self, addr: PeerAddr) -> Result<Vec<Directive>, Refusal> {
         self.admit(addr, true)
     }
 
-    /// Accept a connection a peer made to this node.
+    /// Accept a connection a peer made to this node, evicting someone if full.
+    ///
+    /// Returns whatever the transport must do as a consequence — at most one
+    /// [`Directive::Disconnect`], for the peer that made room.
     ///
     /// # Errors
     /// Returns why the connection should be dropped instead.
-    pub fn on_inbound(&mut self, addr: PeerAddr) -> Result<(), Refusal> {
+    pub fn on_inbound(&mut self, addr: PeerAddr) -> Result<Vec<Directive>, Refusal> {
         self.admit(addr, false)
     }
 
-    fn admit(&mut self, addr: PeerAddr, outbound: bool) -> Result<(), Refusal> {
+    /// Which inbound peer to remove to make room, if there is a seat to take back.
+    ///
+    /// Bitcoin's `AttemptToEvictConnection`, reduced to the property that matters
+    /// on a network whose whole consensus argument is geographic spread:
+    /// *favour the diversity of peer connections.* There is no protected-set
+    /// constant here and deliberately so — a fixed number of protected slots is a
+    /// number an attacker can count, and an unbounded one (say, one peer per
+    /// group) closes a diverse node to newcomers forever.
+    ///
+    /// The rule is written in terms of the thing being defended instead:
+    ///
+    /// * **If any [`AddrGroup`] holds two or more inbound peers, evict from the
+    ///   largest one.** A subnet that has more than one seat is over-represented
+    ///   by definition, and taking the seat back costs it nothing it was entitled
+    ///   to. Applied repeatedly, this is what bounds an attacker holding one
+    ///   subnet to exactly one inbound seat, however many connections they open.
+    /// * **Otherwise every group holds exactly one peer**, the set is as diverse
+    ///   as it can be, and the newcomer is **refused**.
+    ///
+    /// That second branch is the one worth arguing about, because Bitcoin does
+    /// the opposite: it evicts something almost always, so that a new listening
+    /// node can always find a slot somewhere. Evicting here would mean a
+    /// saturated node throws out a good peer on *every* arrival — and since
+    /// `Transport::dial_out` refills its outbound slots twice a second, the peer
+    /// it threw out re-dials immediately and displaces another. The result is a
+    /// permanent rotation among honest peers on any healthy network, which costs
+    /// a handshake and a TCP connection each time on links that are metered by
+    /// the gigabyte, and destroys the very thing the rest of this function treats
+    /// as evidence: that a long-lived connection means something.
+    ///
+    /// The cost of refusing is real and is recorded rather than hidden: a network
+    /// whose nodes are all saturated stops accepting new *inbound* peers, so a
+    /// new node can dial out but is not itself reachable. The fix for that is
+    /// dial-side backoff and address advertisement (§7), not eviction — see
+    /// [10-network-hardening.md](../../../docs/10-network-hardening.md) §3.
+    ///
+    /// Within the eligible group the victim is the **youngest**, and a peer that
+    /// has served a block goes after one that has not. A connection that just
+    /// arrived has demonstrated nothing; one that answered a sync request has.
+    /// Serving is a tiebreak and never protection, because one block is cheap and
+    /// anything an attacker can buy for one block is not a defence.
+    ///
+    /// Outbound peers are never candidates: they are the eclipse-relevant
+    /// connections and *this node* chose them, so letting a stranger's arrival
+    /// displace one would hand that choice back to whoever dialled in.
+    fn eviction_candidate(&self) -> Option<PeerId> {
+        let mut population: BTreeMap<AddrGroup, usize> = BTreeMap::new();
+        for peer in self.peers.values().filter(|p| !p.outbound) {
+            let seats = population.entry(peer.addr.group()).or_insert(0usize);
+            *seats = seats.saturating_add(1);
+        }
+        let largest = *population.values().max()?;
+        if largest < 2 {
+            // Nothing is over-represented, so there is no seat to take back.
+            return None;
+        }
+
+        self.peers
+            .iter()
+            .filter(|(_, peer)| !peer.outbound)
+            // Only the over-represented group is eligible.
+            .filter(|(_, peer)| population.get(&peer.addr.group()).copied() == Some(largest))
+            // Largest key wins, so order the *most* evictable highest.
+            .max_by_key(|(id, peer)| (!peer.served, peer.since, **id))
+            .map(|(id, _)| *id)
+    }
+
+    fn admit(&mut self, addr: PeerAddr, outbound: bool) -> Result<Vec<Directive>, Refusal> {
         if addr.id == self.ours {
             return Err(Refusal::SelfConnection);
         }
-        if self.banned.contains(&addr.id) {
+        if self.is_banned(&addr.id) {
             return Err(Refusal::Banned);
         }
         if self.peers.contains_key(&addr.id) {
             return Err(Refusal::Duplicate);
         }
+        let mut out = Vec::new();
         if outbound {
             if self.outbound_count() >= self.limits.max_outbound {
                 return Err(Refusal::NoRoom);
@@ -459,7 +637,9 @@ impl Manager {
                 return Err(Refusal::GroupInUse);
             }
         } else if self.inbound_count() >= self.limits.max_inbound {
-            return Err(Refusal::NoRoom);
+            let victim = self.eviction_candidate().ok_or(Refusal::NoRoom)?;
+            self.peers.remove(&victim);
+            out.push(Directive::Disconnect(victim, "evicted to make room"));
         }
 
         if outbound {
@@ -493,9 +673,11 @@ impl Manager {
                 tip: None,
                 awaiting_block: None,
                 request_age: 0,
+                since: self.uptime,
+                served: false,
             },
         );
-        Ok(())
+        Ok(out)
     }
 
     /// Forget a peer that has gone away.
@@ -515,6 +697,11 @@ impl Manager {
     /// whether a block request has waited long enough to be given to somebody
     /// else, is this module's.
     pub fn on_tick(&mut self, elapsed: Duration) -> Vec<Directive> {
+        self.uptime = self.uptime.saturating_add(elapsed);
+        // A ban that has run out is forgotten rather than merely ignored, so the
+        // set does not grow without bound on a node an attacker keeps poking.
+        let now = self.uptime;
+        self.banned.retain(|_, until| *until > now);
         for peer in self.peers.values_mut() {
             peer.messages.refill(elapsed);
             peer.bytes.refill(elapsed);
@@ -760,6 +947,7 @@ impl Manager {
         }
         peer.awaiting_block = None;
         peer.request_age = 0;
+        peer.served = true;
         peer.tip = Some(peer.tip.map_or(height, |tip| tip.max(height)));
 
         // A reply that raced this node's own commit. Not an attack and not worth
@@ -825,12 +1013,21 @@ impl Manager {
     }
 
     /// Record a misbehaviour, disconnecting if it was one too many.
+    ///
+    /// The ban lasts [`BAN_DURATION`] and **is not written to disk**, which is
+    /// the one place this crate departs from Bitcoin, whose `banlist.dat`
+    /// survives a restart. A persisted ban list is a persisted mistake: a bug in
+    /// our own scoring, or a peer wrongly punished during a partition, becomes
+    /// permanent and — because nothing here logs a ban to an operator — invisible.
+    /// The reason `banlist.dat` exists is that a restart is when an eclipse is
+    /// cheapest, and anchors ([`Self::seed_anchors`]) answer that directly.
     pub fn penalise(&mut self, from: PeerId, what: Misbehaviour) -> Vec<Directive> {
         let Some(peer) = self.peers.get_mut(&from) else {
             return Vec::new();
         };
         if peer.reputation.penalise(what) {
-            self.banned.insert(from);
+            self.banned
+                .insert(from, self.uptime.saturating_add(BAN_DURATION));
             self.peers.remove(&from);
             return vec![Directive::Disconnect(from, "banned")];
         }
@@ -881,7 +1078,7 @@ mod tests {
         // attack expensive to set up; this makes it useless once set up.
         let mut m = manager();
         let first = addr(1, "198.51.100.1");
-        assert_eq!(m.on_outbound(first), Ok(()));
+        assert!(m.on_outbound(first).is_ok());
         assert_eq!(
             m.on_outbound(addr(2, "198.51.100.2")),
             Err(Refusal::GroupInUse)
@@ -891,7 +1088,7 @@ mod tests {
             Err(Refusal::GroupInUse),
             "a different /24 in the same /16 is the same group"
         );
-        assert_eq!(m.on_outbound(addr(4, "203.0.113.1")), Ok(()));
+        assert!(m.on_outbound(addr(4, "203.0.113.1")).is_ok());
         assert_eq!(m.outbound_count(), 2);
     }
 
@@ -935,10 +1132,174 @@ mod tests {
         // Inbound has its own budget, and is deliberately not group-restricted:
         // refusing inbound by group is a way for an attacker to deny honest
         // peers a seat.
+        //
+        // Each from a different /16, so the set is already as diverse as three
+        // slots can be, and the fourth arrival is from a subnet that already
+        // holds a seat. *That* is what makes it a refusal rather than an
+        // eviction: it adds no diversity, so evicting for it would be pure loss —
+        // and would hand a stranger a way to disconnect a good peer on demand.
         assert!(m.on_inbound(addr(10, "198.51.100.1")).is_ok());
-        assert!(m.on_inbound(addr(11, "198.51.100.2")).is_ok());
-        assert!(m.on_inbound(addr(12, "198.51.100.3")).is_ok());
+        assert!(m.on_inbound(addr(11, "198.52.100.2")).is_ok());
+        assert!(m.on_inbound(addr(12, "198.53.100.3")).is_ok());
         assert_eq!(m.on_inbound(addr(13, "198.51.100.4")), Err(Refusal::NoRoom));
+        assert_eq!(m.inbound_count(), 3);
+    }
+
+    /// A manager with `max_inbound` slots and nothing else changed.
+    fn with_inbound_cap(cap: usize) -> Manager {
+        Manager::new(
+            PeerId::new(key(200).public_key()),
+            AddrBook::new(&key(1)),
+            Limits {
+                max_inbound: cap,
+                ..Limits::default()
+            },
+        )
+    }
+
+    /// Every peer this manager has evicted, from a batch of directives.
+    fn evicted(directives: &[Directive]) -> Vec<PeerId> {
+        directives
+            .iter()
+            .filter_map(|d| match d {
+                Directive::Disconnect(peer, _) => Some(*peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forty_connections_from_one_subnet_do_not_keep_an_honest_peer_out() {
+        // **The attack this exists for**, and the cheapest one there was: the
+        // inbound cap alone meant anybody who could open forty sockets held every
+        // slot until they chose to leave, and every honest peer was answered
+        // `NoRoom`. That is an inbound cap of zero, arrived at by an attacker
+        // rather than by configuration.
+        let mut m = with_inbound_cap(40);
+        for n in 0..40u32 {
+            m.on_tick(TICK);
+            assert!(
+                m.on_inbound(addr(n, &format!("203.0.{}.{}", n / 250, n % 250 + 1)))
+                    .is_ok(),
+                "the attacker fills the slots, as they are free to do"
+            );
+        }
+        assert_eq!(m.inbound_count(), 40);
+
+        m.on_tick(TICK);
+        let honest = addr(900, "198.51.100.7");
+        let out = m.on_inbound(honest).expect("an honest peer still gets in");
+
+        assert_eq!(
+            evicted(&out).len(),
+            1,
+            "one peer made room, not none and not many"
+        );
+        assert!(m.peers().contains(&honest.id));
+        assert_eq!(m.inbound_count(), 40, "and the cap still holds");
+    }
+
+    #[test]
+    fn a_subnet_keeps_exactly_one_inbound_seat_however_many_it_opens() {
+        // The eviction rule is the inbound half of the group rule. An attacker
+        // who fills the slots from one /16 is protected in exactly one of them,
+        // so honest peers from distinct groups displace the rest one by one.
+        let mut m = with_inbound_cap(4);
+        for n in 0..4u32 {
+            m.on_tick(TICK);
+            // 203.0.x.y — one /16, four addresses.
+            assert!(m.on_inbound(addr(n, &format!("203.0.{n}.1"))).is_ok());
+        }
+        for n in 0..3u32 {
+            m.on_tick(TICK);
+            let honest = addr(500 + n, &format!("198.{}.100.1", 51 + n));
+            m.on_inbound(honest).expect("displaces an attacker");
+            assert!(m.peers().contains(&honest.id));
+        }
+        // One attacker survives: the longest-connected of their group.
+        let attackers = (0..4u32).filter(|n| m.peers().contains(&id(*n))).count();
+        assert_eq!(attackers, 1, "a subnet buys one seat, not four");
+    }
+
+    #[test]
+    fn the_longest_connected_peer_in_a_group_is_the_one_protected() {
+        // Protecting the *oldest* rather than the newest is what makes the
+        // protected set unoccupiable: an attacker arriving later cannot displace
+        // whoever was already there, however many connections they open.
+        let mut m = with_inbound_cap(3);
+        let established = addr(1, "203.0.1.1");
+        m.on_inbound(established).expect("first");
+        m.on_tick(TICK);
+        m.on_inbound(addr(2, "203.0.2.1"))
+            .expect("same group, later");
+        m.on_tick(TICK);
+        m.on_inbound(addr(3, "203.0.3.1"))
+            .expect("same group, later still");
+
+        m.on_tick(TICK);
+        let out = m.on_inbound(addr(9, "198.51.100.1")).expect("honest peer");
+        assert_eq!(evicted(&out), vec![id(3)], "the youngest goes first");
+        assert!(
+            m.peers().contains(&established.id),
+            "the oldest is protected"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_served_a_block_outlives_one_that_has_served_nothing() {
+        // The only evidence a node has that an inbound connection is worth
+        // anything. It breaks ties and does no more than that: protecting on it
+        // outright would put protection on sale for the price of one block.
+        let mut m = with_inbound_cap(3);
+        m.set_height(Height(1));
+        for n in 1..=3u32 {
+            m.on_inbound(addr(n, &format!("203.0.{n}.1"))).expect("in");
+            drop(m.on_message(id(n), PeerMessage::Status(Height(9))));
+        }
+        // One of them is asked for a block and answers it.
+        let asked = requested(&m.on_tick(TICK));
+        let (server, height) = asked.first().copied().expect("somebody was asked");
+        drop(m.on_message(
+            server,
+            PeerMessage::Block(Box::new(sync_block(height.0, [1; 32]))),
+        ));
+
+        let out = m.on_inbound(addr(9, "198.51.100.1")).expect("honest peer");
+        assert_eq!(evicted(&out).len(), 1);
+        assert!(
+            m.peers().contains(&server),
+            "a peer that answered a sync request is not the one thrown out"
+        );
+    }
+
+    #[test]
+    fn an_outbound_peer_is_never_evicted_by_a_stranger_dialling_in() {
+        // Outbound connections are the eclipse-relevant ones and *this node*
+        // chose them. Letting an inbound arrival displace one would hand that
+        // choice to whoever dialled in — which is the attack the group rule on
+        // outbound slots exists to prevent, reintroduced through the back door.
+        // The outbound peer is put in the same group as the inbound pair *and*
+        // dialled last, so it is both eligible by group and the youngest — which
+        // is to say, exactly what the rule would pick if outbound connections
+        // were candidates at all. It survives because they are not.
+        let mut m = with_inbound_cap(2);
+        m.on_inbound(addr(2, "203.0.2.1"))
+            .expect("first inbound slot");
+        m.on_tick(TICK);
+        m.on_inbound(addr(3, "203.0.3.1"))
+            .expect("second inbound slot");
+        m.on_tick(TICK);
+        let ours = addr(1, "203.0.1.1");
+        m.on_outbound(ours)
+            .expect("we dialled this one, last of all");
+        m.on_tick(TICK);
+
+        let out = m
+            .on_inbound(addr(4, "203.0.4.1"))
+            .expect("displaces an inbound peer, never the outbound one");
+        assert_eq!(evicted(&out), vec![id(3)], "the youngest *inbound* peer");
+        assert!(m.peers().contains(&ours.id), "the outbound peer stays");
+        assert_eq!(m.outbound_count(), 1);
     }
 
     #[test]
@@ -953,6 +1314,148 @@ mod tests {
         let peer = addr(1, "203.0.113.7");
         assert!(m.on_inbound(peer).is_ok());
         assert_eq!(m.on_inbound(peer), Err(Refusal::Duplicate));
+    }
+
+    #[test]
+    fn a_ban_expires_rather_than_lasting_forever() {
+        // A permanent ban is a permanent mistake. Several of the things that earn
+        // a penalty — a malformed frame, a burst that outran the limit — are
+        // reachable by a peer that is merely overloaded or mid-upgrade, and on
+        // links that drop out by design that is a Tuesday rather than an attack.
+        let mut m = manager();
+        let a = addr(1, "203.0.113.1");
+        m.on_inbound(a).expect("connects");
+        m.penalise(a.id, Misbehaviour::Unforgivable);
+        assert!(m.is_banned(&a.id));
+        assert_eq!(m.on_inbound(a), Err(Refusal::Banned));
+
+        // Just short of the hour, still out.
+        m.on_tick(BAN_DURATION - Duration::from_secs(1));
+        assert!(m.is_banned(&a.id));
+
+        m.on_tick(Duration::from_secs(2));
+        assert!(!m.is_banned(&a.id), "an hour is a ban, not an exile");
+        assert!(m.on_inbound(a).is_ok(), "and the peer may come back");
+    }
+
+    #[test]
+    fn an_expired_ban_is_forgotten_rather_than_merely_ignored() {
+        // Otherwise the set grows for as long as an attacker keeps poking, which
+        // is a memory cost with somebody else holding the tap.
+        let mut m = manager();
+        for n in 0..64u32 {
+            let a = addr(n, &format!("203.0.{}.{}", n / 250, n % 250 + 1));
+            m.on_inbound(a).expect("connects");
+            m.penalise(a.id, Misbehaviour::Unforgivable);
+        }
+        assert_eq!(m.banned.len(), 64);
+        m.on_tick(BAN_DURATION + Duration::from_secs(1));
+        assert!(m.banned.is_empty());
+    }
+
+    #[test]
+    fn a_ban_does_not_reset_when_the_peer_is_penalised_again_from_nowhere() {
+        // `penalise` on a peer that is no longer connected does nothing, so a
+        // banned peer cannot have its clock restarted by a stray message that
+        // arrives after the disconnect.
+        let mut m = manager();
+        let a = addr(1, "203.0.113.1");
+        m.on_inbound(a).expect("connects");
+        m.penalise(a.id, Misbehaviour::Unforgivable);
+        m.on_tick(BAN_DURATION - Duration::from_secs(1));
+        assert!(m.penalise(a.id, Misbehaviour::Unforgivable).is_empty());
+        m.on_tick(Duration::from_secs(2));
+        assert!(!m.is_banned(&a.id));
+    }
+
+    #[test]
+    fn an_anchor_is_dialled_before_anything_the_address_book_offers() {
+        // The whole point of an anchor. On a restart every outbound slot is on
+        // offer at once, drawn from a book an attacker has had hours to shape;
+        // dialling last run's peers first keeps two of them off the table at the
+        // moment they are cheapest to take.
+        let mut m = manager();
+        let known = addr(1, "203.0.113.1");
+        m.book_mut().add(known, known.group());
+        let anchor = addr(2, "198.51.100.1");
+        m.seed_anchors([anchor]);
+
+        assert_eq!(m.wants_outbound(), Some(anchor), "the anchor comes first");
+        m.on_outbound(anchor).expect("dialled");
+        assert_eq!(m.wants_outbound(), Some(known), "then the book as usual");
+    }
+
+    #[test]
+    fn an_anchor_is_dialled_but_never_trusted() {
+        // An anchor is a hint about who to try, not a licence. It passes the same
+        // checks as any other candidate — otherwise a file on disk would be a way
+        // around the ban list, and an attacker who could write one would have a
+        // way around the group rule too.
+        let mut m = manager();
+        let banned = addr(1, "203.0.113.1");
+        m.on_inbound(banned).expect("connects");
+        m.penalise(banned.id, Misbehaviour::Unforgivable);
+        assert!(m.is_banned(&banned.id));
+
+        let good = addr(2, "198.51.100.1");
+        m.seed_anchors([banned, good]);
+        assert_eq!(
+            m.wants_outbound(),
+            Some(good),
+            "a banned anchor is skipped, not dialled because a file said so"
+        );
+    }
+
+    #[test]
+    fn a_dead_anchor_is_consumed_rather_than_retried_forever() {
+        // An anchor that cannot be used must not be re-offered on every pass: a
+        // node that kept proposing a dead anchor would spend its whole dial
+        // budget on it instead of finding peers that answer.
+        let mut m = manager();
+        let known = addr(1, "203.0.113.1");
+        m.book_mut().add(known, known.group());
+        // Same group as a peer already connected, so it can never be dialled.
+        m.on_outbound(addr(3, "198.51.100.3")).expect("connects");
+        let clashing = addr(2, "198.51.100.2");
+        let usable = addr(4, "192.0.2.1");
+        m.seed_anchors([clashing, usable]);
+
+        assert_eq!(
+            m.wants_outbound(),
+            Some(usable),
+            "the unusable anchor is passed over rather than returned"
+        );
+        m.on_outbound(usable).expect("dialled");
+        assert_eq!(
+            m.wants_outbound(),
+            Some(known),
+            "and it is gone: the queue is empty and the book takes over"
+        );
+    }
+
+    #[test]
+    fn at_most_two_anchors_are_kept_however_many_peers_there_are() {
+        // Anchoring every outbound slot would mean an attacker who captured this
+        // node once keeps it. Two means an attacker who had not captured it
+        // before the restart cannot capture it during the restart.
+        let mut m = manager();
+        for n in 1..=5u32 {
+            m.on_outbound(addr(n, &format!("203.{n}.1.1")))
+                .expect("out");
+            m.on_tick(TICK);
+        }
+        m.on_inbound(addr(90, "198.51.100.1")).expect("in");
+        let anchors = m.anchors();
+        assert_eq!(anchors.len(), ANCHOR_COUNT);
+        assert!(
+            anchors.iter().all(|a| a.id != id(90)),
+            "an inbound peer is not an anchor: we did not choose it and cannot dial it"
+        );
+        assert_eq!(
+            anchors.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![id(1), id(2)],
+            "the longest-connected outbound peers, because survival is evidence"
+        );
     }
 
     #[test]

@@ -271,6 +271,14 @@ impl Config {
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("chain.redb")
     }
+
+    /// The file holding the peers to dial first after a restart.
+    ///
+    /// See [`crate::anchors`] for why it exists and why it is deleted on read.
+    #[must_use]
+    pub fn anchors_path(&self) -> PathBuf {
+        self.data_dir.join("anchors")
+    }
 }
 
 /// `hex@host:port, hex@host:port`

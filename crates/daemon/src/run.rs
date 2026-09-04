@@ -249,6 +249,21 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
         manager.book_mut().add(*seed, seed.group());
     }
 
+    // Last run's peers, dialled before the book. A restart is when an eclipse is
+    // cheapest — every outbound slot is on offer at once, drawn from a book an
+    // attacker has had hours to shape — and this keeps two of them off the table.
+    // The file is consumed by reading it, so a crash-loop is not pinned to peers
+    // that may be the reason it is looping.
+    let anchors = crate::anchors::take(&config.anchors_path());
+    if !anchors.is_empty() {
+        log(&format!(
+            "dialling {} anchor{} from the last run first",
+            anchors.len(),
+            if anchors.len() == 1 { "" } else { "s" }
+        ));
+        manager.seed_anchors(anchors);
+    }
+
     let transport = Transport::start(
         chain_id.clone(),
         node_key,
@@ -295,6 +310,16 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
     let outcome = drive(config, &transport, &shared, stop, &halted);
 
     log("stopping");
+    // Before the transport is torn down, while there is still a peer set to read.
+    let anchors = transport.anchors();
+    if let Err(e) = crate::anchors::put(&config.anchors_path(), &anchors) {
+        log(&format!("could not write anchors: {e}"));
+    } else if !anchors.is_empty() {
+        log(&format!(
+            "kept {} anchor(s) for the next run",
+            anchors.len()
+        ));
+    }
     transport.handle().stop();
     if let Some(handle) = http {
         handle.stop();

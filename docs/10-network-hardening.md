@@ -162,7 +162,7 @@ logged `last signed height 4 round 0 Precommit` before carrying on.
 
 # P1 — An attacker can degrade a node cheaply
 
-## 3. No inbound eviction: forty connections keep everyone else out
+## 3. No inbound eviction: forty connections keep everyone else out — **done**
 
 **What is wrong.** `max_inbound: 40` is a cap and nothing more. An attacker who
 opens forty connections holds every inbound slot until they choose to leave, and
@@ -177,25 +177,59 @@ then peers protected by longest uptime allocated evenly across networks, and
 never evicting the most recently useful peers. The point is stated explicitly by
 the Bitcoin developers: *favour the diversity of peer connections.*
 
-**What we do.** Evict rather than refuse, protecting in this order:
+**What we did.** Evict rather than refuse. `Manager::eviction_candidate` decides,
+and outbound connections are never candidates: they are the eclipse-relevant ones
+and this node chose them, so letting a stranger's arrival displace one would hand
+that choice back to whoever dialled in.
 
-1. **One peer per address group, by longest uptime.** The direct analogue of
-   netgroup protection, and it reuses the `AddrGroup` the eclipse defence already
-   depends on. An attacker with one subnet can hold exactly one protected slot,
-   however many connections they open.
-2. **Peers that have served a block**, which an attacker filling slots has not.
-   Cheap to track — the sync path already knows.
-3. Of the rest, evict the **youngest**, because a connection that just arrived
-   has demonstrated nothing and a long-lived one has.
+**The plan above was wrong, and building it is what showed why.** It said to
+protect *one peer per address group*. That protects an unbounded number of peers:
+a node whose forty inbound slots hold forty distinct groups has forty protected
+peers, nothing is ever evictable, and the node is closed to new peers forever —
+which is the same denial of service the item was written to fix, reached by the
+fix itself. Bitcoin avoids this by protecting a *fixed* four netgroups out of
+125, but a fixed number is a number an attacker can count and fill.
 
-Outbound connections are never evicted: they are the eclipse-relevant ones and
-this node chose them.
+So the rule is written in terms of the thing being defended, and needs no
+constant at all: **eviction happens only to take back a seat from an
+over-represented address group.** If some group holds two or more inbound peers,
+the youngest of that group makes way. If every group holds exactly one, nothing is
+evicted and the newcomer is refused. A peer that has served a block goes after one
+that has not — a tiebreak and never protection, because one block is cheap and
+anything an attacker can buy for one block is not a defence.
 
-**Cost.** Moderate, and entirely inside `Manager`, so it is unit-testable without
-a socket. The test that matters: *forty attacker connections from one group must
-not stop an honest peer from a new group getting in.*
+A first draft went further, evicting whenever the newcomer brought a group the
+node did not have, on Bitcoin's reasoning that a new listening node should always
+be able to find a slot somewhere. **Running it is what showed that to be wrong
+here.** `Transport::dial_out` refills its outbound slots twice a second, so a peer
+evicted to make room re-dials immediately and displaces another — a permanent
+rotation among honest peers on a *healthy* network, costing a handshake and a TCP
+connection each time on links metered by the gigabyte, and destroying the one
+thing the rest of the rule treats as evidence: that a long-lived connection means
+something. Bitcoin gets away with the aggressive version because its nodes do not
+re-dial the way ours do.
 
-## 4. No anchors: a restart is when an eclipse is cheapest
+**The cost of refusing, recorded rather than hidden.** A network whose nodes are
+all saturated stops accepting new inbound peers, so a new node can dial out but is
+not itself reachable. That is a real gap, and the answer to it is not eviction: it
+is dial-side backoff — a peer that just dropped us should not be re-dialled within
+the second — plus address advertisement (§7), so that the set of reachable nodes
+grows instead of being fought over. Both are open.
+
+**Verified.** Twelve tests in `crates/p2p/src/manager.rs`, each checked to fail
+against a reverted or mutated fix — including two that did *not* discriminate when
+first written, and were rewritten until they did. The one that matters is
+`forty_connections_from_one_subnet_do_not_keep_an_honest_peer_out`; the one that
+matters second is `an_outbound_peer_is_never_evicted_by_a_stranger_dialling_in`.
+
+**What is not verified over sockets, and why.** `crates/p2p/tests/network.rs`
+cannot construct an eviction at all: every node in it is on loopback, and the
+loopback carve-out in `AddrGroup::of` makes each socket its own group, so two
+inbound connections there can never share one. The refusal path is asserted over
+real sockets (`a_refused_peer_is_told_rather_than_left_hanging`); the eviction
+path is asserted only against routable addresses, in unit tests.
+
+## 4. No anchors: a restart is when an eclipse is cheapest — **done**
 
 **What is wrong.** On restart a node dials from its address book, and the book is
 rebuilt from a seed list plus whatever is gossiped. An attacker who can influence
@@ -208,30 +242,66 @@ vulnerable.
 from the address book. A later change deletes the file after use, so a crash-loop
 cannot pin a node to the same peers forever.
 
-**What we do.** The same, sized to our eight outbound slots: persist **two**
-outbound peers at shutdown, dial them before the book on startup, and **delete
-the file once read**. Two rather than all eight, because anchoring every slot
-would mean an attacker who captured us once keeps us; two means an attacker who
-did not capture us before the restart cannot capture us during it.
+**What we did.** The same, sized to our eight outbound slots: `crates/daemon`
+persists **two** outbound peers to `<data-dir>/anchors` at shutdown,
+`Manager::seed_anchors` puts them ahead of the address book on startup, and the
+file is **deleted the moment it is read** — before any dial — so a crash-loop
+cannot be pinned to two peers that may be why it is looping. Two rather than all
+eight, because anchoring every slot would mean an attacker who captured us once
+keeps us; two means an attacker who did not capture us before the restart cannot
+capture us during it.
 
-**Cost.** Small. A file, a startup dial, a shutdown write.
+An anchor is dialled, never trusted: it passes the ban check, the
+self-connection check and the group rule like any other candidate, and it is
+*consumed* whether or not it turns out to be usable — a dead anchor re-offered on
+every pass would spend the whole dial budget. A file that cannot be parsed yields
+no anchors rather than refusing to start; unlike the signing record, an anchor is
+a hint, and refusing to start over a bad hint turns a hardening measure into an
+outage.
 
-## 5. Bans do not decay and do not survive a restart
+**Verified.** `crates/p2p/src/manager.rs` (four tests) and
+`crates/daemon/src/anchors.rs` (six), each checked against a reverted fix.
+
+## 5. Bans do not decay and do not survive a restart — **done**
 
 **What is wrong.** `banned: BTreeSet<PeerId>` lives in one process. A restart
 forgives everybody, and nothing ever forgives anybody within a process. Both
 directions are wrong: an attacker gets a clean slate for free, and a peer that
 was briefly overloaded is exiled forever.
 
-**What we do.** Reputation already decays per-misbehaviour; give the *ban* a
-clock too. A ban expires after a bounded period (default: one hour of accumulated
-tick time), and bans are **not** persisted across restarts — deliberately, and
-this is the one place we depart from Bitcoin's `banlist.dat`. A persisted ban
-list is a persisted mistake: a bug in our own scoring, or a peer wrongly punished
-during a partition, becomes permanent and unobservable. Anchors already cover the
-restart-eclipse case, which is the reason `banlist.dat` exists.
+**What we did.** `banned` is now a map from peer to the uptime stamp its ban
+expires at, denominated in the same tick time every other limit here uses, so it
+still reads no clock. `BAN_DURATION` is one hour; an expired entry is swept on
+the next tick rather than merely ignored, so the set cannot grow for as long as
+an attacker keeps poking.
 
-**Cost.** Small.
+Bans are still **not** persisted across restarts — deliberately, and this is the
+one place we depart from Bitcoin's `banlist.dat`. A persisted ban list is a
+persisted mistake: a bug in our own scoring, or a peer wrongly punished during a
+partition, becomes permanent and, since nothing here surfaces a ban to an
+operator, invisible. The reason `banlist.dat` exists is that a restart is when an
+eclipse is cheapest, and §4 answers that directly.
+
+**Verified.** Three tests, checked against a reverted fix.
+
+## 5a. A node stopped the way a service manager stops it did not stop cleanly
+
+Found while verifying §4 against real binaries, and not on the list before that.
+
+The daemon installs a signal handler so it can close its peers, flush its store
+and — now — write its anchors. It handled **SIGINT only**, which is what a
+terminal sends on Ctrl-C and what nothing in production sends: systemd, Docker
+and Kubernetes all send SIGTERM and then SIGKILL a few seconds later. So the
+clean-stop path existed, was tested, and was never taken in the one situation it
+was written for. A node stopped by its own service manager simply died, leaving
+its anchors unwritten and its peers holding connections nobody would close.
+
+The fix is one line — the `termination` feature of `ctrlc` — and it is the same
+defect class as the six before it: correct, tested code that nothing reached. It
+is recorded here because *how it was found* is the point. No test in this
+workspace would have caught it; stopping a running node the way an operator's
+tooling stops one did.
+
 
 ## 6. No channel priorities: mempool gossip can starve votes
 
@@ -462,6 +532,33 @@ exactly what this harness exists to reach.
 
 ---
 
+## 15a. The harness was less capable than the daemon, twice
+
+Both found by chasing one intermittent failure —
+`a_node_that_joins_late_reaches_the_tip_from_genesis`, which failed only under
+full-workspace parallelism and passed alone. Neither is a defect in the network.
+Both are the *inverse* of the §15 hazard: where a simulator more capable than
+production hides bugs, a harness **less** capable than production invents them.
+
+**The harness never re-dialled.** `run::drive` calls `Transport::dial_out` every
+five seconds, so a peer lost to a full outbox or a read timeout comes back. The
+cluster dialled once, at construction, and never again — so under CPU starvation
+a node that lost a connection was one peer short for the rest of the run. Fixed
+by giving `ClusterNode::step` the daemon's dial timer, and by giving `Cluster` a
+`partition`/`heal` pair: a deliberate partition now suspends re-dialling, because
+a partition every peer can dial straight through is not a partition.
+
+**The harness threw away the `halted` flag.** `Persist` sets it when a block or a
+state root cannot be written, and `run::drive` treats it as fatal — a node that
+cannot write its own chain stops rather than voting on a history only it can see.
+The cluster passed `halted` to `Persist` and dropped its own handle. A failed
+write was therefore *silent*: the node carried on with a store one block behind
+its consensus state, and the symptom surfaced much later, and elsewhere, as a
+node that would not settle. `quiesce` now fails on it by name.
+
+The general point is the one §15 was written for. A harness earns trust by being
+**exactly** as capable as the thing it stands in for — no more, and no less.
+
 # Order of work
 
 | # | Item | Why here | Size | State |
@@ -469,9 +566,9 @@ exactly what this harness exists to reach.
 | 15 | Joined harness | Validates everything after it; the thing that catches seam defects | M | **done** |
 | 1 | Equivocation evidence end to end | The economic security argument did not run | S | **done** |
 | 2 | Double-sign guard | §1 makes an honest operator's mistake fatal; ships with it | S | **done** |
-| 3 | Inbound eviction | Cheapest attack on a node's usefulness | M | open |
-| 4 | Anchor connections | Restart is when an eclipse is cheapest | S | open |
-| 5 | Ban decay | Small, and wrong in both directions today | S | open |
+| 3 | Inbound eviction | Cheapest attack on a node's usefulness | M | **done** |
+| 4 | Anchor connections | Restart is when an eclipse is cheapest | S | **done** |
+| 5 | Ban decay | Small, and wrong in both directions today | S | **done** |
 | 7 | Address advertisement | Topology cannot grow past the seeds without it | M | open |
 | 6 | Channel priority | Votes must not queue behind payments | M | open |
 | 8 | Seen-set by height | Same pass as §6 | S | open |

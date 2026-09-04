@@ -365,6 +365,9 @@ fn a_connection_that_says_nothing_does_not_hold_a_slot_forever() {
 
 #[test]
 fn the_inbound_limit_is_enforced_on_real_connections() {
+    // Proving who you are is not the same as being wanted: the cap is applied by
+    // the manager *after* a perfectly good handshake, and it holds over sockets
+    // rather than only in a unit test.
     let a = node(1);
     let ta = transport_with(
         1,
@@ -379,12 +382,50 @@ fn the_inbound_limit_is_enforced_on_real_connections() {
 
     tb.dial(address_of(&ta)).expect("the first gets in");
     assert!(wait_for(PATIENCE, || ta.peers().len() == 1));
-    // The second is refused by the manager after a perfectly good handshake:
-    // proving who you are is not the same as being wanted.
     drop(tc.dial(address_of(&ta)));
     assert!(
         wait_for(Duration::from_millis(500), || ta.peers().len() == 1),
-        "the inbound cap must hold over sockets, not only in a unit test"
+        "one slot means one peer, whoever is in it"
+    );
+}
+
+#[test]
+fn a_refused_peer_is_told_rather_than_left_hanging() {
+    // The other half of the cap: a node that refuses an inbound connection must
+    // close it, or the refused peer sits holding a socket it believes is a peer
+    // — and, believing it has a connection, never dials anyone else.
+    //
+    // **Why eviction is not exercised here.** `Manager` evicts only to take back
+    // a seat from an over-represented address group, and on loopback every
+    // socket is its own group (see `distinct_loopback_sockets_are_distinct_groups`
+    // for why that carve-out has to exist). Two inbound connections on 127.0.0.1
+    // can therefore never share a group, so no test in this file can construct
+    // the condition eviction responds to. The policy is asserted where it is
+    // constructible, against routable addresses, in
+    // `manager::tests::forty_connections_from_one_subnet_do_not_keep_an_honest_peer_out`.
+    let a = node(1);
+    let ta = transport_with(
+        1,
+        &a,
+        Limits {
+            max_inbound: 1,
+            ..Limits::default()
+        },
+    );
+    let (b, c) = (node(2), node(3));
+    let (tb, tc) = (transport(2, &b), transport(3, &c));
+
+    tb.dial(address_of(&ta)).expect("the first gets in");
+    assert!(wait_for(PATIENCE, || ta.peers() == vec![tb.peer_id()]));
+
+    drop(tc.dial(address_of(&ta)));
+    assert!(
+        wait_for(PATIENCE, || tc.peers().is_empty()),
+        "a refused peer must see its connection close"
+    );
+    assert!(
+        ta.peers() == vec![tb.peer_id()],
+        "and the peer already in the slot keeps it"
     );
 }
 

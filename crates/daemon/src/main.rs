@@ -154,6 +154,15 @@ fn start(args: &Args) -> Result<(), String> {
     // so this is one of the few places a dependency earns its place. A daemon
     // that can only be stopped with SIGKILL leaves its peers holding half-open
     // connections and its operator unable to tell a clean stop from a crash.
+    //
+    // **SIGTERM as well as SIGINT**, which is the `termination` feature and is
+    // not the default. Nothing that runs a node in production sends SIGINT:
+    // systemd, Docker and Kubernetes all send SIGTERM and then SIGKILL a few
+    // seconds later. Without this the clean-stop path above existed and was
+    // never taken in the one situation it was written for — the node simply
+    // died, leaving its anchors unwritten and its peers holding connections
+    // nobody would close. Found by stopping a live node the way a service
+    // manager would rather than the way a terminal does.
     let flag = Arc::clone(&stop);
     if ctrlc::set_handler(move || {
         if flag.swap(true, Ordering::SeqCst) {

@@ -540,6 +540,19 @@ impl Transport {
             .unwrap_or_default()
     }
 
+    /// The outbound peers worth writing down for the next run.
+    ///
+    /// Read at shutdown. See [`Manager::anchors`] for why there are only two of
+    /// them and why they are dialled first.
+    #[must_use]
+    pub fn anchors(&self) -> Vec<PeerAddr> {
+        self.shared
+            .manager
+            .lock()
+            .map(|m| m.anchors())
+            .unwrap_or_default()
+    }
+
     /// Drop every peer, keeping the listener open.
     ///
     /// What a partition looks like from inside one node: connections go away, the
@@ -677,17 +690,23 @@ fn establish(
     // tried table until this node has itself reached it.
     let addr = expected.unwrap_or_else(|| PeerAddr::new(peer, remote_of(&stream)));
     let outbound = expected.is_some();
-    {
+    let consequences = {
         let mut manager = shared
             .manager
             .lock()
             .map_err(|_| TransportError::Poisoned)?;
         if outbound {
-            manager.on_outbound(addr)?;
+            manager.on_outbound(addr)?
         } else {
-            manager.on_inbound(addr)?;
+            manager.on_inbound(addr)?
         }
-    }
+    };
+    // Outside the lock, always: admitting an inbound peer can evict another one,
+    // and carrying that out reaches `drop_peer`, which takes the manager lock
+    // itself. Applying it while still holding the guard would deadlock the
+    // listener thread on the first eviction — which is to say, the first time an
+    // attacker filled the inbound slots.
+    shared.apply(consequences);
 
     let (tx, rx) = sync_channel::<PeerMessage>(OUTBOX_DEPTH);
     if let Ok(mut outboxes) = shared.outboxes.lock() {

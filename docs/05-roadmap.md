@@ -167,14 +167,28 @@ header it verified itself, trusting nothing about the node in between.
       described code that never ran *([10](10-network-hardening.md) §1)*
 - [x] **A joined harness** — N real nodes, N sockets, N databases, real
       consensus. Agreement, catch-up after a healed partition, a late joiner from
-      genesis, and a restart rejoining. Found four defects in its first hour
-      *([10](10-network-hardening.md) §15)*
+      genesis, and a restart rejoining. Found four defects in its first hour, and
+      two more in itself: it never re-dialled where the daemon does, and it threw
+      away the `halted` flag the daemon treats as fatal, so a failed store write
+      was silent *([10](10-network-hardening.md) §15, §15a)*
 - [ ] **Seed nodes and peer exchange in crawler mode** — no longer blocked on
       block sync, which now exists; what is missing is the crawler mode itself
       *(ADR-0023)*
-- [ ] **Inbound eviction preferring group diversity** — the inbound cap alone
-      means an attacker who can open forty connections keeps honest peers out.
-      Bitcoin evicts rather than refuses, and that is the right fix *(ADR-0023)*
+- [x] **Inbound eviction preferring group diversity** — the inbound cap alone
+      meant an attacker who could open forty connections kept honest peers out,
+      which is an inbound cap of zero reached by an attacker rather than by
+      configuration. A full node now takes a seat back from an over-represented
+      address group instead of refusing everyone, so a subnet buys one inbound
+      seat as well as one outbound one *([10](10-network-hardening.md) §3)*
+- [x] **Anchor connections across a restart** — two outbound peers written at
+      shutdown and dialled before the address book, then the file deleted, so a
+      restart is no longer a fresh draw at every outbound slot from a book an
+      attacker has had hours to shape. Bitcoin PR #17428, sized to eight slots
+      *([10](10-network-hardening.md) §4)*
+- [x] **Bans that expire** — an hour of accumulated tick time, swept rather than
+      merely ignored, and deliberately still not persisted: a saved ban list is a
+      saved mistake, and anchors cover the reason Bitcoin persists one
+      *([10](10-network-hardening.md) §5)*
 - [x] Byzantine testing — partitions, packet loss, message reordering and
       injected equivocation, all against the agreement invariant *([08](08-adversarial-testing.md))*
 - [ ] Model checking the round state machine (TLA+ / Stateright). The randomised
@@ -189,10 +203,12 @@ header it verified itself, trusting nothing about the node in between.
       *([ADR-0012](adr/0012-staking-and-slashing.md))*
 - [ ] Downtime slashing — needs the per-block vote history a networked node has.
       No longer blocked: the votes now arrive over a wire *(ADR-0023)*
-- [ ] **Network hardening, the rest** — inbound eviction, anchor connections, ban
-      decay, address advertisement, channel priority, retention, a metrics
-      endpoint, state sync and validator set rotation, each with its reference
-      design and its reasoning *([10](10-network-hardening.md))*
+- [ ] **Network hardening, the rest** — address advertisement, channel priority,
+      a seen-set keyed by height, retention, a metrics endpoint, state sync and
+      validator set rotation, each with its reference design and its reasoning
+      *([10](10-network-hardening.md))*. Also open, and named there rather than
+      hidden: a saturated node refuses new inbound peers, whose answer is
+      dial-side backoff plus address advertisement, not more eviction
 - [ ] Delegation — stake through another operator. Deliberately deferred:
       reward accounting and slashing across delegators is the largest addition
       to the staking surface *(ADR-0012)*
