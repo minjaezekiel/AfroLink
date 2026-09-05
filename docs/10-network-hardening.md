@@ -680,6 +680,54 @@ claimed as tested.
 
 ---
 
+# 17. A late joiner intermittently stalls one block short — **open, not understood**
+
+Recorded because it is real, reproducible under load, and **not fixed**. Writing
+it down beats leaving it as a test that fails one run in five and gets re-run
+until it passes.
+
+**What happens.** In `a_node_that_joins_late_reaches_the_tip_from_genesis`, the
+node that joined late reaches a height one or two short of the validators and
+stays there. Traced over 230 consecutive samples in one reproduction: the joiner
+sat at tip 7 with **four connected peers**, `is_behind() == true`, and
+`synced == 7`, while all four validators sat at tip 9 with block 9 durably
+stored. It never closed the gap.
+
+**What is ruled out.** It is not the state-tree work and not the publish-ordering
+guard: the same failure reproduces with both stashed, on the tree as of
+`489d6f9`. It is not the missing re-dial fixed in §15a either — that made it much
+rarer without removing it, which is why it read as fixed at the time. That was
+too quick a conclusion and is corrected here.
+
+**What the code says should happen.** `is_behind()` is true, so
+`schedule_sync` passes its `best < height` guard; `ceiling` allows the missing
+height; and `free_peer_holding` should find one of four peers whose announced
+`tip` covers it. Every step reads as though it must work, which is why this needs
+evidence rather than more reading.
+
+**Why it is not diagnosed yet.** It is a heisenbug: with `SYNC_DEBUG` tracing
+enabled the extra `eprintln!` per tick slows the loop enough that six consecutive
+runs all passed. The next attempt should record into a **ring buffer read after
+the failure**, not print as it goes.
+
+**Two suspects worth checking first**, both visible in `manager.rs` and both
+capable of producing exactly this:
+
+1. `free_peer_holding` skips any peer whose `tip` is `None`. A peer dropped for a
+   full outbox and re-dialled starts with no `tip` until its next `Status`, and a
+   node whose peers were all recently re-dialled would ask nobody at all.
+2. `on_block` penalises a block the peer was not *currently* asked for with
+   `BadBlock` (20 points). A legitimate answer that arrives after a reconnect has
+   cleared `awaiting_block` is therefore scored as misbehaviour, and five of them
+   ban a peer that did nothing wrong.
+
+**Severity.** Real but bounded: it affects a node catching up, not consensus
+safety, and the network keeps committing throughout. It matters because catching
+up is what every new node and every restarted node does, and a node that silently
+stops one block short serves stale answers to every query it receives.
+
+---
+
 # Order of work
 
 | # | Item | Why here | Size | State |
@@ -698,6 +746,7 @@ claimed as tested.
 | 10 | State sync | Large; needs P0/P1 stable first | L | open |
 | 11 | Validator set rotation | Largest; a mistake here is a chain split | L | open |
 | 16 | The defect class itself | Seven instances; one loop, a halt in the type, the entry point under test | M | **done** |
+| 17 | Late-joiner sync stall | Intermittent, pre-dates this work, not understood | ? | **open** |
 
 ---
 

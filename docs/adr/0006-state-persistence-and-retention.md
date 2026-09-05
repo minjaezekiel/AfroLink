@@ -140,10 +140,50 @@ easy to get wrong: deleting a node still reachable from a retained root is silen
 corruption that only surfaces on a later read. It needs reference tracking and
 adversarial tests before it is enabled by default.
 
-**Known gap after the first implementation step:** writing only *new* nodes makes
-disk writes `O(log n)`, but recomputing the node set still costs `O(n)` CPU per
-commit. Incremental copy-on-write updates are the follow-up; the structure this
-ADR introduces is what makes them possible.
+**Known gap after the first implementation step — now closed.** Writing only
+*new* nodes made disk writes `O(log n)`, but recomputing the node set still cost
+`O(n)` CPU per commit, because the tree was a flat `BTreeMap` of entries and
+every root had to be rebuilt from all of them. Incremental copy-on-write updates
+were named here as the follow-up. They are now built.
+
+What that gap was worth, measured on the real code rather than reasoned about:
+
+| accounts | one write, then `root()` — before | after |
+|---|---|---|
+| 1 000 | 0.8 ms | 6.1 µs |
+| 20 000 | 11.7 ms | ~7 µs |
+| 100 000 | **63.4 ms** | **9.8 µs** |
+| 1 000 000 | *(not attempted)* | 15.0 µs |
+
+Changing one balance cost the same as rebuilding the entire state, on a path
+taken at least twice per block, alongside a full `MemoryStore` clone per commit
+(30 ms at 100 000 accounts). The chain would have stopped keeping one-second
+blocks somewhere around 100–200 000 accounts — a ceiling far below the first real
+corridor, for a network whose entire argument is mass adoption.
+
+`SparseMerkleTree` now keeps its nodes, each caching its own hash, with children
+behind `Arc` so an insert rebuilds only the path from the changed leaf to the
+root and every untouched subtree is *the same allocation*. That is the same
+structural sharing this ADR already relies on for persistence, applied in memory
+— and it is what finally makes the `O(log n)` claim true of CPU as well as of
+writes. `commit_tree` can now test `has_node` on the way **down** and stop there,
+because a hash the store already holds names a subtree the store already holds in
+full; at a million accounts a commit touches 40 nodes rather than two million.
+
+The design is the shape Diem's and Aptos's Jellyfish Merkle Tree uses, whose
+defining optimisation — any subtree of 0 or 1 leaves collapses to a placeholder
+or that leaf — this tree already had in its *hashing* while discarding the
+structure that makes it pay.
+
+**The hashing did not change.** Roots are byte-identical, which is what lets the
+existing suite stand as the proof rather than being rewritten alongside the thing
+it checks. The one rule a flat map never had to implement is the one a structural
+tree can get wrong — collapsing a branch back to a leaf after a removal — and
+getting it wrong is invisible: two honest nodes simply disagree on the app hash
+after one of them deletes a key. `crates/state/tests/differential.rs` keeps the
+old algorithm verbatim and compares roots, lengths, proofs and iteration order
+after every operation of a random history; it was verified to fail when that
+collapse rule is broken.
 
 ## Revisit if
 

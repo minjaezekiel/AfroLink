@@ -53,6 +53,26 @@ pub struct Persist {
     state: Arc<Mutex<MemoryStore>>,
     /// Set when a write fails. The daemon stops rather than carrying on.
     failed: Arc<Mutex<Option<String>>>,
+    /// The height of the state currently published.
+    ///
+    /// # Why publishing needs a guard
+    ///
+    /// A block reaches this sink from two threads: the consensus driver when
+    /// this node decides a height, and the sync path when it learns one from a
+    /// peer. Both capture the state **under the node lock and then release it**,
+    /// because holding it across a disk write would put every socket behind
+    /// consensus. So the interval between "capture state at height H" and
+    /// "publish it" is unguarded, and two commits can arrive here out of order.
+    ///
+    /// The durable store does not care: nodes are content-addressed, so writing
+    /// them in any order converges. The *published* view does — an older state
+    /// overwriting a newer one means a wallet asks for its balance twice and
+    /// gets the newer answer first and the older one second. Nothing is lost on
+    /// disk and nothing forks; the money simply appears to go backwards, which
+    /// for a payments network is its own kind of unacceptable.
+    ///
+    /// Locked **before** `state`, always, and it is the only pair of locks here.
+    published_height: Mutex<Height>,
 }
 
 impl Persist {
@@ -67,6 +87,7 @@ impl Persist {
             store,
             state,
             failed,
+            published_height: Mutex::new(Height(0)),
         }
     }
 
@@ -107,8 +128,18 @@ impl CommitSink for Persist {
         // Only now is the new state published to readers. A query answered from a
         // state whose block is not yet durable would be a proof against a header
         // that a restart could take back.
+        //
+        // Never backwards: see `published_height`. The two locks are taken in
+        // this order and in no other.
+        let Ok(mut at) = self.published_height.lock() else {
+            return;
+        };
+        if block.header.height < *at {
+            return;
+        }
         if let Ok(mut published) = self.state.lock() {
             *published = state.clone();
+            *at = block.header.height;
         }
     }
 }
@@ -194,5 +225,254 @@ impl ChainView for LiveChain {
         limit: usize,
     ) -> Result<Option<(Vec<HistoryEntry>, bool)>, QueryError> {
         self.with(|c| c.history(address, from, limit))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests assert on known-good fixtures; a panic there is a failed test, not a halted node"
+)]
+mod tests {
+    use super::*;
+    use afrolink_consensus::{CountryCode, Validator, ValidatorSet, Vote, VoteType};
+    use afrolink_crypto::SecretKey;
+    use afrolink_executor::{Allocation, Executor, Genesis, GenesisLimits, ValidatorSets};
+    use afrolink_primitives::{Amount, Denom, Round, Timestamp};
+    use afrolink_state::{KeyValueStore, StoreKey};
+    use afrolink_types::{Fee, Message, TxBody};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            path.push(format!("afrolink-persist-{label}-{unique}"));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn key(seed: u8) -> SecretKey {
+        SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn chain_id() -> ChainId {
+        ChainId::new("afrolink-persist").unwrap()
+    }
+
+    /// Genesis, plus two empty blocks on top of it, each with its own state.
+    /// One committed height: the block, its certificate, its receipts, and the
+    /// state it produced.
+    type Committed = (Block, Commit, Vec<TxReceipt>, MemoryStore);
+
+    fn two_heights() -> (Genesis, Vec<Committed>) {
+        let validators = ValidatorSet::new(vec![Validator::new(
+            key(1).public_key(),
+            1,
+            CountryCode::new("ke").unwrap(),
+        )])
+        .unwrap();
+        let genesis = Genesis {
+            chain_id: chain_id(),
+            genesis_time: Timestamp::from_millis(1_700_000_000_000),
+            validators: validators.clone(),
+            issuers: Vec::new(),
+            attestors: Vec::new(),
+            council: afrolink_executor::Council::devnet(Address::from_public_key(
+                &key(50).public_key(),
+            )),
+            params: afrolink_executor::ChainParams::devnet(),
+            allocations: vec![Allocation {
+                address: Address::from_public_key(&key(50).public_key()),
+                denom: Denom::native(),
+                amount: Amount::from_afri(10),
+            }],
+        };
+        let mut state = MemoryStore::new();
+        let mut parent = genesis.apply(&mut state, GenesisLimits::devnet()).unwrap();
+
+        let executor = Executor::new(chain_id());
+        let mut blocks = Vec::new();
+        for _ in 0..2 {
+            let height = parent.header.height.next();
+            // A real transfer in each block, so the two states have *different*
+            // roots. With empty blocks they do not, and this fixture would let
+            // the ordering test pass whether or not the guard exists — which is
+            // how it was first written, and why it was rewritten.
+            let payment = TxBody {
+                chain_id: chain_id(),
+                sender: Address::from_public_key(&key(50).public_key()),
+                nonce: height.0.saturating_sub(1),
+                valid_until: Height(1_000),
+                fee: Fee::new(Amount::from_units(1_000), Denom::native()),
+                messages: vec![Message::Transfer {
+                    to: Address::from_public_key(&key(60).public_key()),
+                    denom: Denom::native(),
+                    amount: Amount::from_afri(1),
+                    reference: None,
+                }],
+                memo: String::new(),
+            }
+            .sign(&key(50));
+            let (block, outcome) = executor.build_block(
+                &mut state,
+                height,
+                Timestamp::from_millis(
+                    1_700_000_000_000u64.saturating_add(height.0.saturating_mul(1_000)),
+                ),
+                parent.header.id(),
+                vec![payment],
+                ValidatorSets::unchanged(&validators),
+            );
+            let block_id = block.header.id();
+            let signatures = vec![
+                Vote {
+                    chain_id: chain_id(),
+                    height,
+                    round: Round::ZERO,
+                    vote_type: VoteType::Precommit,
+                    block_id: Some(block_id),
+                    validator: Address::from_public_key(&key(1).public_key()),
+                }
+                .sign(&key(1)),
+            ];
+            let commit = Commit::new(height, Round::ZERO, block_id, signatures);
+            parent = block.clone();
+            let receipts: Vec<TxReceipt> =
+                outcome.outcomes.iter().map(|o| o.receipt.clone()).collect();
+            blocks.push((block, commit, receipts, state.clone()));
+        }
+        (genesis, blocks)
+    }
+
+    #[test]
+    fn a_later_state_is_never_replaced_by_an_earlier_one() {
+        // **The race this guard exists for.** A block reaches this sink from two
+        // threads — the consensus driver when this node decides a height, and
+        // the sync path when it learns one from a peer. Both capture their state
+        // under the node lock and then *release it* before writing, because
+        // holding it across a disk write would put every socket behind
+        // consensus. So the window between "capture the state at height H" and
+        // "publish it" is unguarded, and two commits can reach the publish step
+        // out of order.
+        //
+        // Modelled here by replaying height 1's commit after height 2's, which
+        // is exactly what a late-scheduled thread does. The durable store does
+        // not mind — content-addressed nodes converge in any order, and the
+        // write is idempotent — but the published view is what queries read.
+        //
+        // Without the guard a wallet asks for its balance twice and gets the
+        // newer answer first and the older one second: money appearing to go
+        // backwards on a node behaving perfectly otherwise. Found by a sustained
+        // load test rather than by reasoning — 1 000 payments, every receipt
+        // `Success`, and the queried balance short by a quarter.
+        let dir = TempDir::new("ordering");
+        let store = Arc::new(ChainStore::open(dir.0.join("chain.redb")).unwrap());
+        let (genesis, blocks) = two_heights();
+        store.put_genesis(&genesis).unwrap();
+
+        let published = Arc::new(Mutex::new(MemoryStore::new()));
+        let sink = Persist::new(
+            Arc::clone(&store),
+            Arc::clone(&published),
+            Arc::new(Mutex::new(None)),
+        );
+
+        let (block1, commit1, receipts1, state1) = &blocks[0];
+        let (block2, commit2, receipts2, state2) = &blocks[1];
+        assert_ne!(
+            state1.root(),
+            state2.root(),
+            "the fixture must actually change state between heights, or this \
+             test cannot tell a stale publish from a fresh one"
+        );
+
+        sink.committed(block1, commit1, receipts1, state1);
+        sink.committed(block2, commit2, receipts2, state2);
+        assert_eq!(published.lock().unwrap().root(), state2.root());
+
+        // Height 1's publish, arriving late.
+        sink.committed(block1, commit1, receipts1, state1);
+        assert_eq!(
+            published.lock().unwrap().root(),
+            state2.root(),
+            "an older state overwrote a newer one: a query would go backwards"
+        );
+
+        // And both blocks are still durable, because the store never had the
+        // problem this guard is about.
+        assert!(store.block(Height(1)).unwrap().is_some());
+        assert!(store.block(Height(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_newest_state_is_published_when_blocks_arrive_in_order() {
+        // The ordinary case must not be broken by the guard: a chain that
+        // commits 1 then 2 must end up publishing 2.
+        let dir = TempDir::new("in-order");
+        let store = Arc::new(ChainStore::open(dir.0.join("chain.redb")).unwrap());
+        let (genesis, blocks) = two_heights();
+        store.put_genesis(&genesis).unwrap();
+        let published = Arc::new(Mutex::new(MemoryStore::new()));
+        let sink = Persist::new(
+            Arc::clone(&store),
+            Arc::clone(&published),
+            Arc::new(Mutex::new(None)),
+        );
+
+        for (block, commit, receipts, state) in &blocks {
+            sink.committed(block, commit, receipts, state);
+            assert_eq!(published.lock().unwrap().root(), state.root());
+        }
+    }
+
+    #[test]
+    fn a_balance_is_readable_from_the_published_state() {
+        // The guard must not stop the published state being *usable*: a query
+        // answered from it has to find the account genesis funded.
+        let dir = TempDir::new("readable");
+        let store = Arc::new(ChainStore::open(dir.0.join("chain.redb")).unwrap());
+        let (genesis, blocks) = two_heights();
+        store.put_genesis(&genesis).unwrap();
+        let published = Arc::new(Mutex::new(MemoryStore::new()));
+        let failed = Arc::new(Mutex::new(None));
+        let sink = Persist::new(store, Arc::clone(&published), Arc::clone(&failed));
+        let (block, commit, receipts, state) = &blocks[0];
+        sink.committed(block, commit, receipts, state);
+        assert!(
+            failed.lock().unwrap().is_none(),
+            "the sink refused the block: {:?}",
+            failed.lock().unwrap()
+        );
+        assert_eq!(published.lock().unwrap().root(), state.root());
+
+        let who = Address::from_public_key(&key(50).public_key());
+        let raw = published
+            .lock()
+            .unwrap()
+            .get(&StoreKey::balance(&who, &Denom::native()))
+            .expect("genesis funded this account");
+        let amount = afrolink_primitives::codec::decode_exact::<Amount>(raw.as_slice()).unwrap();
+        // Genesis funded ten, and the block this fixture builds spends one plus
+        // the fee. Stated as the arithmetic rather than as a constant, so the
+        // number cannot drift away from what the fixture actually does.
+        assert_eq!(
+            amount.units(),
+            Amount::from_afri(10).units() - Amount::from_afri(1).units() - 1_000,
+        );
     }
 }

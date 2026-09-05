@@ -29,7 +29,7 @@ use afrolink_crypto::hash::Hash32;
 use afrolink_primitives::codec::{CodecError, Decode, Encode, Reader, decode_exact};
 use std::collections::BTreeMap;
 
-use crate::smt::{EMPTY, SparseMerkleTree, key_hash, leaf_hash, node_hash};
+use crate::smt::{EMPTY, NodeKind, NodeRef, SparseMerkleTree, key_hash, leaf_hash, node_hash};
 
 /// A materialised node of the state tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,51 +193,50 @@ pub struct WriteStats {
 ///
 /// Nodes already present are skipped, so only genuinely new nodes are written.
 pub fn commit_tree<S: NodeSink>(tree: &SparseMerkleTree, sink: &mut S) -> (Hash32, WriteStats) {
-    let entries: Vec<(Hash32, Vec<u8>)> = tree.entries().map(|(k, v)| (k, v.clone())).collect();
     let mut stats = WriteStats {
         visited: 0,
         written: 0,
     };
-    let root = write_subtree(&entries, 0, sink, &mut stats);
+    let root = match tree.root_node() {
+        Some(node) => write_node(node, sink, &mut stats),
+        None => EMPTY,
+    };
     (root, stats)
 }
 
-fn write_subtree<S: NodeSink>(
-    items: &[(Hash32, Vec<u8>)],
-    depth: usize,
-    sink: &mut S,
-    stats: &mut WriteStats,
-) -> Hash32 {
-    match items {
-        [] => EMPTY,
-        [(k, v)] => {
-            let node = Node::Leaf {
-                key_hash: *k,
-                value: v.clone(),
-            };
-            store(node, sink, stats)
-        }
-        _ => {
-            if depth >= 256 {
-                return EMPTY;
-            }
-            let split = items.partition_point(|(k, _)| !k.bit(depth));
-            let (left_items, right_items) = items.split_at(split);
-            let next = depth.saturating_add(1);
-            let left = write_subtree(left_items, next, sink, stats);
-            let right = write_subtree(right_items, next, sink, stats);
-            store(Node::Internal { left, right }, sink, stats)
-        }
-    }
-}
-
-fn store<S: NodeSink>(node: Node, sink: &mut S, stats: &mut WriteStats) -> Hash32 {
+/// Write a node and everything new beneath it.
+///
+/// # Why this may stop early
+///
+/// Nodes are addressed by their own hash, so a hash the sink already holds names
+/// a subtree the sink already holds *in full*: nothing beneath it could have
+/// changed without changing that hash. Returning there is what makes a commit
+/// cost `O(changed · log n)` rather than `O(n)`.
+///
+/// That was always true of the *writes* — `has_node` skipped them. It was not
+/// true of the **work**, because the previous implementation computed every hash
+/// bottom-up from a flat list of entries and so had to visit all of them before
+/// it could know what to skip. The tree caches its hashes now, so the check
+/// happens on the way *down* and the saving is real rather than only in the
+/// write count.
+fn write_node<S: NodeSink>(node: NodeRef<'_>, sink: &mut S, stats: &mut WriteStats) -> Hash32 {
     let hash = node.hash();
     stats.visited = stats.visited.saturating_add(1);
-    if !sink.has_node(hash) {
-        sink.put_node(hash, &node);
-        stats.written = stats.written.saturating_add(1);
+    if sink.has_node(hash) {
+        return hash;
     }
+    let materialised = match node.kind() {
+        NodeKind::Leaf { key_hash, value } => Node::Leaf {
+            key_hash,
+            value: value.to_vec(),
+        },
+        NodeKind::Internal { left, right } => Node::Internal {
+            left: left.map_or(EMPTY, |child| write_node(child, sink, stats)),
+            right: right.map_or(EMPTY, |child| write_node(child, sink, stats)),
+        },
+    };
+    sink.put_node(hash, &materialised);
+    stats.written = stats.written.saturating_add(1);
     hash
 }
 
