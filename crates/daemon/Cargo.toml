@@ -34,6 +34,9 @@ ctrlc = { version = "3.5", features = ["termination"] }
 
 [dev-dependencies]
 afrolink-types.workspace = true
+# The cluster harness verifies a served balance the way a phone does, so it
+# needs the client a phone runs rather than a reimplementation of it.
+afrolink-light.workspace = true
 
 [lints]
 workspace = true

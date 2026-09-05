@@ -32,11 +32,9 @@
 //! * **A second signal is obeyed at once.** An operator who asks twice wants out
 //!   now, and a daemon that refuses is a daemon that teaches people `kill -9`.
 //!
-//! # Why signals are sent by `kill(1)`
-//!
-//! The workspace forbids `unsafe`, and every Rust way to send a signal to
-//! another process goes through `libc`. Shelling out to `kill` costs a process
-//! and buys the rule staying absolute.
+//! The machinery for spawning and signalling the binary lives in
+//! `tests/binary/mod.rs`, shared with the query tests — two copies of it would
+//! drift into two different binaries under test, which is §16.1 again.
 
 #![cfg(unix)]
 #![allow(
@@ -46,9 +44,12 @@
     reason = "tests assert on known-good fixtures; a panic there is a failed test, not a halted node"
 )]
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "binary/mod.rs"]
+mod binary;
+
+use binary::{TempDir, log_of, prepared, signal, start, wait_for_exit, wait_for_log};
 
 /// How long to wait for the node to produce blocks before signalling it.
 const RUNNING: Duration = Duration::from_secs(20);
@@ -57,118 +58,10 @@ const RUNNING: Duration = Duration::from_secs(20);
 /// holds us to.
 const STOP_WITHIN: Duration = Duration::from_secs(8);
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let mut path = std::env::temp_dir();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        path.push(format!("afrolink-shutdown-{label}-{unique}"));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        drop(std::fs::remove_dir_all(&self.0));
-    }
-}
-
-/// The binary as an operator would run it, not a library call that resembles it.
-fn afrolinkd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_afrolinkd"))
-}
-
-/// A node with keys, a genesis and a config, on ports nothing else is using.
-fn prepared(dir: &Path, label: &str, p2p: u16, rpc: u16) {
-    let status = afrolinkd()
-        .args(["init", "--dir"])
-        .arg(dir)
-        .args(["--chain-id", "afrolink-shutdown", "--moniker", label])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("afrolinkd init runs");
-    assert!(status.success(), "init failed");
-
-    let path = dir.join("config");
-    let text = std::fs::read_to_string(&path).unwrap();
-    let rewritten: String = text
-        .lines()
-        .map(|line| {
-            if line.starts_with("p2p_listen") {
-                format!("p2p_listen = 127.0.0.1:{p2p}")
-            } else if line.starts_with("rpc_listen") {
-                format!("rpc_listen = 127.0.0.1:{rpc}")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&path, rewritten).unwrap();
-}
-
-/// Start the node, with its log going to a file we can read back.
-fn start(dir: &Path) -> (Child, PathBuf) {
-    let log = dir.join("node.log");
-    let handle = std::fs::File::create(&log).unwrap();
-    let child = afrolinkd()
-        .args(["start", "--dir"])
-        .arg(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(handle))
-        .spawn()
-        .expect("afrolinkd start runs");
-    (child, log)
-}
-
-fn log_of(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
-/// Wait for something to appear in the log, so the test never races the node.
-fn wait_for_log(path: &Path, needle: &str, patience: Duration) -> bool {
-    let deadline = Instant::now().checked_add(patience);
-    while deadline.is_some_and(|at| Instant::now() < at) {
-        if log_of(path).contains(needle) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
-fn signal(child: &Child, name: &str) {
-    let status = Command::new("kill")
-        .arg(format!("-{name}"))
-        .arg(child.id().to_string())
-        .status()
-        .expect("kill runs");
-    assert!(status.success(), "could not send SIG{name}");
-}
-
-/// Wait for the process to exit, returning whether it did in time.
-fn wait_for_exit(child: &mut Child, patience: Duration) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now().checked_add(patience);
-    while deadline.is_some_and(|at| Instant::now() < at) {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
 /// Start a node, let it commit, signal it, and say what happened.
 fn stopped_by(label: &str, name: &str, p2p: u16, rpc: u16) -> (std::process::ExitStatus, String) {
-    let dir = TempDir::new(label);
-    prepared(&dir.0, label, p2p, rpc);
+    let dir = TempDir::new(&format!("shutdown-{label}"));
+    prepared(&dir.0, "afrolink-shutdown", label, p2p, rpc);
     let (mut child, log) = start(&dir.0);
 
     // Signal a node that is *doing something*. A node killed before it began has
@@ -225,8 +118,8 @@ fn a_second_signal_stops_the_node_at_once() {
     // An operator who asks twice wants out now. A daemon that refuses is a daemon
     // that teaches people to reach for `kill -9`, which is how the clean-stop
     // path stops being taken at all.
-    let dir = TempDir::new("twice");
-    prepared(&dir.0, "twice", 29676, 29677);
+    let dir = TempDir::new("shutdown-twice");
+    prepared(&dir.0, "afrolink-shutdown", "twice", 29676, 29677);
     let (mut child, log) = start(&dir.0);
     assert!(
         wait_for_log(&log, "height 2", RUNNING),
@@ -248,8 +141,8 @@ fn a_stopped_node_leaves_a_store_it_can_resume_from() {
     // What the clean stop is *for*. Asserting the log alone would pass against a
     // shutdown that printed the right words and flushed nothing, so this restarts
     // the node and makes it say where it came back from.
-    let dir = TempDir::new("resume");
-    prepared(&dir.0, "resume", 29686, 29687);
+    let dir = TempDir::new("shutdown-resume");
+    prepared(&dir.0, "afrolink-shutdown", "resume", 29686, 29687);
     let (mut child, log) = start(&dir.0);
     assert!(
         wait_for_log(&log, "height 3", RUNNING),

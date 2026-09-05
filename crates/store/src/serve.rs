@@ -80,8 +80,13 @@ impl ChainView for ServedChain<'_> {
         }))
     }
 
-    fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError> {
-        Ok(self.state.get_with_proof(key))
+    fn prove(&self, key: &StoreKey) -> Result<(Height, Option<Vec<u8>>, Proof), QueryError> {
+        // A `ServedChain` is built around the state at its store's tip — that is
+        // what the borrow means — so the two cannot drift apart within one view.
+        // A server whose published state lags its block store must not use this
+        // impl for proofs; see `LiveChain` in the daemon, which does not.
+        let (value, proof) = self.state.get_with_proof(key);
+        Ok((self.store.height().map_err(|e| backend(&e))?, value, proof))
     }
 
     fn block(&self, height: Height) -> Result<Option<Block>, QueryError> {

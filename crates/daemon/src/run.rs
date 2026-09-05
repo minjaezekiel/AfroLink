@@ -48,7 +48,7 @@ use afrolink_p2p::transport::Transport;
 use afrolink_primitives::codec::{Encode, decode_exact};
 use afrolink_store::ChainStore;
 
-use crate::chain::{Blocks, LiveChain, Persist};
+use crate::chain::{Blocks, LiveChain, Persist, Published};
 use crate::config::Config;
 use crate::driver::{Beat, Driver, StopWatchdog, Timings};
 use crate::identity;
@@ -210,7 +210,10 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
     let shared = Arc::new(SharedNode::new(node));
 
     // -- what queries read, and what a failed write does --------------------
-    let published = Arc::new(Mutex::new(state));
+    // The height travels with the state. A resumed node starts answering at the
+    // height it resumed from, not at zero and not at whatever the block store
+    // happens to hold — see `Published`.
+    let published = Arc::new(Mutex::new(Published::new(tip.header.height, state)));
     let halted: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sink = Arc::new(Persist::new(
         Arc::clone(&store),

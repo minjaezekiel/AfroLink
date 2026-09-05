@@ -561,13 +561,13 @@ The general point is the one §15 was written for. A harness earns trust by bein
 
 # 16. The class itself: correct code that nothing reaches
 
-Seven times now, this workspace has held code that was written, reviewed and
+Eight times now, this workspace has held code that was written, reviewed and
 tested, and that no caller ever executed: the address book that recorded
 undialable peers, the frame limit that made a legal block unsendable, the node
 that did not count its own vote, the persistence orphaned by moving that vote,
 the equivocation evidence that was built and dropped, the signal handler that
-took the wrong signal — and, in the harness itself, a dropped halt flag and a
-missing re-dial. Every one was found by **running the artefact**, never by
+took the wrong signal, the staged blocks with no caller to release them — and,
+in the harness itself, a dropped halt flag and a missing re-dial. Every one was found by **running the artefact**, never by
 adding another test of the kind that already existed.
 
 Fixing them one at a time is not a strategy. This is the pass that goes after
@@ -721,40 +721,99 @@ exact height from that exact peer is forgiven, once. The rule that a peer must
 not get to choose which heights this node holds in memory is untouched — the two
 tests stating it still pass, and both fixes were verified by reverting them.
 
-# 18. A node's published state can lag the block it has committed — **open**
+# 18. A wallet was handed proofs it could not verify — **fixed**
 
-Found by the load test in the same pass, and **separate** from the ordering guard
-in `Persist` (which is fixed, and which reverting does not make this go away).
+Recorded originally as "the published state lags the store", which was the
+symptom seen from the outside and *not* what was wrong. Chasing it properly
+found something worse, and the gap between the two is the lesson.
 
-**What happens.** After the chain settles, a node's durable store holds block N
-and its state root, while the `published` state the query server answers from is
-still at N−1. Observed on all four nodes at once, with `halted=None`, so no write
-failed:
+## What was actually observed
 
+After a load run, a node's durable store held block N and its state root while
+the `published` state — the one the query server answers from — was still at
+N-1. On all four nodes at once, `halted=None`, nothing failed. The write for
+block N had plainly happened; the sink appeared never to have been called for it.
+
+## Why that was not a stall
+
+It was a **window**, not a stuck state, and the settle condition was standing
+inside it. `Persist::committed` does three things in order: write the block,
+write the state, publish. `quiesce` waited for `stored_height() == tip()` — the
+*first* of the three — so it was guaranteed to be satisfiable while a node's
+query view was still a block behind. The harness was reporting a transient as a
+permanent one.
+
+That is [§15a](#15a-the-harness-was-less-capable-than-the-daemon-twice) pointing
+the other way. A harness less capable than production invents defects; a harness
+that **settles on something weaker than what a user waits for** invents a
+different one — it reports a race as a hang.
+
+The sink now records each commit on **entry** and updates it as it advances
+(`entered` → `stored` → `published`), because "the call never came" and "the call
+is still running" look identical from outside and have nothing in common as
+causes. And `quiesce` settles on publication.
+
+## What the window was actually doing to wallets
+
+This is the part that matters, and it is not staleness.
+
+```rust
+let height = view.tip_height()?;        // the block store
+let (value, proof) = view.prove(&key)?; // the published state
+Ok(Response::Value(ProvedValue::new(height, value, proof)))
 ```
-node 1: node-state e2da9c6b published e65077bc stored-tip e2da9c6b h=13 stored=13 halted=None
-sink saw [1:… 12:got=e65077bc want=e65077bc]     <- and never height 13
-```
 
-Every entry the sink recorded matches its block's `app_hash` exactly, so nothing
-is corrupt: block 13 simply never reached `Persist::committed`, while its
-`put_block` plainly did. That combination is not yet explained.
+`answer()` took the height from one place and the proof from another. Inside the
+window a wallet was handed a proof of the state at N-1, **labelled N**, and
+pointed at the header for N — which it cannot possibly satisfy.
 
-**Why it matters.** `published` is what a wallet's balance query is answered
-from. A node in this state serves an answer one block stale, indefinitely, while
-looking healthy from every other angle — its store is correct, its peers agree,
-and it keeps committing.
+The user does not see a stale balance. They see `BadProof`: a node whose answers
+do not verify, indistinguishable from one serving forgeries. `ChainView::prove`'s
+own doc comment already stated the rule — *"two separate calls could straddle a
+commit and produce a value that its own proof rejects"* — and the height was
+exactly such a separate call.
 
-**Why the load test no longer fails on it.** Because it was asking the wrong
-question through the wrong door: "did the ledger move the money" is a question
-about the store, and it was being asked of a cache. It now reads the ledger, and
-`Cluster::published_vs_decided` reports the divergence as its own concern rather
-than as an arithmetic error.
+## The fixes
 
-**Next step.** Record an entry on *entry* to `Persist::committed`, not only after
-both writes, to establish whether the call happens at all for the missing height.
+**The height travels with the proof.** `ChainView::prove` returns
+`(Height, Option<Vec<u8>>, Proof)`, all from one read of one tree. `LiveChain`
+does not delegate this to `ServedChain`, deliberately: a `ServedChain` is built
+around the state at its store's tip, and the daemon's published state is not
+that.
 
----
+**The height travels with the state.** `Published { at, state }` replaces a
+`Mutex<Height>` beside a `Mutex<MemoryStore>` whose consistency was a
+lock-ordering convention written in a doc comment. The never-backwards guard
+moved inside it. A pair of values that must agree, policed by convention, is a
+pair that will eventually disagree; one value cannot.
+
+**State first, block second.** Both orders survive a crash, so correctness does
+not choose between them — what chooses is the window they leave open. The block
+tip is visible to everything and moves the instant `put_block` commits, so
+writing the state first shrinks the interval from a whole state-tree write to a
+lock and a clone.
+
+## How each fix was verified
+
+| Fix | Evidence |
+|---|---|
+| Height travels with the proof | `a_proof_is_labelled_with_the_height_it_was_actually_built_from` — deterministic, sets the window up rather than racing for it. Fails on the old code with *"answered at height 2 but proved against a different state"* |
+| Write order | Measured. `stale_settles` counts moments where every node was durable and level and at least one could still only answer at the previous height: **2 of 3 runs non-zero** before, **0 of 6** after |
+| Both, live | `tests/query.rs` — the real binary, a real socket, a real `LightClient`, verifying against the node's own genesis file. **4 of 4 runs fail** on the old code with `BadProof`; **6 of 6 pass** on the new |
+
+## Two things the first attempt got wrong
+
+**The live test passed against the defect.** An idle chain commits identical
+empty blocks, so the state tree never changes and the window is microseconds
+wide — 1 failure in 16 runs. It only became a real test once it submitted
+payments, which is what widens the window in production too. A load-sensitive
+defect needs a test under load; sampling an idle system proves nothing.
+
+**One of its assertions was wrong, and looked like a finding.** Reading
+`/v1/status` *before* the balance and asserting `proved <= tip` fails whenever a
+block lands between two HTTP requests — three runs in four, with a plausible
+message. The tip is now read afterwards. A test that fails for its own reasons
+is worse than no test: it spends the credibility the real failures need.
 
 # Order of work
 
@@ -775,7 +834,7 @@ both writes, to establish whether the call happens at all for the missing height
 | 11 | Validator set rotation | Largest; a mistake here is a chain split | L | open |
 | 16 | The defect class itself | Seven instances; one loop, a halt in the type, the entry point under test | M | **done** |
 | 17 | Late-joiner sync stall | Staged blocks never drained; honest peers punished | S | **done** |
-| 18 | Published state lags the store | Queries answered one block stale | ? | **open** |
+| 18 | Proofs labelled with the wrong height | A wallet could not verify what it was served | S | **done** |
 
 ---
 

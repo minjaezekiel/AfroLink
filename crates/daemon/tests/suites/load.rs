@@ -106,6 +106,17 @@ fn many_accounts_paying_at_once_all_arrive_and_all_balances_are_exact() {
     // header, which is the property a busy tree could break without breaking
     // agreement.
     cluster.assert_balance_provable(&account(harness::RECIPIENT));
+
+    // **The door people knock on.** Everything above is about the ledger; this
+    // is about what a wallet is told when it asks. The two are separate
+    // questions and were once conflated here, which made a stale cache read as
+    // arithmetic that did not add up — see
+    // [10 §18](../../../../docs/10-network-hardening.md).
+    cluster.assert_answerable();
+    eprintln!(
+        "settled with a stale query view {} time(s) along the way",
+        cluster.stale_settles()
+    );
 }
 
 #[test]
@@ -188,13 +199,15 @@ fn a_thousand_payments_across_four_hundred_accounts() {
         cluster.ledger_balance(&account(harness::RECIPIENT)),
         Amount::from_afri(1).units() * payments as u128
     );
+    cluster.assert_answerable();
     println!(
         "\n{payments} payments over {senders} accounts in {:.1}s ({:.0} tx/s), \
-         final height {:?}, state entries {}\n",
+         final height {:?}, state entries {}, stale query views {}\n",
         elapsed.as_secs_f64(),
         payments as f64 / elapsed.as_secs_f64(),
         cluster.nodes[0].tip(),
-        cluster.state_len()
+        cluster.state_len(),
+        cluster.stale_settles()
     );
 }
 

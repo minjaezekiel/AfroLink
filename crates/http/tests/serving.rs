@@ -678,7 +678,14 @@ fn a_backend_failure_does_not_narrate_the_nodes_filesystem() {
         fn prove(
             &self,
             _key: &afrolink_state::StoreKey,
-        ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
+        ) -> Result<
+            (
+                afrolink_primitives::Height,
+                Option<Vec<u8>>,
+                afrolink_state::Proof,
+            ),
+            afrolink_rpc::QueryError,
+        > {
             Err(afrolink_rpc::QueryError::Backend("disk on fire".into()))
         }
         fn block(
@@ -1024,7 +1031,14 @@ impl afrolink_rpc::ChainView for Unindexed {
     fn prove(
         &self,
         _key: &afrolink_state::StoreKey,
-    ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
+    ) -> Result<
+        (
+            afrolink_primitives::Height,
+            Option<Vec<u8>>,
+            afrolink_state::Proof,
+        ),
+        afrolink_rpc::QueryError,
+    > {
         Err(afrolink_rpc::QueryError::Backend("no state".into()))
     }
     fn block(

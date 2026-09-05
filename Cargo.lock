@@ -62,6 +62,7 @@ dependencies = [
  "afrolink-crypto",
  "afrolink-executor",
  "afrolink-http",
+ "afrolink-light",
  "afrolink-node",
  "afrolink-p2p",
  "afrolink-primitives",

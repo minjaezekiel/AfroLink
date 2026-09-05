@@ -718,8 +718,16 @@ impl afrolink_rpc::ChainView for Fixture {
     fn prove(
         &self,
         key: &afrolink_state::StoreKey,
-    ) -> Result<(Option<Vec<u8>>, afrolink_state::Proof), afrolink_rpc::QueryError> {
-        Ok(self.store.get_with_proof(key))
+    ) -> Result<
+        (
+            afrolink_primitives::Height,
+            Option<Vec<u8>>,
+            afrolink_state::Proof,
+        ),
+        afrolink_rpc::QueryError,
+    > {
+        let (value, proof) = self.store.get_with_proof(key);
+        Ok((self.block.header.height, value, proof))
     }
     fn block(&self, height: Height) -> Result<Option<Block>, afrolink_rpc::QueryError> {
         if height == self.block.header.height {

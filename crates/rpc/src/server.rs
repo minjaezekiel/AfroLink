@@ -40,16 +40,26 @@ pub trait ChainView {
     /// Backend failures only; a pruned or future height is `Ok(None)`.
     fn signed_header(&self, height: Height) -> Result<Option<SignedHeader>, QueryError>;
 
-    /// Read a key from current state and prove the result.
+    /// Read a key from current state and prove the result, saying which height
+    /// that state is.
     ///
-    /// Returns the value *and* its proof together because they must come from
-    /// the same tree. Two separate calls could straddle a commit and produce a
-    /// value that its own proof rejects.
+    /// Returns the height, the value *and* its proof together because all three
+    /// must come from the same tree. Two separate calls could straddle a commit
+    /// and produce a value that its own proof rejects.
+    ///
+    /// **The height is part of that rule, not decoration.** A proof is only
+    /// checkable against the header whose `app_hash` is the root it was built
+    /// from, and a client is told which header to fetch by this number. Taking
+    /// it from anywhere else — the store's block tip, say — hands the client a
+    /// proof and points it at a header the proof cannot satisfy: not a stale
+    /// answer but an unverifiable one, from a node that is behaving correctly.
+    /// That is what [10 §18](../../../docs/10-network-hardening.md) turned out
+    /// to be.
     ///
     /// # Errors
-    /// Backend failures only. An absent key is `Ok((None, proof))` — absence is
-    /// proved, not reported.
-    fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError>;
+    /// Backend failures only. An absent key is `Ok((height, None, proof))` —
+    /// absence is proved, not reported.
+    fn prove(&self, key: &StoreKey) -> Result<(Height, Option<Vec<u8>>, Proof), QueryError>;
 
     /// A whole block, if this node retains it.
     ///
@@ -254,8 +264,12 @@ pub fn answer<V: ChainView + ?Sized>(view: &V, query: &Query) -> Result<Response
             let key = query
                 .store_key()
                 .ok_or_else(|| QueryError::Backend("query has no state key".into()))?;
-            let height = view.tip_height()?;
-            let (value, proof) = view.prove(&key)?;
+            // The height comes back *with* the proof, from the same read of the
+            // same tree. It used to come from `tip_height()`, which is a
+            // question about the block store, while the proof is a question
+            // about the state a node has published — two different things,
+            // read separately, and stamped on each other.
+            let (height, value, proof) = view.prove(&key)?;
             Ok(Response::Value(ProvedValue::new(height, value, proof)))
         }
     }
@@ -373,8 +387,9 @@ mod tests {
             }))
         }
 
-        fn prove(&self, key: &StoreKey) -> Result<(Option<Vec<u8>>, Proof), QueryError> {
-            Ok(self.state.get_with_proof(key))
+        fn prove(&self, key: &StoreKey) -> Result<(Height, Option<Vec<u8>>, Proof), QueryError> {
+            let (value, proof) = self.state.get_with_proof(key);
+            Ok((self.block.header.height, value, proof))
         }
 
         fn block(&self, height: Height) -> Result<Option<Block>, QueryError> {

@@ -45,16 +45,18 @@ use std::time::{Duration, Instant};
 use afrolink_consensus::{CountryCode, Validator, ValidatorSet};
 use afrolink_crypto::hash::Hash32;
 use afrolink_crypto::{Address, SecretKey};
-use afrolink_daemon::chain::{Blocks, Persist};
+use afrolink_daemon::chain::{Blocks, LiveChain, Persist, Published};
 use afrolink_daemon::driver::{Driver, Timings};
 use afrolink_executor::{Allocation, Genesis, GenesisLimits};
+use afrolink_light::LightClient;
 use afrolink_node::{Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
 use afrolink_p2p::transport::Transport;
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
-use afrolink_state::{KeyValueStore, MemoryStore, StoreKey};
+use afrolink_rpc::{ChainView, Query, Response, answer};
+use afrolink_state::{KeyValueStore, StoreKey};
 use afrolink_store::ChainStore;
 use afrolink_types::{Fee, Message, Transaction, TxBody};
 
@@ -194,7 +196,7 @@ pub struct ClusterNode {
         dead_code,
         reason = "kept so the node is assembled exactly as the daemon assembles it"
     )]
-    pub published: Arc<Mutex<MemoryStore>>,
+    pub published: Arc<Mutex<Published>>,
     pub dir: TempDir,
     /// Held so a failure can ask what it was handed.
     pub sink: Arc<Persist>,
@@ -229,7 +231,7 @@ impl ClusterNode {
             &tip,
         );
         let shared = Arc::new(SharedNode::new(node));
-        let published = Arc::new(Mutex::new(state));
+        let published = Arc::new(Mutex::new(Published::new(tip.header.height, state)));
         // Kept, not dropped. `run::drive` treats this as fatal — a node that
         // cannot write its own chain stops rather than voting on a history only
         // it can see. Throwing it away here made the harness *less* capable than
@@ -340,6 +342,11 @@ pub struct Cluster {
     /// Cleared only by [`Cluster::partition`], because a partition that peers
     /// could dial straight through is not a partition.
     autodial: bool,
+    /// How many times `quiesce` saw every node durable and level while at least
+    /// one of them could still only answer queries at the previous height.
+    ///
+    /// A measurement, not an assertion. See [`Self::stale_settles`].
+    stale_settles: usize,
 }
 
 impl Drop for Cluster {
@@ -360,6 +367,7 @@ impl Cluster {
         let mut cluster = Self {
             nodes,
             autodial: true,
+            stale_settles: 0,
         };
         cluster.connect_all();
         cluster
@@ -546,11 +554,36 @@ impl Cluster {
                 );
             }
             let durable = self.nodes.iter().all(|n| n.stored_height() == n.tip());
+            // **Settled means answerable, not merely written.** `stored_height`
+            // moves when `put_block` commits, which is the *first* of the three
+            // things `Persist::committed` does; publication is the last. So a
+            // settle condition that reads only the block tip is guaranteed to be
+            // satisfiable in the window where a node's query view is still a
+            // block behind its own store — and that is precisely the state
+            // [10 §18](../../../docs/10-network-hardening.md) recorded as an
+            // unexplained defect, on four healthy nodes at once.
+            //
+            // This is the §15a lesson pointing the other way. A harness that
+            // settles on something weaker than what a user waits for does not
+            // invent a defect so much as *report a transient as a permanent one*.
+            let answerable = self
+                .nodes
+                .iter()
+                .all(|n| n.sink.published_height() == n.tip());
             let level = self
                 .nodes
                 .first()
                 .is_some_and(|first| self.nodes.iter().all(|n| n.tip() == first.tip()));
-            if durable && level {
+            if durable && level && !answerable {
+                // Counted, not asserted. This is the measurement behind the
+                // write-ordering change in `Persist::committed`: how often the
+                // old settle condition would have declared a node ready while
+                // its query view was a block behind. Reported by
+                // `stale_settles`, and the number is what says whether
+                // reordering the writes actually shrank the window.
+                self.stale_settles = self.stale_settles.saturating_add(1);
+            }
+            if durable && answerable && level {
                 return;
             }
             // `CLUSTER_DEBUG=1` prints the time series rather than only the
@@ -581,11 +614,17 @@ impl Cluster {
             assert!(
                 last_progress.elapsed() <= STALL_WINDOW
                     && ceiling.is_some_and(|at| Instant::now() < at),
-                "the cluster never settled — (node, decided, stored): {:?}\n{}",
+                "the cluster never settled — (node, decided, stored, published): {:?}\n{}\n{}",
                 self.nodes
                     .iter()
-                    .map(|n| (n.seed, n.tip().0, n.stored_height().0))
+                    .map(|n| (
+                        n.seed,
+                        n.tip().0,
+                        n.stored_height().0,
+                        n.sink.published_height().0
+                    ))
                     .collect::<Vec<_>>(),
+                self.published_vs_decided(),
                 self.why_stuck()
             );
         }
@@ -718,6 +757,7 @@ impl Cluster {
         let mut cluster = Self {
             nodes,
             autodial: true,
+            stale_settles: 0,
         };
         cluster.connect_all();
         cluster
@@ -785,6 +825,7 @@ impl Cluster {
             .published
             .lock()
             .unwrap()
+            .state()
             .get(&key)
             .and_then(|raw| afrolink_primitives::codec::decode_exact::<Amount>(raw.as_slice()).ok())
             .unwrap_or(Amount::ZERO)
@@ -798,10 +839,50 @@ impl Cluster {
             .published
             .lock()
             .unwrap()
+            .state()
             .get(&key)
             .and_then(|raw| afrolink_primitives::codec::decode_exact::<Amount>(raw.as_slice()).ok())
             .unwrap_or(Amount::ZERO)
             .units()
+    }
+
+    /// How many times a settled-looking cluster could not yet answer at its tip.
+    ///
+    /// The measurement behind the write ordering in `Persist::committed`. Every
+    /// count is a moment where "all blocks durable, all nodes level" held and a
+    /// wallet querying any of them would still have been given the *previous*
+    /// height's balance.
+    ///
+    /// Not asserted to be zero. The window cannot be closed entirely — a block
+    /// becomes durable and becomes answerable at two different instants, and
+    /// nothing makes a redb transaction and a mutex swap one atomic act. What
+    /// can be done is to make the interval as short as the swap itself, and this
+    /// is how that is checked.
+    #[allow(dead_code, reason = "read by the load suite")]
+    pub const fn stale_settles(&self) -> usize {
+        self.stale_settles
+    }
+
+    /// **What a wallet gets is what the chain decided.**
+    ///
+    /// Distinct from [`Self::assert_agreement`], which compares nodes with each
+    /// other: four nodes can agree perfectly on every block and all four answer
+    /// queries from a state one height stale. Agreement is about the ledger;
+    /// this is about the door people knock on.
+    #[allow(dead_code, reason = "read by the load suite")]
+    pub fn assert_answerable(&self) {
+        for node in &self.nodes {
+            let published = node.published.lock().unwrap().state().root();
+            assert_eq!(
+                published,
+                node.app_hash(),
+                "node {} answers queries from a state its own consensus does not \
+                 hold — a balance served here is one block stale, on a node that \
+                 looks healthy from every other angle\n{}",
+                node.seed,
+                self.published_vs_decided()
+            );
+        }
     }
 
     /// Whether each node's *published* state matches the state it decided.
@@ -814,7 +895,7 @@ impl Cluster {
         self.nodes
             .iter()
             .map(|n| {
-                let published = n.published.lock().unwrap().root();
+                let published = n.published.lock().unwrap().state().root();
                 let decided = n.app_hash();
                 let stored_tip = n
                     .store
@@ -824,13 +905,14 @@ impl Cluster {
                     .map(|h| h.to_hex()[..12].to_owned())
                     .unwrap_or_else(|| "none".to_owned());
                 format!(
-                    "  node {}: node-state {} published {} stored-tip {} h={} stored={} halted={:?} {}",
+                    "  node {}: node-state {} published {} stored-tip {} h={} stored={} published-h={} halted={:?} {}",
                     n.seed,
                     &decided.to_hex()[..12],
                     &published.to_hex()[..12],
                     stored_tip,
                     n.tip().0,
                     n.stored_height().0,
+                    n.sink.published_height().0,
                     n.driver.halted(),
                     if published == decided {
                         String::new()
@@ -877,25 +959,72 @@ impl Cluster {
 
     /// How many entries the state tree holds. A proxy for how hard it is working.
     pub fn state_len(&self) -> usize {
-        self.nodes[0].published.lock().unwrap().len()
+        self.nodes[0].published.lock().unwrap().state().len()
     }
 
-    /// A light client must still be able to prove this balance.
+    /// **The whole customer round trip.** A wallet asks a node for a balance and
+    /// checks the answer against a header it trusts.
     ///
-    /// Load must not break the proof path. A busy tree is a deeper tree, and a
-    /// deeper tree is where an off-by-one in sibling ordering would show — a
-    /// class of bug that leaves agreement intact while making every wallet
-    /// unable to verify what it is told.
+    /// Everything on the path is the real thing: `LiveChain` is the view
+    /// `afrolinkd` serves from, `answer` is the function its HTTP handler calls,
+    /// and `LightClient` is what a phone runs. Nothing here reaches around the
+    /// query layer to read state directly.
+    ///
+    /// It used to. The old version proved the published state against *its own*
+    /// root, which cannot fail for any reason a user would care about — a proof
+    /// checked against the tree it came from is a tautology. The question a
+    /// wallet actually asks is different and harder: **does this proof verify
+    /// against the header at the height the node named?** That is where
+    /// [10 §18](../../../docs/10-network-hardening.md) lived. The node was
+    /// stamping proofs with its block-store tip while building them from its
+    /// published state, so in the window between writing block N and publishing
+    /// it, a wallet was handed an N-1 proof labelled N and pointed at a header
+    /// it could not possibly satisfy.
     pub fn assert_balance_provable(&self, who: &Address) {
+        let node = &self.nodes[0];
         let key = StoreKey::balance(who, &Denom::native());
-        let state = self.nodes[0].published.lock().unwrap();
-        let root = state.root();
-        let proof = state.tree().prove(key.as_bytes());
-        let value = state.get(&key);
-        assert!(
-            proof.verify(root, key.as_bytes(), value.as_deref()),
-            "a balance could not be proved against the state root under load"
+        let view = LiveChain::new(
+            chain(),
+            Arc::clone(&node.store),
+            Arc::clone(&node.published),
         );
+        let query = Query::Balance {
+            address: *who,
+            denom: Denom::native(),
+        };
+        let Response::Value(proved) = answer(&view, &query).expect("the node can answer") else {
+            panic!("a balance query must be answered with a proved value");
+        };
+
+        // The header the node's own answer points the wallet at.
+        let header = view
+            .signed_header(proved.height())
+            .expect("the store is readable")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the node proved a balance at height {} and does not hold that header\n{}",
+                    proved.height().0,
+                    self.published_vs_decided()
+                )
+            });
+
+        let client = LightClient::from_checkpoint(
+            chain(),
+            header.header.clone(),
+            validators(self.nodes.len() as u8),
+            validators(self.nodes.len() as u8),
+        )
+        .expect("the checkpoint matches its header");
+
+        proved.verify(&client, &key).unwrap_or_else(|e| {
+            panic!(
+                "a wallet could not verify the balance this node served: {e:?}\n  \
+                 answered at height {}, whose header claims state {}\n{}",
+                proved.height().0,
+                &header.header.app_hash.to_hex()[..12],
+                self.published_vs_decided()
+            )
+        });
     }
 }
 
