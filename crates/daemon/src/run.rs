@@ -44,7 +44,7 @@ use afrolink_node::{Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::PeerId;
-use afrolink_p2p::transport::Transport;
+use afrolink_p2p::transport::{Binding, Transport};
 use afrolink_primitives::codec::{Encode, decode_exact};
 use afrolink_store::ChainStore;
 
@@ -259,7 +259,7 @@ pub fn start(config: &Config, stop: &Arc<AtomicBool>) -> Result<(), RunError> {
         node_key,
         Arc::clone(&shared),
         manager,
-        config.p2p_listen,
+        Binding::advertising(config.p2p_listen, config.advertise),
         Arc::new(Blocks(Arc::clone(&store))),
         sink,
     )

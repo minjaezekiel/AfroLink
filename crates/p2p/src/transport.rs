@@ -167,6 +167,10 @@ struct Shared {
     /// When peer housekeeping last ran, so rate limits are denominated in real
     /// time rather than in however often the caller happens to call.
     last_tick: Mutex<std::time::Instant>,
+    /// Where this node tells peers it can be dialled, if anywhere.
+    ///
+    /// See [`Transport::start`] for how it is chosen and why it is optional.
+    advertise: Option<SocketAddr>,
 }
 
 impl Shared {
@@ -425,6 +429,42 @@ impl Handle {
     }
 }
 
+/// Where a node listens, and where it tells peers to find it.
+///
+/// One value rather than two parameters because the second only makes sense
+/// against the first: "advertise nothing" and "advertise something other than
+/// what I bound" are both answers to a question the bind address raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    /// The socket to bind.
+    pub listen: SocketAddr,
+    /// What to tell peers, if that differs from the bound address.
+    ///
+    /// `None` means "work it out": the bound address if it names one
+    /// interface, and nothing at all if it does not. See [`Binding::of`].
+    pub advertise: Option<SocketAddr>,
+}
+
+impl Binding {
+    /// Listen here, and let the node work out what to advertise.
+    #[must_use]
+    pub const fn of(listen: SocketAddr) -> Self {
+        Self {
+            listen,
+            advertise: None,
+        }
+    }
+
+    /// Listen here, and tell peers to use `advertise` instead.
+    ///
+    /// For a node behind NAT, a load balancer or a port mapping — the cases
+    /// where no amount of inspecting the socket finds the right answer.
+    #[must_use]
+    pub const fn advertising(listen: SocketAddr, advertise: Option<SocketAddr>) -> Self {
+        Self { listen, advertise }
+    }
+}
+
 impl Transport {
     /// Bind a listener and start accepting peers.
     ///
@@ -435,12 +475,29 @@ impl Transport {
         key: afrolink_crypto::SecretKey,
         node: Arc<SharedNode>,
         mut manager: Manager,
-        listen: SocketAddr,
+        binding: Binding,
         blocks: Arc<dyn BlockSource>,
         sink: Arc<dyn CommitSink>,
     ) -> Result<Self, TransportError> {
+        let Binding { listen, advertise } = binding;
         let listener = TcpListener::bind(listen)?;
         let local = listener.local_addr()?;
+        // What this node tells peers about itself, in order of authority:
+        //
+        // 1. What the operator configured. A node behind NAT or a load balancer
+        //    is the only one who knows its own public address, and no amount of
+        //    inspecting the socket will find it.
+        // 2. Otherwise the bound address, which is right for a node listening on
+        //    one concrete interface and for every devnet.
+        // 3. Nothing, if that address is unspecified — `0.0.0.0` means "every
+        //    interface" to a listener and nothing to a dialler, and advertising
+        //    it would put an unreachable entry in every peer's book.
+        //
+        // CometBFT's `external_address` and Bitcoin's `-externalip` are the same
+        // knob for the same reason.
+        let advertise = advertise
+            .or(Some(local))
+            .filter(|a| !a.ip().is_unspecified());
         let ours = PeerId::new(key.public_key());
         // The manager's idea of where the chain is comes from the node, once,
         // here — and is corrected after every commit. A manager that started at
@@ -463,6 +520,7 @@ impl Transport {
             sink,
             synced: AtomicU64::new(0),
             last_tick: Mutex::new(std::time::Instant::now()),
+            advertise,
         });
 
         let accepting = Arc::clone(&shared);
@@ -562,6 +620,19 @@ impl Transport {
             .lock()
             .map(|m| m.anchors())
             .unwrap_or_default()
+    }
+
+    /// Where this node believes `peer` can be reached.
+    ///
+    /// See [`Manager::learned`]. An inbound peer appears here only because it
+    /// advertised itself in the handshake, which is the whole of §7.
+    #[must_use]
+    pub fn learned(&self, peer: &PeerId) -> Option<PeerAddr> {
+        self.shared
+            .manager
+            .lock()
+            .ok()
+            .and_then(|m| m.learned(peer))
     }
 
     /// Drop every peer, keeping the listener open.
@@ -693,7 +764,8 @@ fn establish(
 
     let mut hs_reader = stream.try_clone()?;
     let mut hs_writer = stream.try_clone()?;
-    let (peer, session) = shake(shared, &mut hs_reader, &mut hs_writer, expected.as_ref())?;
+    let (peer, claimed, session) =
+        shake(shared, &mut hs_reader, &mut hs_writer, expected.as_ref())?;
 
     // Where the peer says it is, if we dialled; otherwise where the socket says
     // it came from. A peer's own claim about its listening address is never
@@ -718,6 +790,24 @@ fn establish(
     // listener thread on the first eviction — which is to say, the first time an
     // attacker filled the inbound slots.
     shared.apply(consequences);
+
+    // **Only now, and only for an inbound peer.** A peer that dialled us told us
+    // where it listens; the socket it arrived on cannot say, because an inbound
+    // connection carries an ephemeral source port that dials nothing. Recording
+    // the claim is what lets the topology grow past whoever ran the seeds — and
+    // it is recorded as a *claim*: the address book puts it in `new`, and only a
+    // dial this node chose to make and completed can promote it to `tried`.
+    //
+    // Nothing is recorded for an outbound peer: we already have its real
+    // address, and it is already promoted by `on_outbound`. Taking a claim there
+    // too would let a peer overwrite the address we successfully reached with
+    // one we have not.
+    if !outbound
+        && let Some(claimed) = claimed
+        && let Ok(mut manager) = shared.manager.lock()
+    {
+        manager.advertised(peer, claimed, addr.group());
+    }
 
     let (tx, rx) = sync_channel::<PeerMessage>(OUTBOX_DEPTH);
     if let Ok(mut outboxes) = shared.outboxes.lock() {
@@ -754,7 +844,7 @@ fn shake(
     reader: &mut TcpStream,
     writer: &mut TcpStream,
     expected: Option<&PeerAddr>,
-) -> Result<(PeerId, Session), TransportError> {
+) -> Result<(PeerId, Option<SocketAddr>, Session), TransportError> {
     use std::io::{Read, Write};
 
     let (handshake, hello) = Handshake::start(shared.chain_id.clone())?;
@@ -763,7 +853,7 @@ fn shake(
 
     let mut theirs = [0u8; crate::handshake::HELLO_LEN];
     reader.read_exact(&mut theirs)?;
-    let pending = handshake.respond(&theirs, &shared.key)?;
+    let pending = handshake.respond(&theirs, &shared.key, shared.advertise)?;
 
     // The identity frame is length-prefixed like any other, so the same bound
     // applies: a peer cannot announce a gigabyte of authentication.
@@ -787,7 +877,7 @@ fn shake(
     reader.read_exact(&mut their_frame)?;
 
     let established = pending.finish(&their_frame, &shared.ours, expected.map(|a| &a.id))?;
-    Ok((established.peer, established.session))
+    Ok((established.peer, established.listen, established.session))
 }
 
 /// The socket's own view of where the peer is.

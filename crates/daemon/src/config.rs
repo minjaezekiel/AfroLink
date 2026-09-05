@@ -85,6 +85,31 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Where peers connect.
     pub p2p_listen: SocketAddr,
+    /// Where peers should be told to connect, if that differs from
+    /// [`Self::p2p_listen`].
+    ///
+    /// # Why a node cannot work this out for itself
+    ///
+    /// A node advertises its listening address in the handshake so that the
+    /// network can learn about it at all — without it, a node is dialable only
+    /// by whoever already dialled it, and the topology stays anchored on
+    /// whoever ran the seeds.
+    ///
+    /// The bound address is the right answer for a node on one concrete
+    /// interface. It is the wrong answer twice over for a node behind NAT, a
+    /// load balancer or a port mapping, and it is *no* answer for the default
+    /// `0.0.0.0`, which means "every interface" to a listener and nothing to a
+    /// dialler. In all three cases the operator is the only party that knows,
+    /// so this is where they say.
+    ///
+    /// Left unset, the node advertises its bound address when that address is
+    /// concrete and advertises nothing when it is not. Advertising nothing is a
+    /// working state, not a broken one: the node dials out and is simply never
+    /// dialled.
+    ///
+    /// CometBFT's `external_address` and Bitcoin's `-externalip` are the same
+    /// knob for the same reason.
+    pub advertise: Option<SocketAddr>,
     /// Where clients query, or `None` to serve no queries at all.
     ///
     /// Optional because a validator has no business exposing a public read
@@ -120,6 +145,9 @@ impl Default for Config {
             p2p_listen: "0.0.0.0:26656"
                 .parse()
                 .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 26656))),
+            // Unset: the node advertises its bound address if that address names
+            // one interface, and otherwise says nothing at all.
+            advertise: None,
             // Loopback for queries: exposing it is a decision, not a default.
             rpc_listen: Some(
                 "127.0.0.1:26657"
@@ -196,6 +224,16 @@ impl Config {
             "data_dir" => self.data_dir = PathBuf::from(value),
             "p2p_listen" => {
                 self.p2p_listen = value.parse().map_err(|_| bad("not a host:port address"))?;
+            }
+            "advertise" => {
+                // "auto" rather than an empty value, matching `rpc_listen`'s
+                // "off": what a node tells the network about itself should be
+                // written down, not left blank.
+                self.advertise = if value.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value.parse().map_err(|_| bad("not a host:port address"))?)
+                };
             }
             "rpc_listen" => {
                 // "off" rather than an empty value, so switching the query server
@@ -371,6 +409,15 @@ pub fn template(config: &Config) -> String {
          # star with somebody else at the centre.\n\
          p2p_listen = {p2p}\n\
          \n\
+         # What to tell peers about where they can reach this node. `auto` uses\n\
+         # the address above, which is right for a node on one concrete\n\
+         # interface and wrong for one behind NAT, a load balancer or a port\n\
+         # mapping — and is no answer at all for `0.0.0.0`, which names every\n\
+         # interface to a listener and nothing to a dialler. A node that\n\
+         # advertises nothing dials out and is never dialled, which is a working\n\
+         # state and the right one for a node that does not want to be reached.\n\
+         advertise = {advertise}\n\
+         \n\
          # Where clients query. Loopback by default, `off` to serve nothing —\n\
          # exposing a read endpoint on a machine that signs blocks is a decision,\n\
          # not a default.\n\
@@ -405,6 +452,9 @@ pub fn template(config: &Config) -> String {
         moniker = config.moniker,
         data_dir = config.data_dir.display(),
         p2p = config.p2p_listen,
+        advertise = config
+            .advertise
+            .map_or_else(|| "auto".to_owned(), |a| a.to_string()),
         rpc = rpc,
         seeds = seeds,
         max_outbound = config.max_outbound,

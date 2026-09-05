@@ -185,7 +185,7 @@ fn a_handshake_never_panics_on_a_hostile_hello() {
         // The only requirement is that it returns. A successful exchange with
         // random bytes is possible and fine — the peer still has to sign the
         // transcript with a key it does not have.
-        drop(handshake.respond(&hello, &key(1)));
+        drop(handshake.respond(&hello, &key(1), None));
     }
 }
 
@@ -198,8 +198,8 @@ fn a_hostile_authentication_frame_never_authenticates() {
         let mut rng = Rng::new(seed);
         let (alice, hello_a) = Handshake::start(chain()).unwrap();
         let (mallory, hello_m) = Handshake::start(chain()).unwrap();
-        let alice = alice.respond(&hello_m, &key(1)).unwrap();
-        let mallory = mallory.respond(&hello_a, &key(2)).unwrap();
+        let alice = alice.respond(&hello_m, &key(1), None).unwrap();
+        let mallory = mallory.respond(&hello_a, &key(2), None).unwrap();
 
         let frame = match seed % 3 {
             // Random bytes.

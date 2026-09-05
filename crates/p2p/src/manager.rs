@@ -45,6 +45,7 @@
 //! not persisted — see [`Manager::penalise`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use afrolink_crypto::hash::Hash32;
@@ -743,6 +744,56 @@ impl Manager {
         Ok(out)
     }
 
+    /// Record where an inbound peer **says** it can be dialled.
+    ///
+    /// # Why this exists
+    ///
+    /// Only peers this node dialled enter the address book, which is the fix
+    /// for the inbound-source-port defect and has a consequence nobody had paid
+    /// for: a node's listening address becomes known only if somebody already
+    /// dialled it. Nothing ever said *"I am reachable at X"*, so the set of
+    /// dialable nodes was the seed set plus whatever the seeds gossiped,
+    /// forever. For a chain whose consensus argument rests on geographic
+    /// distribution, a topology permanently anchored on whoever ran the seeds is
+    /// close to self-defeating.
+    ///
+    /// # What is and is not trusted
+    ///
+    /// The claim is signed by the peer's long-term key, so it is theirs. It is
+    /// **not** evidence that anything is listening there.
+    ///
+    /// * It goes into the `new` table, never `tried`. `mark_good` is not called
+    ///   here and must not be: the only way into `tried` stays a dial this node
+    ///   chose to make and completed.
+    /// * It is bucketed by the **observed** source group, not by the claimed
+    ///   one, which is what bounds an attacker to a few buckets however many
+    ///   addresses they claim. Bitcoin buckets `addr` the same way.
+    /// * The book keys entries by [`PeerId`], so a peer can only advertise
+    ///   *itself*. There is no path from here to injecting an address for
+    ///   somebody else, which is the amplification this would otherwise open.
+    ///
+    /// A dishonest claim therefore costs this node one failed dial and costs the
+    /// attacker a completed handshake. A claim about a third party is impossible
+    /// rather than merely expensive.
+    pub fn advertised(&mut self, peer: PeerId, claimed: SocketAddr, source: AddrGroup) {
+        if peer == self.ours || self.is_banned(&peer) {
+            return;
+        }
+        self.book.add(PeerAddr::new(peer, claimed), source);
+    }
+
+    /// Where this node believes `peer` can be reached, if it believes anything.
+    ///
+    /// For operators and tests. "Believes" is the right word: an entry here may
+    /// be an address this node reached itself, or one a peer claimed and nobody
+    /// has checked. [`AddrBook`] keeps the two apart internally, and
+    /// [`AddrBook::sample`] is the place that cares — it gossips only the first
+    /// kind.
+    #[must_use]
+    pub fn learned(&self, peer: &PeerId) -> Option<PeerAddr> {
+        self.book.get(peer).map(|entry| entry.addr)
+    }
+
     /// Forget a peer that has gone away.
     pub fn on_disconnect(&mut self, peer: &PeerId) {
         self.peers.remove(peer);
@@ -1174,6 +1225,122 @@ mod tests {
 
     /// One second per tick, so a rate written "per second" reads as itself.
     const TICK: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn an_advertised_address_is_learned_but_not_trusted() {
+        // **The whole of §7 in one assertion.** A node that only ever dialled
+        // out was in nobody's address book, so the set of dialable nodes was the
+        // seed set forever. Now an inbound peer can say where it listens — and
+        // saying it puts the address in `new`, where a dial can find it, and
+        // nowhere near `tried`, which is what this node gossips to others.
+        let mut m = manager();
+        let caller = addr(1, "203.0.113.9");
+        drop(m.on_inbound(caller).expect("room for one"));
+
+        // Nothing yet: an inbound connection's source port is ephemeral and
+        // dials nothing, so the socket alone teaches this node nothing.
+        assert!(m.book().get(&caller.id).is_none());
+
+        let claimed: SocketAddr = "203.0.113.9:26656".parse().expect("valid");
+        m.advertised(caller.id, claimed, caller.group());
+
+        let entry = m.book().get(&caller.id).expect("the claim was recorded");
+        assert_eq!(entry.addr.addr, claimed);
+        assert!(
+            m.book().tried_addresses().is_empty(),
+            "a claim reached the tried table — this node would now recommend to \
+             everyone an address it has never itself reached"
+        );
+    }
+
+    #[test]
+    fn a_peer_cannot_advertise_an_address_for_somebody_else() {
+        // The amplification this feature would otherwise open, and the reason it
+        // is closed by construction rather than by a check: the address book is
+        // keyed by identity, so a claim can only ever be about the claimant.
+        //
+        // Without this an attacker holding one host could name a victim's
+        // address under a thousand identities and have every node it spoke to
+        // spread them.
+        let mut m = manager();
+        let attacker = addr(1, "203.0.113.9");
+        let victim = addr(2, "198.51.100.4");
+        drop(m.on_inbound(attacker).expect("room"));
+
+        // The attacker connects, and claims the victim's address. It lands
+        // under the *attacker's* identity, because that is the only key the
+        // handshake proved.
+        m.advertised(attacker.id, victim.addr, attacker.group());
+
+        assert!(
+            m.book().get(&victim.id).is_none(),
+            "an entry appeared for an identity that never spoke to this node"
+        );
+        assert_eq!(
+            m.book().get(&attacker.id).map(|e| e.addr.addr),
+            Some(victim.addr),
+            "the claim should be recorded against the claimant and dialled once"
+        );
+    }
+
+    #[test]
+    fn a_banned_peer_cannot_put_itself_back_in_the_book() {
+        // A ban that a peer can undo by reconnecting and announcing itself is
+        // not a ban. The claim is refused while the ban stands.
+        let mut m = manager();
+        let bad = addr(1, "203.0.113.9");
+        drop(m.on_inbound(bad).expect("room"));
+        for _ in 0..6 {
+            drop(m.penalise(bad.id, Misbehaviour::BadBlock));
+        }
+        assert!(m.is_banned(&bad.id), "the fixture must actually ban it");
+
+        m.advertised(bad.id, bad.addr, bad.group());
+        assert!(
+            m.book().get(&bad.id).is_none(),
+            "a banned peer advertised its way back into the address book"
+        );
+    }
+
+    #[test]
+    fn one_source_cannot_fill_the_book_by_claiming_many_subnets() {
+        // Bitcoin's rule, and the reason it is Bitcoin's rule: bucketing a
+        // claim by the subnet it *names* would let one attacker reach every
+        // bucket by naming a different subnet each time. Bucketing by the
+        // subnet it *came from* bounds them to what they can connect from.
+        //
+        // The bound is exact and worth stating as arithmetic rather than as a
+        // vague "not too many": one source group reaches at most
+        // `NEW_BUCKETS_PER_SOURCE` buckets of `BUCKET_SIZE` each, so 256 entries
+        // — a fraction of the 2 048 the new table holds. An attacker offering
+        // ten times that many gets no more.
+        use crate::addrbook::{BUCKET_SIZE, NEW_BUCKETS_PER_SOURCE};
+        let cap = BUCKET_SIZE * NEW_BUCKETS_PER_SOURCE as usize;
+
+        let mut m = manager();
+        let offered = cap * 10;
+        for n in 0..offered as u32 {
+            // One host, many identities, each naming a different /16. Every
+            // claim is well formed and signed; none of them is checkable.
+            let source = addr(n, "203.0.113.9");
+            // A distinct /16 each time — which is what an [`AddrGroup`] is for
+            // a routable IPv4 address, so each claim names a different subnet.
+            // Getting this wrong is easy and quiet: an earlier version varied
+            // only the third octet, produced ten groups instead of thousands,
+            // and passed against bucketing by the claimed subnet.
+            let claimed: SocketAddr = format!("{}.{}.0.4:26656", 11 + n / 256, n % 256)
+                .parse()
+                .expect("valid");
+            m.advertised(source.id, claimed, source.group());
+        }
+        assert!(
+            m.book().len() <= cap,
+            "one source placed {} of {offered} claimed addresses; the bound is \
+             {cap}, and exceeding it means an attacker with a single host owns \
+             the address book",
+            m.book().len()
+        );
+    }
 
     fn ping(n: u64) -> PeerMessage {
         PeerMessage::Ping(n)

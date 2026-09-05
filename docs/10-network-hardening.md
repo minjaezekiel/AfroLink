@@ -328,37 +328,85 @@ multiplexed connection.
 
 **Cost.** Moderate, confined to `transport.rs` and the outbox.
 
-## 7. No address advertisement: the inbound-reachable set never grows
+## 7. No address advertisement: the inbound-reachable set never grows — **done**
 
-**What is wrong.** Only peers this node *dialled* enter the address book — the
-correct fix for the inbound-source-port defect, and it has a consequence nobody
-has paid for yet. A node's listening address becomes known **only** if somebody
-already dialled it. Nothing ever tells the network "I am reachable at X". So the
-set of dialable nodes is the seed set plus whatever those seeds gossip, forever,
-and a node that joins by dialling out is never dialled by anyone.
+**What was wrong.** Only peers this node *dialled* entered the address book — the
+correct fix for the inbound-source-port defect, and it had a consequence nobody
+had paid for. A node's listening address became known **only** if somebody had
+already dialled it. Nothing ever said "I am reachable at X". So the set of
+dialable nodes was the seed set plus whatever those seeds gossiped, forever, and
+a node that joined by dialling out was never dialled by anyone.
 
-For this network that is worse than it sounds: it means the topology is
-permanently anchored on whoever ran the seeds, which for a chain whose whole
-consensus argument is geographic distribution is close to self-defeating.
+For this network that is worse than it sounds: the topology stays permanently
+anchored on whoever ran the seeds, which for a chain whose whole consensus
+argument is geographic distribution is close to self-defeating.
 
 **What the field does.** Bitcoin's `VERSION` message carries the sender's
 `addr_me`, and nodes self-advertise periodically with `ADDR`. The address is
 *claimed*, never trusted — it only ever becomes `tried` after somebody
 successfully dials it.
 
-**What we do.** The handshake already authenticates an identity; extend it to
-carry the peer's **claimed listening address**. That claim goes into the `new`
-table only, never `tried`, and is only promoted once this node has itself dialled
-it successfully. So the rule that closed the original defect is kept intact —
-*an address is only trusted after we have reached it* — while giving the network
-a way to learn about a node at all.
+### What was built
 
-A node that does not want to be dialled (behind NAT, or deliberately private)
-advertises nothing and is simply never in anyone's book, which is the correct
-outcome rather than a broken one.
+The handshake's authentication frame now carries the sender's **claimed
+listening address**, and `PROTOCOL_VERSION` is **2**. The frame is canonically
+encoded, so a version 1 peer's frame does not decode here; the version check in
+`respond` turns that into a stated refusal rather than a mysterious
+`MalformedAuth`.
 
-**Cost.** Moderate: a handshake field, so it is a wire-format change to the
-handshake, and it must be `PROTOCOL_VERSION`-gated.
+Four rules, each with a test that fails without it:
+
+| Rule | Why | Test |
+|---|---|---|
+| A claim enters `new`, never `tried` | `tried` is what this node gossips. An address it has never reached must not be one it recommends | `an_advertised_address_is_learned_but_not_trusted` |
+| A claim is bucketed by the **observed** source group, not the claimed one | Otherwise one host reaches every bucket by naming a different subnet each time. Under that mutation a single source placed **1 934** addresses against a bound of **256** | `one_source_cannot_fill_the_book_by_claiming_many_subnets` |
+| A banned peer's claim is refused | A ban a peer can undo by reconnecting and announcing itself is not a ban | `a_banned_peer_cannot_put_itself_back_in_the_book` |
+| The claim is **signed**, not merely sealed | Sealing binds it to whoever completed the key exchange, which is enough for one connection. Signing binds it to the long-term identity | `the_signature_covers_the_claimed_address` |
+
+**A peer can only advertise itself, and that is structural rather than checked.**
+The address book is keyed by `PeerId`, and the only key the handshake proved is
+the claimant's. So there is no path from here to injecting an address for
+somebody else — the amplification this feature would otherwise have opened is
+closed by the data structure, not by a rule someone has to remember.
+
+### What an operator has to decide
+
+`advertise` in the config, defaulting to `auto`. A node advertises its bound
+address when that address names one interface, and nothing when it does not —
+`0.0.0.0`, the shipped default for `p2p_listen`, means "every interface" to a
+listener and nothing at all to a dialler.
+
+So a node behind NAT, a load balancer or a port mapping has to say where it
+really is, because no amount of inspecting the socket will find it. CometBFT's
+`external_address` and Bitcoin's `-externalip` are the same knob for the same
+reason. A node that advertises nothing dials out and is never dialled: a working
+state, and the right one for a node that does not want to be reached.
+
+### The cost this accepts
+
+A claim can name any address, so a dishonest one makes this node attempt one
+dial to somewhere of the claimant's choosing. That is a weak scanning primitive
+and it is bounded three ways: the claimant pays a completed handshake for it,
+one source group can hold at most 256 entries however many it offers, and a
+failed dial marks the entry down. Bitcoin accepts the same trade for the same
+reason — without it there is no way to learn about a node at all.
+
+### Verified live, with a control
+
+Two real binaries. `n1` seeds `n2`, so `n1` dials and `n2` only ever answers.
+Then `n1` is stopped, its seeds are cleared **and its anchors file deleted**, and
+it is restarted — so it makes no outbound connection at all, and the only way the
+two can reconnect is `n2` dialling an address it can have learned from nothing
+but the handshake.
+
+| | n1 (validator) | n2 (follower) |
+|---|---|---|
+| With the claim | height 36 | height 36 — reconnected on its own |
+| Without it | height 27 | **frozen at 15** |
+
+The control is what makes this evidence rather than a demonstration: deleting the
+anchors file matters, because a node that re-dials its own anchors would
+reconnect whether or not any of this worked.
 
 ## 8. The seen-set is forgetful
 
@@ -825,7 +873,7 @@ is worse than no test: it spends the credibility the real failures need.
 | 3 | Inbound eviction | Cheapest attack on a node's usefulness | M | **done** |
 | 4 | Anchor connections | Restart is when an eclipse is cheapest | S | **done** |
 | 5 | Ban decay | Small, and wrong in both directions today | S | **done** |
-| 7 | Address advertisement | Topology cannot grow past the seeds without it | M | open |
+| 7 | Address advertisement | Topology cannot grow past the seeds without it | M | **done** |
 | 6 | Channel priority | Votes must not queue behind payments | M | open |
 | 8 | Seen-set by height | Same pass as §6 | S | open |
 | 9 | Retention | Before a chain gets long, not after | M | open |

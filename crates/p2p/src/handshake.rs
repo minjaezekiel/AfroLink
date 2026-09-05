@@ -44,6 +44,8 @@
 //! lets an attacker impersonate the node *in future* handshakes. It does not let
 //! them read past ones.
 
+use std::net::{IpAddr, SocketAddr};
+
 use afrolink_crypto::hash::{Domain, Hash32, hash_parts};
 use afrolink_crypto::{PublicKey, SecretKey, Signature};
 use afrolink_primitives::ChainId;
@@ -57,7 +59,13 @@ use crate::secret::Session;
 ///
 /// Part of the transcript, so a version mismatch fails authentication rather
 /// than being silently negotiated down.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// **2** added the claimed listening address to the authentication frame. The
+/// frame is canonically encoded, so a version 1 peer's frame does not decode
+/// here and a version 2 peer's does not decode there; the version check in
+/// [`Handshake::respond`] turns that into a stated refusal rather than a
+/// mysterious `MalformedAuth`.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Bytes in the first message: version, then the ephemeral public key.
 pub const HELLO_LEN: usize = 2 + 32;
@@ -142,15 +150,71 @@ fn direction_key(label: &[u8], shared: &[u8; 32], transcript: &Hash32) -> [u8; 3
 }
 
 /// What each side sends, encrypted, to prove who it is.
+///
+/// `listen` is the sender's **claim** about where it can be dialled, and the
+/// word claim is doing real work: nothing here makes it true. See
+/// [`Established::listen`] for what a receiver is allowed to do with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Auth {
     key: PublicKey,
+    listen: Option<SocketAddr>,
     signature: Signature,
+}
+
+/// Append a socket address, or a single zero byte for "none".
+///
+/// The same shape `PeerAddr` uses, so the two agree on what an address looks
+/// like on the wire without one depending on the other.
+fn encode_claim(listen: Option<SocketAddr>, out: &mut Vec<u8>) {
+    match listen {
+        None => out.push(0),
+        Some(addr) => {
+            match addr.ip() {
+                IpAddr::V4(v4) => {
+                    out.push(4);
+                    out.extend_from_slice(&v4.octets());
+                }
+                IpAddr::V6(v6) => {
+                    out.push(6);
+                    out.extend_from_slice(&v6.octets());
+                }
+            }
+            addr.port().encode(out);
+        }
+    }
+}
+
+fn decode_claim(r: &mut Reader<'_>) -> Result<Option<SocketAddr>, CodecError> {
+    let ip = match u8::decode(r)? {
+        0 => return Ok(None),
+        4 => IpAddr::from(r.take_array::<4>()?),
+        6 => IpAddr::from(r.take_array::<16>()?),
+        tag => {
+            return Err(CodecError::UnknownDiscriminant {
+                tag,
+                type_name: "Auth/listen family",
+            });
+        }
+    };
+    Ok(Some(SocketAddr::new(ip, u16::decode(r)?)))
+}
+
+/// What the signature covers: the transcript, and the claim made alongside it.
+///
+/// The claim is signed rather than merely sealed. Sealing binds it to whoever
+/// completed the key exchange, which is enough *for this connection*; signing
+/// binds it to the long-term identity, so a node cannot later disown an address
+/// it advertised, and a compromised session key cannot substitute one.
+fn sign_doc(transcript: &Hash32, listen: Option<SocketAddr>) -> Vec<u8> {
+    let mut doc = transcript.as_bytes().to_vec();
+    encode_claim(listen, &mut doc);
+    doc
 }
 
 impl Encode for Auth {
     fn encode(&self, out: &mut Vec<u8>) {
         self.key.encode(out);
+        encode_claim(self.listen, out);
         self.signature.encode(out);
     }
 }
@@ -159,9 +223,26 @@ impl Decode for Auth {
     fn decode(r: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
             key: PublicKey::decode(r)?,
+            listen: decode_claim(r)?,
             signature: Signature::decode(r)?,
         })
     }
+}
+
+/// Whether an advertised address is one anybody could dial.
+///
+/// Not a routability policy — a node on a private network is a legitimate
+/// deployment here, and devnets run on loopback. This rejects only claims that
+/// name nowhere at all: the unspecified address, which means "every interface"
+/// to a listener and nothing to a dialler, and port zero, which means "pick one"
+/// to a listener and nothing to a dialler.
+///
+/// An unusable claim is **ignored, not punished**. A node that misreports its
+/// own address is misconfigured far more often than hostile, and dropping the
+/// connection would take a working peer off the network over a field that is
+/// optional by design.
+fn is_dialable(addr: SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && addr.port() != 0
 }
 
 /// A handshake in progress: the ephemeral secret, waiting for a peer's hello.
@@ -188,6 +269,26 @@ pub struct Established {
     pub session: Session,
     /// Who is on the other end, proven rather than claimed.
     pub peer: PeerId,
+    /// Where the peer **says** it can be dialled, if it said anything.
+    ///
+    /// # What this is and is not
+    ///
+    /// It is signed by the peer's long-term key, so it is definitely *theirs*.
+    /// It is not evidence that anything is listening there, and the two are
+    /// different claims. Bitcoin draws the same line with `addr_me`.
+    ///
+    /// So the rule that closed the inbound-source-port defect stays exactly as
+    /// it was: **an address is trusted only after this node has reached it.**
+    /// A claim belongs in the address book's `new` table, never `tried`, and is
+    /// promoted only by a successful dial this node chose to make. Since the
+    /// book keys entries by [`PeerId`], a peer can only ever advertise *itself*
+    /// — there is no way to use this to inject an address for somebody else,
+    /// which is the amplification this feature would otherwise have opened.
+    ///
+    /// A node that does not want to be dialled — behind NAT, or deliberately
+    /// private — sends nothing and is simply in nobody's book. That is the
+    /// correct outcome, not a degraded one.
+    pub listen: Option<SocketAddr>,
 }
 
 impl Handshake {
@@ -228,7 +329,12 @@ impl Handshake {
     /// # Errors
     /// [`HandshakeError::Version`], [`HandshakeError::MalformedHello`] or
     /// [`HandshakeError::NonContributory`].
-    pub fn respond(self, hello: &[u8], key: &SecretKey) -> Result<Pending, HandshakeError> {
+    pub fn respond(
+        self,
+        hello: &[u8],
+        key: &SecretKey,
+        listen: Option<SocketAddr>,
+    ) -> Result<Pending, HandshakeError> {
         if hello.len() != HELLO_LEN {
             return Err(HandshakeError::MalformedHello(hello.len()));
         }
@@ -265,9 +371,15 @@ impl Handshake {
             direction_key(recv_label, &shared, &transcript),
         );
 
+        // Advertise nothing rather than something undialable: a claim of
+        // `0.0.0.0` is what a node listening on every interface would say if
+        // nobody stopped it, and it would put an address nobody can reach into
+        // every peer's book.
+        let listen = listen.filter(|addr| is_dialable(*addr));
         let auth = Auth {
             key: key.public_key(),
-            signature: key.sign(Domain::P2pHandshakeSignDoc, transcript.as_bytes()),
+            listen,
+            signature: key.sign(Domain::P2pHandshakeSignDoc, &sign_doc(&transcript, listen)),
         };
         let auth_frame = session
             .seal(&auth.to_bytes(), &[])
@@ -306,7 +418,7 @@ impl Pending {
         auth.key
             .verify(
                 Domain::P2pHandshakeSignDoc,
-                self.transcript.as_bytes(),
+                &sign_doc(&self.transcript, auth.listen),
                 &auth.signature,
             )
             .map_err(|_| HandshakeError::BadSignature)?;
@@ -330,6 +442,10 @@ impl Pending {
         Ok(Established {
             session: self.session,
             peer,
+            // Filtered on receipt as well as on send. The sender's own filter
+            // protects honest misconfiguration; this one protects against a
+            // peer that skipped it on purpose.
+            listen: auth.listen.filter(|addr| is_dialable(*addr)),
         })
     }
 }
@@ -360,8 +476,8 @@ mod tests {
     ) -> Result<(Established, Established), HandshakeError> {
         let (alice, hello_a) = Handshake::start(chain_a.clone())?;
         let (bob, hello_b) = Handshake::start(chain_b.clone())?;
-        let alice = alice.respond(&hello_b, a)?;
-        let bob = bob.respond(&hello_a, b)?;
+        let alice = alice.respond(&hello_b, a, None)?;
+        let bob = bob.respond(&hello_a, b, None)?;
         let alice_frame = alice.auth_frame.clone();
         let bob_frame = bob.auth_frame.clone();
         let alice = alice.finish(&bob_frame, &PeerId::new(a.public_key()), expected)?;
@@ -436,7 +552,7 @@ mod tests {
         hello[..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         // hello[2..] stays all zero.
         assert_eq!(
-            alice.respond(&hello, &key(1)).err(),
+            alice.respond(&hello, &key(1), None).err(),
             Some(HandshakeError::NonContributory)
         );
     }
@@ -488,7 +604,7 @@ mod tests {
             hello[..2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
             hello[2..].copy_from_slice(bad);
             assert_eq!(
-                alice.respond(&hello, &key(1)).err(),
+                alice.respond(&hello, &key(1), None).err(),
                 Some(HandshakeError::NonContributory),
                 "low-order point {i} must be refused"
             );
@@ -502,7 +618,7 @@ mod tests {
         hello[..2].copy_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
         hello[2..].copy_from_slice(&[7u8; 32]);
         assert_eq!(
-            alice.respond(&hello, &key(1)).err(),
+            alice.respond(&hello, &key(1), None).err(),
             Some(HandshakeError::Version {
                 theirs: PROTOCOL_VERSION + 1
             })
@@ -513,7 +629,7 @@ mod tests {
     fn a_truncated_hello_is_refused_rather_than_padded() {
         let (alice, _) = Handshake::start(chain()).expect("entropy");
         assert_eq!(
-            alice.respond(&[0u8; 8], &key(1)).err(),
+            alice.respond(&[0u8; 8], &key(1), None).err(),
             Some(HandshakeError::MalformedHello(8))
         );
     }
@@ -528,10 +644,10 @@ mod tests {
         let (alice, hello_a) = Handshake::start(chain()).expect("entropy");
         let (mallory_to_alice, hello_m) = Handshake::start(chain()).expect("entropy");
         // Alice completes with Mallory, believing she reached Bob.
-        let alice = alice.respond(&hello_m, &key(1)).expect("exchange");
+        let alice = alice.respond(&hello_m, &key(1), None).expect("exchange");
         // Mallory, holding no key of Bob's, can only sign as herself.
         let mallory = mallory_to_alice
-            .respond(&hello_a, &key(66))
+            .respond(&hello_a, &key(66), None)
             .expect("exchange");
         let error = alice
             .finish(&mallory.auth_frame, &id(1), Some(&id(2)))
@@ -544,14 +660,135 @@ mod tests {
     fn an_edited_authentication_frame_does_not_decrypt() {
         let (alice, hello_a) = Handshake::start(chain()).expect("entropy");
         let (bob, hello_b) = Handshake::start(chain()).expect("entropy");
-        let alice = alice.respond(&hello_b, &key(1)).expect("exchange");
-        let bob = bob.respond(&hello_a, &key(2)).expect("exchange");
+        let alice = alice.respond(&hello_b, &key(1), None).expect("exchange");
+        let bob = bob.respond(&hello_a, &key(2), None).expect("exchange");
         let mut frame = bob.auth_frame.clone();
         frame[0] ^= 0x80;
         assert_eq!(
             alice.finish(&frame, &id(1), None).err(),
             Some(HandshakeError::NotAuthentic)
         );
+    }
+
+    /// A completed handshake in both directions, so a test can assert on what
+    /// each side learned about the other.
+    fn exchange(
+        a_key: &SecretKey,
+        b_key: &SecretKey,
+        a_listen: Option<SocketAddr>,
+        b_listen: Option<SocketAddr>,
+    ) -> Result<(Established, Established), HandshakeError> {
+        let (alice, hello_a) = Handshake::start(chain())?;
+        let (bob, hello_b) = Handshake::start(chain())?;
+        let alice = alice.respond(&hello_b, a_key, a_listen)?;
+        let bob = bob.respond(&hello_a, b_key, b_listen)?;
+        let a_frame = alice.auth_frame.clone();
+        let b_frame = bob.auth_frame.clone();
+        let at_alice = alice.finish(&b_frame, &id_of(a_key), None)?;
+        let at_bob = bob.finish(&a_frame, &id_of(b_key), None)?;
+        Ok((at_alice, at_bob))
+    }
+
+    fn id_of(key: &SecretKey) -> PeerId {
+        PeerId::new(key.public_key())
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("a socket address")
+    }
+
+    #[test]
+    fn a_peer_learns_where_the_other_side_listens() {
+        // The point of the field. Without it a node's listening address is known
+        // only to whoever already dialled it, so the set of dialable nodes never
+        // grows past the seeds — which for a chain whose security argument is
+        // geographic distribution is close to self-defeating.
+        let (at_alice, at_bob) = exchange(
+            &key(1),
+            &key(2),
+            Some(addr("203.0.113.7:26656")),
+            Some(addr("198.51.100.4:26656")),
+        )
+        .expect("the handshake completes");
+        assert_eq!(at_alice.listen, Some(addr("198.51.100.4:26656")));
+        assert_eq!(at_bob.listen, Some(addr("203.0.113.7:26656")));
+    }
+
+    #[test]
+    fn a_node_that_says_nothing_is_advertised_as_nothing() {
+        // A node behind NAT, or one that simply does not want to be dialled,
+        // advertises nothing and is in nobody's book. That is the correct
+        // outcome rather than a degraded one, so it has to stay expressible.
+        let (at_alice, _) = exchange(&key(1), &key(2), None, None).expect("completes");
+        assert_eq!(at_alice.listen, None);
+    }
+
+    #[test]
+    fn an_address_nobody_could_dial_is_never_advertised() {
+        // `0.0.0.0` is what a node listening on every interface would say if
+        // nothing stopped it, and it is the default this binary ships with. It
+        // means "every interface" to a listener and nothing whatsoever to a
+        // dialler, so advertising it would put an unreachable entry in every
+        // peer's address book. Port zero is the same mistake with a different
+        // field.
+        for claim in ["0.0.0.0:26656", "[::]:26656", "203.0.113.7:0"] {
+            let (at_alice, _) =
+                exchange(&key(1), &key(2), None, Some(addr(claim))).expect("completes");
+            assert_eq!(
+                at_alice.listen, None,
+                "{claim} was advertised and nothing can dial it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_signature_covers_the_claimed_address() {
+        // **The claim is signed, not merely sealed.** Sealing binds it to
+        // whoever completed the key exchange, which is enough for one
+        // connection. Signing binds it to the long-term identity — so a node
+        // cannot disown an address it advertised, and an attacker holding a
+        // session key cannot substitute one.
+        //
+        // Stated here rather than by forging a frame, and the reason is worth
+        // recording: a forged frame is rejected by the AEAD first, because the
+        // nonce has already advanced past the real authentication frame. That
+        // is a genuine defence and it is not this one, so a test built that way
+        // would pass with the claim outside the signature entirely.
+        //
+        // What makes this cover the whole path rather than one function: if
+        // `respond` and `finish` disagreed about which document is signed, no
+        // handshake in this file would complete at all. They agree — every
+        // other test proves it — so showing that the document depends on the
+        // claim is showing that the check does.
+        let transcript = Hash32::from_bytes([7; 32]);
+        let claimed = Some(addr("203.0.113.7:26656"));
+        let elsewhere = Some(addr("198.51.100.9:26656"));
+        let signature = key(2).sign(Domain::P2pHandshakeSignDoc, &sign_doc(&transcript, claimed));
+
+        assert!(
+            key(2)
+                .public_key()
+                .verify(
+                    Domain::P2pHandshakeSignDoc,
+                    &sign_doc(&transcript, claimed),
+                    &signature,
+                )
+                .is_ok(),
+            "a peer's own claim must verify, or nothing connects"
+        );
+        for substituted in [elsewhere, None] {
+            assert!(
+                key(2)
+                    .public_key()
+                    .verify(
+                        Domain::P2pHandshakeSignDoc,
+                        &sign_doc(&transcript, substituted),
+                        &signature,
+                    )
+                    .is_err(),
+                "an address outside the signature is an address anyone can rewrite"
+            );
+        }
     }
 
     #[test]

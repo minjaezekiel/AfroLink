@@ -32,7 +32,7 @@ use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
 use afrolink_p2p::sync::{BlockSource, NoBlocks, SyncBlock};
-use afrolink_p2p::transport::{CommitSink, DiscardCommits, Transport, wait_for};
+use afrolink_p2p::transport::{Binding, CommitSink, DiscardCommits, Transport, wait_for};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_state::MemoryStore;
 use afrolink_types::{Fee, Message, Transaction, TxBody};
@@ -111,7 +111,7 @@ fn transport_serving(
         key(seed),
         Arc::clone(node),
         manager,
-        "127.0.0.1:0".parse().unwrap(),
+        Binding::of("127.0.0.1:0".parse().unwrap()),
         blocks,
         Arc::new(DiscardCommits),
     )
@@ -163,6 +163,68 @@ fn two_nodes_shake_hands_over_a_real_socket() {
     assert!(
         wait_for(PATIENCE, || tb.peers() == vec![ta.peer_id()]),
         "the accepting side must know who called"
+    );
+}
+
+#[test]
+fn a_node_learns_where_an_inbound_peer_listens() {
+    // **§7.** Only peers this node dialled used to enter its address book —
+    // correct, because an inbound connection's source port is ephemeral and
+    // dials nothing, and it left a consequence nobody had paid for: a node's
+    // listening address became known only to whoever had already dialled it.
+    // The dialable set was the seeds and whatever the seeds gossiped, forever.
+    //
+    // Now the handshake carries the caller's claim about where it listens.
+    let a = node(1);
+    let b = node(2);
+    let ta = transport(1, &a);
+    let tb = transport(2, &b);
+
+    // A dials B. B has done nothing but answer.
+    ta.dial(address_of(&tb)).expect("connects");
+    assert!(wait_for(PATIENCE, || !tb.peers().is_empty()));
+
+    let learned = tb
+        .learned(&ta.peer_id())
+        .expect("B learned nothing about a peer that introduced itself");
+    assert_eq!(
+        learned.addr,
+        ta.local_addr(),
+        "B recorded the connection's source port rather than the listening port \
+         it was told about — an address nothing can dial"
+    );
+}
+
+#[test]
+fn a_node_can_dial_back_a_peer_that_only_ever_dialled_it() {
+    // The property the field exists for, end to end and through the real dial
+    // path: B was never told about A by anybody, has never dialled anything,
+    // and can nonetheless reconnect to A on its own after the link drops.
+    //
+    // Without the advertised address B's book is empty and `dial_out` has
+    // nowhere to go, which is what "the topology never grows past the seeds"
+    // means in practice.
+    let a = node(1);
+    let b = node(2);
+    let ta = transport(1, &a);
+    let tb = transport(2, &b);
+
+    ta.dial(address_of(&tb)).expect("connects");
+    assert!(wait_for(PATIENCE, || !tb.peers().is_empty()));
+
+    // The link goes, as links do.
+    ta.disconnect_all();
+    tb.disconnect_all();
+    assert!(wait_for(PATIENCE, || tb.peers().is_empty()));
+
+    assert!(
+        tb.dial_out() > 0,
+        "B could not reach a peer that had introduced itself, so nothing it \
+         learns from an inbound connection is usable"
+    );
+    assert!(
+        tb.peers().contains(&ta.peer_id()),
+        "B dialled somebody, and it was not the peer it had heard from"
     );
 }
 
@@ -287,7 +349,7 @@ fn a_node_on_another_chain_cannot_join() {
         key(2),
         Arc::clone(&b),
         manager,
-        "127.0.0.1:0".parse().unwrap(),
+        Binding::of("127.0.0.1:0".parse().unwrap()),
         Arc::new(NoBlocks),
         Arc::new(DiscardCommits),
     )
@@ -812,7 +874,7 @@ fn a_block_decided_locally_still_reaches_the_store() {
         key(1),
         Arc::clone(&alone),
         Manager::new(identity, AddrBook::new(&key(1)), Limits::default()),
-        "127.0.0.1:0".parse().unwrap(),
+        Binding::of("127.0.0.1:0".parse().unwrap()),
         Arc::new(NoBlocks),
         Arc::clone(&sink) as Arc<dyn CommitSink>,
     )

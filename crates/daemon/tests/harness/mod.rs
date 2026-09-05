@@ -53,7 +53,7 @@ use afrolink_node::{Node, SharedNode};
 use afrolink_p2p::addrbook::AddrBook;
 use afrolink_p2p::manager::{Limits, Manager};
 use afrolink_p2p::peer::{PeerAddr, PeerId};
-use afrolink_p2p::transport::Transport;
+use afrolink_p2p::transport::{Binding, Transport};
 use afrolink_primitives::{Amount, ChainId, Denom, Height, Timestamp};
 use afrolink_rpc::{ChainView, Query, Response, answer};
 use afrolink_state::{KeyValueStore, StoreKey};
@@ -258,7 +258,9 @@ impl ClusterNode {
                 AddrBook::new(&network_key),
                 Limits::default(),
             ),
-            "127.0.0.1:0".parse().unwrap(),
+            // The harness binds an ephemeral loopback port, so the bound
+            // address *is* the reachable one — exactly what a devnet node does.
+            Binding::of("127.0.0.1:0".parse().unwrap()),
             Arc::new(Blocks(Arc::clone(&store))),
             Arc::clone(&sink) as Arc<dyn afrolink_p2p::transport::CommitSink>,
         )

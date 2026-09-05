@@ -256,8 +256,11 @@ learned what a peer is.
   stops being exercised and ASN bucketing starts mattering
 - **Bandwidth becomes the binding constraint**, which is when channel priorities
   and compact block relay earn their complexity
-- **A regulator or an operator needs a node behind NAT to be a full participant**,
-  which needs address advertisement and hole punching
+- **A regulator or an operator needs a node behind NAT to be a full participant**.
+  Address advertisement is now built — the handshake carries the sender's claimed
+  listening address, into the `new` table only, and `advertise` in the config is
+  what a node behind NAT sets ([10 §7](../10-network-hardening.md)). Hole
+  punching, for a node that cannot be reached at *any* address, is not
 
 ## Sources
 
