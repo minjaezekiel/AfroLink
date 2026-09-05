@@ -530,6 +530,17 @@ impl Transport {
             .is_ok_and(|manager| manager.is_behind())
     }
 
+    /// Why this node is or is not asking anyone for a block.
+    ///
+    /// For failure messages only — see [`Manager::sync_snapshot`].
+    #[must_use]
+    pub fn sync_snapshot(&self) -> String {
+        self.shared.manager.lock().map_or_else(
+            |_| "manager lock poisoned".to_owned(),
+            |m| m.sync_snapshot(),
+        )
+    }
+
     /// Who is connected right now.
     #[must_use]
     pub fn peers(&self) -> Vec<PeerId> {

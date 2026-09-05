@@ -196,6 +196,8 @@ pub struct ClusterNode {
     )]
     pub published: Arc<Mutex<MemoryStore>>,
     pub dir: TempDir,
+    /// Held so a failure can ask what it was handed.
+    pub sink: Arc<Persist>,
     /// **The daemon's own loop**, not a copy of it.
     ///
     /// This harness used to reimplement `run::drive` — the timers, the round
@@ -256,7 +258,7 @@ impl ClusterNode {
             ),
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(Blocks(Arc::clone(&store))),
-            sink,
+            Arc::clone(&sink) as Arc<dyn afrolink_p2p::transport::CommitSink>,
         )
         .unwrap();
 
@@ -268,6 +270,7 @@ impl ClusterNode {
             store,
             published,
             dir,
+            sink: Arc::clone(&sink),
             driver: Driver::new(
                 Timings {
                     poll: POLL,
@@ -456,6 +459,18 @@ impl Cluster {
         done(self)
     }
 
+    /// Why each node is or is not asking for the blocks it is missing.
+    ///
+    /// Only ever called from a failure message: see [`Manager::sync_snapshot`]
+    /// for why this is pulled on failure rather than logged as it goes.
+    pub fn why_stuck(&self) -> String {
+        self.nodes
+            .iter()
+            .map(|n| format!("  node {}: {}", n.seed, n.transport.sync_snapshot()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The furthest any node has got. The progress signal for [`Self::wait_until`].
     pub fn highest_tip(&self) -> Height {
         self.nodes
@@ -566,11 +581,12 @@ impl Cluster {
             assert!(
                 last_progress.elapsed() <= STALL_WINDOW
                     && ceiling.is_some_and(|at| Instant::now() < at),
-                "the cluster never settled — (node, decided, stored): {:?}",
+                "the cluster never settled — (node, decided, stored): {:?}\n{}",
                 self.nodes
                     .iter()
                     .map(|n| (n.seed, n.tip().0, n.stored_height().0))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                self.why_stuck()
             );
         }
     }
@@ -731,6 +747,34 @@ impl Cluster {
         .sign(&sender_key(i))
     }
 
+    /// What the **ledger** says `who` holds, read from the durable store.
+    ///
+    /// Not from `published`, which is a *cache* of the last committed state kept
+    /// for the query server. The two are meant to agree and
+    /// [`Self::published_vs_decided`] shows they sometimes do not — see
+    /// [10 §18](../../../docs/10-network-hardening.md). That is a real defect
+    /// about what queries return, and it is a different question from "did the
+    /// ledger move the money", which is what the load tests are asking. Asserting
+    /// the second through the first conflated them.
+    pub fn ledger_balance(&self, who: &Address) -> u128 {
+        let key = StoreKey::balance(who, &Denom::native());
+        // `open_state` rather than `tip_app_hash` + `load_state`: before the
+        // first block there is no tip, and the earlier version of this helper
+        // answered 0 for every account — which made a test that compares a
+        // balance before and after conclude that money had appeared from nowhere.
+        // This is the path the daemon itself starts from, so it is defined at
+        // genesis as well as after it.
+        let store = &self.nodes[0].store;
+        let Ok((state, _, _)) = store.open_state(GenesisLimits::devnet()) else {
+            return 0;
+        };
+        state
+            .get(&key)
+            .and_then(|raw| afrolink_primitives::codec::decode_exact::<Amount>(raw.as_slice()).ok())
+            .unwrap_or(Amount::ZERO)
+            .units()
+    }
+
     /// What the committed state says `who` holds, in the smallest unit.
     ///
     /// Read from the first node's **published** state, which is what a query
@@ -758,6 +802,77 @@ impl Cluster {
             .and_then(|raw| afrolink_primitives::codec::decode_exact::<Amount>(raw.as_slice()).ok())
             .unwrap_or(Amount::ZERO)
             .units()
+    }
+
+    /// Whether each node's *published* state matches the state it decided.
+    ///
+    /// A query is answered from the published view, so these two disagreeing is
+    /// a node telling wallets something its own consensus does not believe. Not
+    /// covered by `assert_agreement`, which compares nodes with each other: four
+    /// nodes can agree perfectly and all four publish something stale.
+    pub fn published_vs_decided(&self) -> String {
+        self.nodes
+            .iter()
+            .map(|n| {
+                let published = n.published.lock().unwrap().root();
+                let decided = n.app_hash();
+                let stored_tip = n
+                    .store
+                    .tip_app_hash()
+                    .ok()
+                    .flatten()
+                    .map(|h| h.to_hex()[..12].to_owned())
+                    .unwrap_or_else(|| "none".to_owned());
+                format!(
+                    "  node {}: node-state {} published {} stored-tip {} h={} stored={} halted={:?} {}",
+                    n.seed,
+                    &decided.to_hex()[..12],
+                    &published.to_hex()[..12],
+                    stored_tip,
+                    n.tip().0,
+                    n.stored_height().0,
+                    n.driver.halted(),
+                    if published == decided {
+                        String::new()
+                    } else {
+                        format!("<-- STALE; sink saw [{}]", n.sink.recent())
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// What the chain did with each of `ids`, for a failure message.
+    ///
+    /// Pulled on failure, never logged as it goes — the same rule as
+    /// `Manager::sync_snapshot`. "Committed" and "succeeded" are different
+    /// questions, and a balance that is wrong cannot distinguish them on its own:
+    /// a transaction can be in a block, findable by id, and still have been
+    /// refused by the executor.
+    pub fn outcomes_of(&self, ids: &[Hash32]) -> String {
+        let mut codes: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut missing = 0usize;
+        for id in ids {
+            match self.nodes[0].store.locate(id).ok().flatten() {
+                None => missing = missing.saturating_add(1),
+                Some(found) => {
+                    let receipt = self.nodes[0]
+                        .store
+                        .receipts(found.0)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|r| r.tx_id == *id);
+                    let label = receipt
+                        .map_or_else(|| "no receipt".to_owned(), |r| format!("{:?}", r.code));
+                    *codes.entry(label).or_default() = codes.get(&label).copied().unwrap_or(0) + 1;
+                }
+            }
+        }
+        format!("not in any block: {missing}; receipts: {codes:?}")
     }
 
     /// How many entries the state tree holds. A proxy for how hard it is working.

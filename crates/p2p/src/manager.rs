@@ -259,6 +259,12 @@ struct Connected {
     awaiting_block: Option<Height>,
     /// Ticks since that request went out.
     request_age: u32,
+    /// A height this node asked this peer for and then stopped waiting on.
+    ///
+    /// Kept so a late answer is recognised as an answer rather than as an
+    /// unsolicited block. At most one, and cleared as it is used, so it cannot
+    /// become a standing licence to send whatever the peer likes.
+    abandoned: Option<Height>,
     /// The node's accumulated uptime when this connection was admitted.
     ///
     /// Held as a stamp rather than a duration so that "longest-connected" is a
@@ -429,6 +435,49 @@ impl Manager {
         self.peers.keys().copied().collect()
     }
 
+    /// Everything that decides whether this node will ask for a block.
+    ///
+    /// # Pulled on failure, never pushed
+    ///
+    /// Written for [10 §17](../../../docs/10-network-hardening.md): a node that
+    /// joins late sometimes stops one height short with peers connected and
+    /// `is_behind()` true. The obvious way to chase that — print the scheduler's
+    /// state every tick — slows the loop enough that the bug stops happening, and
+    /// six runs of it in a row all passed.
+    ///
+    /// So this costs nothing until something has already gone wrong: a test that
+    /// is about to fail asks for it and puts it in the failure message. Cheap
+    /// enough to leave in, because it is only ever called by the code reporting
+    /// the failure.
+    #[must_use]
+    pub fn sync_snapshot(&self) -> String {
+        let peers: Vec<String> = self
+            .peers
+            .iter()
+            .map(|(id, p)| {
+                format!(
+                    "{}{}{} tip={:?} awaiting={:?} age={} score={}",
+                    id.short(),
+                    if p.outbound { " out" } else { " in " },
+                    if p.served { " served" } else { "       " },
+                    p.tip.map(|t| t.0),
+                    p.awaiting_block.map(|h| h.0),
+                    p.request_age,
+                    p.reputation.score(),
+                )
+            })
+            .collect();
+        format!(
+            "need={} best={:?} behind={} staged={:?} banned={} peers=[{}]",
+            self.height.0,
+            self.best_peer_height().map(|h| h.0),
+            self.is_behind(),
+            self.staged.keys().map(|h| h.0).collect::<Vec<_>>(),
+            self.banned.len(),
+            peers.join(" | ")
+        )
+    }
+
     /// How many connections this node made.
     #[must_use]
     pub fn outbound_count(&self) -> usize {
@@ -439,6 +488,19 @@ impl Manager {
     #[must_use]
     pub fn inbound_count(&self) -> usize {
         self.peers.values().filter(|p| !p.outbound).count()
+    }
+
+    /// How many penalty points this peer has accumulated.
+    ///
+    /// `None` if it is not connected. Exposed because "was this peer punished"
+    /// is otherwise only observable once it has been punished *enough*, which
+    /// makes a test for "we stopped punishing honest peers" unable to fail until
+    /// the score crosses [`crate::peer::BAN_THRESHOLD`] — five separate
+    /// offences. It is also the number an operator wants when a peer set is
+    /// mysteriously shrinking.
+    #[must_use]
+    pub fn reputation(&self, peer: &PeerId) -> Option<i32> {
+        self.peers.get(peer).map(|p| p.reputation.score())
     }
 
     /// Whether this peer is refused on sight.
@@ -673,6 +735,7 @@ impl Manager {
                 tip: None,
                 awaiting_block: None,
                 request_age: 0,
+                abandoned: None,
                 since: self.uptime,
                 served: false,
             },
@@ -720,6 +783,9 @@ impl Manager {
             if peer.awaiting_block.is_some() {
                 peer.request_age = peer.request_age.saturating_add(1);
                 if peer.request_age >= REQUEST_TIMEOUT_TICKS {
+                    // Remembered, so that if this peer answers after all it is
+                    // treated as the late reply it is rather than as an attack.
+                    peer.abandoned = peer.awaiting_block;
                     peer.awaiting_block = None;
                     peer.request_age = 0;
                 }
@@ -745,6 +811,26 @@ impl Manager {
             out.push(Directive::Send(target, Box::new(PeerMessage::GetAddrs)));
         }
 
+        // **Release anything already held that can now be applied, before asking
+        // for more.**
+        //
+        // `drain_staged` used to have exactly one caller, inside `on_block`, so a
+        // staged block was only ever released by the arrival of *another* block.
+        // Every other way the height moves — `set_height`, called after every
+        // apply, succeeded or failed — left applicable blocks sitting in the
+        // buffer. And `schedule_sync` counts staged heights as already claimed,
+        // so it then asked for nothing, so nothing arrived, so `on_block` never
+        // ran again: a node with the blocks it needed, in its own hands, waiting
+        // forever for a message that could not come.
+        //
+        // That is [10 §17](../../../docs/10-network-hardening.md), seen in the
+        // wild as `need=7 best=8 behind=true staged=[7, 8]` on a node that had
+        // stopped one height short with four healthy peers.
+        //
+        // Draining on the tick makes the release depend on the height being
+        // right, which is the actual condition, rather than on a message
+        // happening to arrive.
+        out.extend(self.drain_staged());
         out.extend(self.schedule_sync(&ids));
         out
     }
@@ -790,12 +876,7 @@ impl Manager {
         // Never request past what the staging buffer can hold. Otherwise a gap at
         // the bottom — one peer stalled on the height everything else waits for —
         // turns into blocks arriving that must be thrown away.
-        let ceiling = Height(
-            self.height
-                .0
-                .saturating_add(MAX_STAGED_BLOCKS as u64)
-                .min(best.0),
-        );
+        let ceiling = Height(self.ceiling().0.min(best.0));
 
         let mut out = Vec::new();
         let mut want = self.height;
@@ -823,6 +904,16 @@ impl Manager {
             want = want.next();
         }
         out
+    }
+
+    /// The highest height this node has room to hold.
+    ///
+    /// One definition, used both when deciding what to *ask* for and when
+    /// deciding whether an unasked-for block is worth keeping. Two copies of that
+    /// rule would be two chances for a node to punish a peer for sending exactly
+    /// what it would have requested a moment later.
+    fn ceiling(&self) -> Height {
+        Height(self.height.0.saturating_add(MAX_STAGED_BLOCKS as u64))
     }
 
     /// A peer with no outstanding request that claims to hold `height`.
@@ -939,11 +1030,27 @@ impl Manager {
             return Vec::new();
         };
         if peer.awaiting_block != Some(height) {
-            // Either nobody asked, or this answers a different question. Both are
-            // a peer deciding on its own that this node should spend memory and a
-            // certificate verification — the same rule as an unsolicited address
-            // list, at a heavier price.
-            return self.penalise(from, Misbehaviour::BadBlock);
+            // Not the outstanding question. Forgivable in exactly one case: this
+            // node **did** ask this peer for this height, and then gave up.
+            //
+            // A request is abandoned after `REQUEST_TIMEOUT_TICKS` and handed to
+            // somebody else; the original peer's reply then lands against a
+            // cleared slot. Scoring that as `BadBlock` — twenty points, five of
+            // them a ban — punishes a peer for being slow on a link this network
+            // *assumes* is slow. It was seen doing exactly that: a node stuck on
+            // [10 §17](../../../docs/10-network-hardening.md) re-asked
+            // repeatedly and drove all four of its honest peers to a score of 40,
+            // three answers short of banning the only nodes it could have caught
+            // up from.
+            //
+            // Deliberately narrow. The rule the tests below state is untouched —
+            // a peer must not get to choose which heights this node holds in
+            // memory — because only a height *this node chose to ask this peer
+            // for* is forgiven, once, with the record cleared as it is used.
+            if peer.abandoned != Some(height) {
+                return self.penalise(from, Misbehaviour::BadBlock);
+            }
+            peer.abandoned = None;
         }
         peer.awaiting_block = None;
         peer.request_age = 0;
@@ -1903,6 +2010,134 @@ mod tests {
             }
         }
         assert!(asked.iter().any(|(p, _)| *p == high.id));
+    }
+
+    #[test]
+    fn a_staged_block_is_released_when_the_height_reaches_it() {
+        // **[10 §17](../../../docs/10-network-hardening.md).** `drain_staged` had
+        // exactly one caller, inside `on_block`, so a staged block was only ever
+        // released by the arrival of *another* block. Every other way the height
+        // moves — `set_height`, called after every apply, succeeded or failed —
+        // left applicable blocks sitting in the buffer, and `schedule_sync`
+        // counts staged heights as already claimed, so it asked for nothing, so
+        // nothing arrived, so `on_block` never ran again.
+        //
+        // A node with the blocks it needed, in its own hands, waiting forever for
+        // a message that could not come. Seen in a real cluster as
+        // `need=7 best=8 behind=true staged=[7, 8]`.
+        let (mut m, addrs) = syncing(Height(1), 2, 10);
+        m.on_tick(TICK);
+
+        // Two blocks arrive out of order: 2 first, so it cannot be applied yet.
+        let out = m.on_message(
+            addrs[0].id,
+            PeerMessage::Block(Box::new(sync_block(2, [2; 32]))),
+        );
+        assert!(applied(&out).is_empty(), "height 2 cannot precede height 1");
+
+        // Now the node reaches height 2 by some other route — the apply of
+        // height 1 landing, which reports back through `set_height`.
+        m.set_height(Height(2));
+        assert_eq!(
+            applied(&m.on_tick(TICK)),
+            vec![Height(2)],
+            "a staged block the node can now apply must be released by the tick, \
+             not only by the arrival of another block"
+        );
+    }
+
+    #[test]
+    fn a_node_holding_what_it_needs_does_not_wait_for_a_message_to_notice() {
+        // The deadlock stated as its own property. Once a needed height is
+        // staged, `schedule_sync` will not request it again — correctly, since
+        // asking twice for a block already held is waste — so if nothing else
+        // drains the buffer the node is stuck with the answer in its hands.
+        let (mut m, addrs) = syncing(Height(5), 2, 10);
+        m.on_tick(TICK);
+        drop(m.on_message(
+            addrs[0].id,
+            PeerMessage::Block(Box::new(sync_block(6, [6; 32]))),
+        ));
+        m.set_height(Height(6));
+
+        // No further messages. Only ticks.
+        let released: Vec<Height> = (0..3).flat_map(|_| applied(&m.on_tick(TICK))).collect();
+        assert_eq!(released, vec![Height(6)]);
+    }
+
+    #[test]
+    fn a_peer_that_answers_late_is_not_treated_as_an_attacker() {
+        // A request abandoned on timeout is handed to somebody else, and the
+        // original peer's reply then lands against a cleared slot. Twenty points
+        // for that — five of them a ban — punishes a peer for being slow on links
+        // this network *assumes* are slow. Observed driving all four of a stuck
+        // node's honest peers to a score of 40, three answers short of banning
+        // the only nodes it could have caught up from.
+        //
+        // The state is set up directly rather than by waiting for a timeout and
+        // hoping the re-request lands on a different peer: whether it does is a
+        // matter of rotation, and two earlier versions of this test passed with
+        // the fix reverted because the peer simply got asked again.
+        let (mut m, addrs) = syncing(Height(1), 2, 10);
+        let slow = addrs[0].id;
+        {
+            let peer = m.peers.get_mut(&slow).expect("connected");
+            peer.awaiting_block = None;
+            peer.abandoned = Some(Height(1));
+        }
+        assert_eq!(m.reputation(&slow), Some(0));
+
+        drop(m.on_message(slow, PeerMessage::Block(Box::new(sync_block(1, [7; 32])))));
+        assert_eq!(
+            m.reputation(&slow),
+            Some(0),
+            "a late answer to a question this node asked must cost the peer nothing"
+        );
+        assert!(
+            m.staged.contains_key(&Height(1)) || m.height() > Height(1),
+            "and the block it sent is used rather than thrown away"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_request_is_remembered_as_abandoned() {
+        // The other half: the forgiveness above is only reachable because the
+        // timeout records what it gave up on.
+        let (mut m, addrs) = syncing(Height(1), 1, 10);
+        let asked = requested(&m.on_tick(TICK));
+        let (peer, height) = *asked.first().expect("a request went out");
+        assert_eq!(peer, addrs[0].id);
+        for _ in 0..=REQUEST_TIMEOUT_TICKS {
+            m.on_tick(TICK);
+        }
+        assert_eq!(
+            m.peers.get(&peer).and_then(|p| p.abandoned),
+            Some(height),
+            "a request given up on must be remembered, or its answer looks unsolicited"
+        );
+    }
+
+    #[test]
+    fn only_the_height_this_node_asked_for_is_forgiven() {
+        // The narrowness is the point: the rule the next two tests state — a peer
+        // must not get to choose which heights this node holds in memory — has to
+        // survive. Only the height this node actually asked *this* peer for is
+        // forgiven; anything else is still unsolicited and still costs.
+        let (mut m, addrs) = syncing(Height(1), 2, 10);
+        let slow = addrs[0].id;
+        {
+            let peer = m.peers.get_mut(&slow).expect("connected");
+            peer.awaiting_block = None;
+            peer.abandoned = Some(Height(1));
+        }
+
+        drop(m.on_message(slow, PeerMessage::Block(Box::new(sync_block(4, [9; 32])))));
+        assert_eq!(
+            m.reputation(&slow),
+            Some(Misbehaviour::BadBlock.penalty()),
+            "a height nobody asked this peer for is still unsolicited"
+        );
+        assert!(!m.staged.contains_key(&Height(4)), "and it is not kept");
     }
 
     #[test]

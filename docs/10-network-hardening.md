@@ -680,51 +680,79 @@ claimed as tested.
 
 ---
 
-# 17. A late joiner intermittently stalls one block short — **open, not understood**
+# 17. A late joiner stalls one block short — **fixed**
 
-Recorded because it is real, reproducible under load, and **not fixed**. Writing
-it down beats leaving it as a test that fails one run in five and gets re-run
-until it passes.
+A node that joined late reached a height one or two short of the validators and
+stayed there, with peers connected and `is_behind()` true.
 
-**What happens.** In `a_node_that_joins_late_reaches_the_tip_from_genesis`, the
-node that joined late reaches a height one or two short of the validators and
-stays there. Traced over 230 consecutive samples in one reproduction: the joiner
-sat at tip 7 with **four connected peers**, `is_behind() == true`, and
-`synced == 7`, while all four validators sat at tip 9 with block 9 durably
-stored. It never closed the gap.
+**Found by making the failure explain itself.** Printing the scheduler's state
+every tick slowed the loop enough that the bug stopped happening — six runs in a
+row passed. Pulling the same state *on failure* instead cost nothing and
+reproduced it on the first run. `Manager::sync_snapshot` exists for that, and the
+line it printed was the whole diagnosis:
 
-**What is ruled out.** It is not the state-tree work and not the publish-ordering
-guard: the same failure reproduces with both stashed, on the tree as of
-`489d6f9`. It is not the missing re-dial fixed in §15a either — that made it much
-rarer without removing it, which is why it read as fixed at the time. That was
-too quick a conclusion and is corrected here.
+```
+node 9: need=7 best=Some(8) behind=true staged=[7, 8] peers=[... score=40 | score=40 | score=40 | score=25]
+```
 
-**What the code says should happen.** `is_behind()` is true, so
-`schedule_sync` passes its `best < height` guard; `ceiling` allows the missing
-height; and `free_peer_holding` should find one of four peers whose announced
-`tip` covers it. Every step reads as though it must work, which is why this needs
-evidence rather than more reading.
+**The blocks it was waiting for were already in its own staging buffer.**
 
-**Why it is not diagnosed yet.** It is a heisenbug: with `SYNC_DEBUG` tracing
-enabled the extra `eprintln!` per tick slows the loop enough that six consecutive
-runs all passed. The next attempt should record into a **ring buffer read after
-the failure**, not print as it goes.
+**Root cause.** `drain_staged` had exactly one caller, inside `on_block`, so a
+staged block was only ever released by the arrival of *another* block. Every
+other way the height moves — `set_height`, called after every apply, succeeded or
+failed — left applicable blocks sitting in the buffer. And `schedule_sync` counts
+staged heights as already claimed, so it asked for nothing, so nothing arrived,
+so `on_block` never ran again. A node holding the blocks it needed, waiting
+forever for a message that could not come.
 
-**Two suspects worth checking first**, both visible in `manager.rs` and both
-capable of producing exactly this:
+**Fixed** by draining on the tick, so release depends on the height being right —
+the actual condition — rather than on a message happening to arrive.
 
-1. `free_peer_holding` skips any peer whose `tip` is `None`. A peer dropped for a
-   full outbox and re-dialled starts with no `tip` until its next `Status`, and a
-   node whose peers were all recently re-dialled would ask nobody at all.
-2. `on_block` penalises a block the peer was not *currently* asked for with
-   `BadBlock` (20 points). A legitimate answer that arrives after a reconnect has
-   cleared `awaiting_block` is therefore scored as misbehaviour, and five of them
-   ban a peer that did nothing wrong.
+**The second defect in the same line.** Those peer scores of 40 were honest peers
+five points of misbehaviour from a ban. A request abandoned on timeout is handed
+to somebody else, and the original peer's reply then lands against a cleared
+slot, scoring `BadBlock` — twenty points, five of them a ban. A node stuck on the
+above re-asked repeatedly and drove all four of its peers to 40: three answers
+short of banning the only nodes it could have caught up from, for the offence of
+being slow on links this network *assumes* are slow.
 
-**Severity.** Real but bounded: it affects a node catching up, not consensus
-safety, and the network keeps committing throughout. It matters because catching
-up is what every new node and every restarted node does, and a node that silently
-stops one block short serves stale answers to every query it receives.
+Fixed narrowly. A timed-out request is remembered as `abandoned`, and only that
+exact height from that exact peer is forgiven, once. The rule that a peer must
+not get to choose which heights this node holds in memory is untouched — the two
+tests stating it still pass, and both fixes were verified by reverting them.
+
+# 18. A node's published state can lag the block it has committed — **open**
+
+Found by the load test in the same pass, and **separate** from the ordering guard
+in `Persist` (which is fixed, and which reverting does not make this go away).
+
+**What happens.** After the chain settles, a node's durable store holds block N
+and its state root, while the `published` state the query server answers from is
+still at N−1. Observed on all four nodes at once, with `halted=None`, so no write
+failed:
+
+```
+node 1: node-state e2da9c6b published e65077bc stored-tip e2da9c6b h=13 stored=13 halted=None
+sink saw [1:… 12:got=e65077bc want=e65077bc]     <- and never height 13
+```
+
+Every entry the sink recorded matches its block's `app_hash` exactly, so nothing
+is corrupt: block 13 simply never reached `Persist::committed`, while its
+`put_block` plainly did. That combination is not yet explained.
+
+**Why it matters.** `published` is what a wallet's balance query is answered
+from. A node in this state serves an answer one block stale, indefinitely, while
+looking healthy from every other angle — its store is correct, its peers agree,
+and it keeps committing.
+
+**Why the load test no longer fails on it.** Because it was asking the wrong
+question through the wrong door: "did the ledger move the money" is a question
+about the store, and it was being asked of a cache. It now reads the ledger, and
+`Cluster::published_vs_decided` reports the divergence as its own concern rather
+than as an arithmetic error.
+
+**Next step.** Record an entry on *entry* to `Persist::committed`, not only after
+both writes, to establish whether the call happens at all for the missing height.
 
 ---
 
@@ -746,7 +774,8 @@ stops one block short serves stale answers to every query it receives.
 | 10 | State sync | Large; needs P0/P1 stable first | L | open |
 | 11 | Validator set rotation | Largest; a mistake here is a chain split | L | open |
 | 16 | The defect class itself | Seven instances; one loop, a halt in the type, the entry point under test | M | **done** |
-| 17 | Late-joiner sync stall | Intermittent, pre-dates this work, not understood | ? | **open** |
+| 17 | Late-joiner sync stall | Staged blocks never drained; honest peers punished | S | **done** |
+| 18 | Published state lags the store | Queries answered one block stale | ? | **open** |
 
 ---
 

@@ -20,7 +20,7 @@ use afrolink_p2p::sync::{BlockSource, SyncBlock};
 use afrolink_p2p::transport::CommitSink;
 use afrolink_primitives::{ChainId, Height};
 use afrolink_rpc::{ChainView, HistoryEntry, QueryError, SignedHeader};
-use afrolink_state::{MemoryStore, Proof, StoreKey};
+use afrolink_state::{KeyValueStore, MemoryStore, Proof, StoreKey};
 use afrolink_store::{ChainStore, ServedChain};
 
 /// Serves committed blocks to peers that fell behind.
@@ -53,6 +53,12 @@ pub struct Persist {
     state: Arc<Mutex<MemoryStore>>,
     /// Set when a write fails. The daemon stops rather than carrying on.
     failed: Arc<Mutex<Option<String>>>,
+    /// The last few (height, state root) pairs handed to this sink.
+    ///
+    /// Kept because "the published state is stale" cannot be diagnosed from the
+    /// end result: it says which state is wrong and nothing about which write put
+    /// it there. Bounded and pulled on failure, never logged as it goes.
+    seen: Mutex<Vec<(u64, Hash32, Hash32)>>,
     /// The height of the state currently published.
     ///
     /// # Why publishing needs a guard
@@ -88,7 +94,29 @@ impl Persist {
             state,
             failed,
             published_height: Mutex::new(Height(0)),
+            seen: Mutex::new(Vec::new()),
         }
+    }
+
+    /// What this sink was handed, most recent last. For failure messages.
+    #[must_use]
+    pub fn recent(&self) -> String {
+        self.seen.lock().map_or_else(
+            |_| "poisoned".to_owned(),
+            |seen| {
+                seen.iter()
+                    .map(|(h, root, want)| {
+                        let flag = if root == want { "" } else { "!" };
+                        format!(
+                            "{h}:got={} want={}{flag}",
+                            &root.to_hex()[..8],
+                            &want.to_hex()[..8]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+        )
     }
 
     fn fail(&self, what: &str) {
@@ -124,6 +152,13 @@ impl CommitSink for Persist {
                 block.header.height.0
             ));
             return;
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push((block.header.height.0, state.root(), block.header.app_hash));
+            let len = seen.len();
+            if len > 12 {
+                seen.drain(..len.saturating_sub(12));
+            }
         }
         // Only now is the new state published to readers. A query answered from a
         // state whose block is not yet durable would be a proof against a header

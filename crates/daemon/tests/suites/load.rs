@@ -87,15 +87,17 @@ fn many_accounts_paying_at_once_all_arrive_and_all_balances_are_exact() {
     for i in 0..SENDERS {
         let expected_out = Amount::from_afri(1).units() * per_sender as u128
             + harness::FEE.units() * per_sender as u128;
-        let left = cluster.balance(&harness::sender(i));
+        let left = cluster.ledger_balance(&harness::sender(i));
         assert_eq!(
             left,
             harness::ENDOWMENT.units() - expected_out,
-            "sender {i} has the wrong balance after {per_sender} payments"
+            "sender {i} has the wrong balance after {per_sender} payments\n  {}\n  {}",
+            cluster.outcomes_of(&submitted),
+            cluster.published_vs_decided()
         );
     }
     assert_eq!(
-        cluster.balance(&account(harness::RECIPIENT)),
+        cluster.ledger_balance(&account(harness::RECIPIENT)),
         Amount::from_afri(1).units() * PAYMENTS as u128,
         "the recipient did not receive exactly what was sent"
     );
@@ -183,7 +185,7 @@ fn a_thousand_payments_across_four_hundred_accounts() {
     }
 
     assert_eq!(
-        cluster.balance(&account(harness::RECIPIENT)),
+        cluster.ledger_balance(&account(harness::RECIPIENT)),
         Amount::from_afri(1).units() * payments as u128
     );
     println!(
@@ -205,7 +207,7 @@ fn a_sender_cannot_spend_more_than_it_has_however_hard_it_tries() {
     let _serial = harness::exclusive();
     let mut cluster = Cluster::funded(4, "overspend", 1);
     let sender = harness::sender(0);
-    let before = cluster.balance(&sender);
+    let before = cluster.ledger_balance(&sender);
 
     // Far more than the account can afford, all valid-looking, submitted at once.
     let affordable = 5u64;
@@ -223,13 +225,13 @@ fn a_sender_cannot_spend_more_than_it_has_however_hard_it_tries() {
     cluster.quiesce();
     cluster.assert_agreement();
 
-    let after = cluster.balance(&sender);
+    let after = cluster.ledger_balance(&sender);
     assert!(
         after <= before,
         "an account gained money by submitting transactions it could not afford"
     );
     let _ = affordable;
-    let recipient = cluster.balance(&account(harness::RECIPIENT));
+    let recipient = cluster.ledger_balance(&account(harness::RECIPIENT));
     assert!(
         recipient <= before,
         "more was delivered than the sender ever had: {recipient} from {before}"
